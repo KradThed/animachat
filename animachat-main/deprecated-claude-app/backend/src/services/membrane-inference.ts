@@ -30,8 +30,9 @@
  * - EnhancedInference calculates markers, we enforce the limit
  * - Stable markers = cacheRead on subsequent requests = huge cost savings
  *
- * FORMATTER STRATEGY (NEW):
- * - anthropic: AnthropicXmlFormatter (default) - prefill mode with XML tools
+ * FORMATTER STRATEGY:
+ * - anthropic + standard (1-on-1): NativeFormatter - uses API native tools
+ * - anthropic + prefill (group chat): AnthropicXmlFormatter - prefill mode with XML tools
  * - openrouter: NativeFormatter - standard chat format, API handles tools
  * - openai-compatible: NativeFormatter - standard chat format
  */
@@ -207,8 +208,13 @@ export class MembraneInferenceService extends InferenceService {
       console.log(`[MembraneInference] Cache positions in normalized: ${JSON.stringify(positions)}`);
     }
 
-    // 8. Create membrane instance
-    const membrane = this.createMembrane(model.provider, apiKey, endpoint, assistantName);
+    // 8. Determine formatter and tool mode
+    const useNativeFormatter = model.provider === 'openrouter'
+      || model.provider === 'openai-compatible'
+      || (model.provider === 'anthropic' && format === 'standard');
+
+    // Create membrane instance
+    const membrane = this.createMembrane(model.provider, apiKey, endpoint, assistantName, useNativeFormatter);
 
     // 9. Build request
     let actualModelId = modelPrefix
@@ -242,6 +248,9 @@ export class MembraneInferenceService extends InferenceService {
       ...(toolOptions?.tools && toolOptions.tools.length > 0 && {
         tools: toolOptions.tools as any,
       }),
+      // Tell membrane to use native tool handling (API tool_use blocks)
+      // instead of XML parsing when using NativeFormatter
+      ...(useNativeFormatter && { toolMode: 'native' as const }),
     };
 
     console.log(`\n[MembraneInference] 📤 REQUEST TO MEMBRANE:`);
@@ -758,7 +767,8 @@ export class MembraneInferenceService extends InferenceService {
    * Create Membrane instance with appropriate formatter for provider
    *
    * FORMATTER SELECTION:
-   * - anthropic: AnthropicXmlFormatter (default) - prefill mode with XML tools
+   * - anthropic + standard (1-on-1): NativeFormatter - uses API native tools
+   * - anthropic + prefill (group chat): AnthropicXmlFormatter - prefill mode with XML tools
    * - openrouter: NativeFormatter - standard chat format, handles Claude/GPT/etc
    * - openai-compatible: NativeFormatter - standard chat format for local models
    */
@@ -766,7 +776,8 @@ export class MembraneInferenceService extends InferenceService {
     provider: string,
     apiKey: string,
     endpoint?: string,
-    assistantParticipant?: string
+    assistantParticipant?: string,
+    useNativeFormatter: boolean = false
   ): Membrane {
     let adapter;
 
@@ -805,12 +816,7 @@ export class MembraneInferenceService extends InferenceService {
         throw new Error(`Unknown provider: ${provider}`);
     }
 
-    // Choose formatter based on provider:
-    // - anthropic: AnthropicXmlFormatter (default) - prefill mode with XML tools
-    // - openrouter/openai-compatible: NativeFormatter - standard chat format
-    const useNativeFormatter = provider === 'openrouter' || provider === 'openai-compatible';
-
-    console.log(`[MembraneInference] Creating Membrane for ${provider} with ${useNativeFormatter ? 'NativeFormatter' : 'AnthropicXmlFormatter (default)'}`);
+    console.log(`[MembraneInference] Creating Membrane for ${provider} with ${useNativeFormatter ? 'NativeFormatter' : 'AnthropicXmlFormatter (prefill)'}`);
 
     return new Membrane(adapter, {
       assistantParticipant: assistantParticipant || 'Claude',
