@@ -1,0 +1,57 @@
+{
+  "providers": {
+    "anthropic": [
+      {
+        "id": "anthropic-main",
+        "name": "Anthropic API",
+        "priority": 1,
+        "credentials": {
+          "apiKey": "YOUR_ANTHROPIC_API_KEY"
+        },
+        "modelCosts": [
+          {
+            "modelId": "claude-sonnet-4-5-20250929",
+            "providerCost": { "inputTokensPerMillion": 3.00, "outputTokensPerMillion": 15.00 },
+            "billedCost": { "inputTokensPerMillion": 0.00, "outputTokensPerMillion": 0.00 }
+          },
+          {
+            "modelId": "claude-opus-4-5-20251101",
+            "providerCost": { "inputTokensPerMillion": 5.00, "outputTokensPerMillion": 25.00 },
+            "billedCost": { "inputTokensPerMillion": 0.00, "outputTokensPerMillion": 0.00 }
+          }
+        ]
+      }
+    ]
+  },
+  "defaultProfiles": {
+    "anthropic": "anthropic-main"
+  },
+  "defaultModel": "claude-sonnet-4.5",
+  "features": {
+    "allowUserApiKeys": true,
+    "enforceRateLimits": false,
+    "trackUsage": true,
+    "billUsers": false
+  },
+  "initialGrants": {
+    "sonnets": 30,
+    "opus": 10
+  },
+  "currencies": {
+    "sonnets": {
+      "name": "Sonnets",
+      "description": "Claude Sonnet models"
+    },
+    "opus": {
+      "name": "Opus",
+      "description": "Claude Opus models"
+    }
+  },
+  "loadBalancing": {
+    "strategy": "random"
+  },
+  "groupChatSuggestedModels": [
+    "claude-sonnet-4.5",
+    "claude-opus-4.5"
+  ]
+}

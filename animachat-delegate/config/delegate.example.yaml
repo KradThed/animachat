@@ -1,0 +1,58 @@
+# Animachat Delegate Configuration
+# Copy this file to delegate.yaml and fill in your values.
+
+server:
+  # WebSocket URL of the Animachat server
+  url: ws://localhost:3010
+  # Your JWT token (get from Animachat login)
+  token: "YOUR_JWT_TOKEN_HERE"
+
+delegate:
+  # Unique ID for this delegate instance
+  id: "my-dev-machine"
+  # Capabilities this delegate supports
+  capabilities:
+    - mcp_host
+    - webhooks
+
+# MCP servers to host locally
+# Each server is a subprocess managed by the delegate
+mcp_servers:
+  # Example: Filesystem access
+  - name: filesystem
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/projects"]
+
+  # Example: GitHub integration
+  # - name: github
+  #   command: npx
+  #   args: ["-y", "@modelcontextprotocol/server-github"]
+  #   env:
+  #     GITHUB_TOKEN: "${GITHUB_TOKEN}"
+
+  # Example: Custom MCP server
+  # - name: my-custom-tools
+  #   command: node
+  #   args: ["./my-mcp-server.js"]
+
+# Webhook server for external triggers (MCP Live)
+webhooks:
+  # Set to true to enable the webhook HTTP server
+  enabled: false
+  # Port for the webhook server
+  port: 8080
+  # Webhook endpoints
+  endpoints:
+    - source: gitlab
+      path: /webhooks/gitlab
+      secret: "${GITLAB_WEBHOOK_SECRET}"
+      # Which conversation to post trigger events to
+      conversation_id: ""
+      # Which AI participant should respond
+      participant_id: ""
+
+    # - source: github
+    #   path: /webhooks/github
+    #   secret: "${GITHUB_WEBHOOK_SECRET}"
+    #   conversation_id: ""
+    #   participant_id: ""

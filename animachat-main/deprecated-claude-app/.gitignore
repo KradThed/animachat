@@ -1,0 +1,32 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.bak*
+*.log
+.DS_Store
+
+# Database persistence
+data/
+*.jsonl
+
+# IDE
+.vscode/
+.idea/
+
+# LLM logs
+logs/
+
+# SSL certificates
+certs/
+*.pem
+*.key
+*.crt
+*.csr
+
+# Site configuration (deployment-specific)
+backend/config/siteConfig.json
+backend/config/siteConfig.production.json
+
+*.md
+*.txt

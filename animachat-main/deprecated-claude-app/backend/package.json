@@ -1,0 +1,45 @@
+{
+  "name": "@deprecated-claude/backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "dev:https": "USE_HTTPS=true tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "start:https": "USE_HTTPS=true node dist/index.js",
+    "generate-cert": "mkdir -p certs && openssl req -x509 -newkey rsa:4096 -keyout certs/key.pem -out certs/cert.pem -days 365 -nodes -subj '/CN=localhost'"
+  },
+  "dependencies": {
+    "@animalabs/membrane": "file:../../../membrane-main",
+    "@anthropic-ai/sdk": "^0.60.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.478.0",
+    "@types/compression": "^1.8.1",
+    "@types/multer": "^2.0.0",
+    "@types/ws": "^8.5.10",
+    "bcrypt": "^5.1.1",
+    "compression": "^1.8.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.0.2",
+    "resend": "^6.6.0",
+    "sharp": "^0.34.5",
+    "uuid": "^9.0.1",
+    "ws": "^8.16.0",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/bcrypt": "^5.0.2",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^4.17.23",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^20.19.11",
+    "@types/sharp": "^0.31.1",
+    "@types/uuid": "^9.0.8",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  }
+}
