@@ -84,6 +84,49 @@ export function convertToNormalizedMessages(
       console.log(`[converter] msg ${i} (${message.id.substring(0, 8)}): cacheBreakpoint=true (hasCacheIndex=${hasCacheIndex}, branchCacheControl=${!!branchCacheControl})`);
     }
 
+    // 5b. TOOL CALL SPLITTING for native formatter
+    // When an assistant message contains both tool_use AND tool_result blocks,
+    // they must be split into separate messages for Anthropic API:
+    //   - tool_use → assistant message
+    //   - tool_result → user message
+    //   - text (final response) → assistant message
+    // Without this, second message in conversation fails with:
+    //   "messages.0: `tool_use` blocks can only be in `assistant` messages"
+    const hasToolUse = content.some(b => b.type === 'tool_use');
+    const hasToolResult = content.some(b => b.type === 'tool_result');
+
+    if (hasToolUse && hasToolResult && participantName === assistantParticipantName) {
+      // Split into: assistant(tool_use) → user(tool_result) → assistant(text)
+      const toolUseBlocks = content.filter(b =>
+        b.type === 'tool_use' || b.type === 'thinking' || b.type === 'redacted_thinking'
+      );
+      const toolResultBlocks = content.filter(b => b.type === 'tool_result');
+      const textBlocks = content.filter(b =>
+        b.type !== 'tool_use' && b.type !== 'tool_result' &&
+        b.type !== 'thinking' && b.type !== 'redacted_thinking'
+      );
+
+      console.log(`[converter] msg ${i}: splitting tool call branch → ${toolUseBlocks.length} tool_use + ${toolResultBlocks.length} tool_result + ${textBlocks.length} text`);
+
+      // 1. Assistant: tool_use (+ thinking if present)
+      if (toolUseBlocks.length > 0) {
+        result.push({ participant: assistantParticipantName, content: toolUseBlocks });
+      }
+      // 2. User: tool_result
+      if (toolResultBlocks.length > 0) {
+        result.push({ participant: 'User', content: toolResultBlocks });
+      }
+      // 3. Assistant: text response (if any)
+      if (textBlocks.length > 0) {
+        result.push({
+          participant: assistantParticipantName,
+          content: textBlocks,
+          cacheBreakpoint: shouldCache || undefined,
+        });
+      }
+      continue; // Skip normal push — we already added split messages
+    }
+
     // CHANGED: Use cacheBreakpoint (new Membrane API) instead of metadata.cacheControl (ignored!)
     result.push({
       participant: participantName,
@@ -92,7 +135,6 @@ export function convertToNormalizedMessages(
     });
   }
 
-  // DEBUG: Log final result
   // CHANGED: Check cacheBreakpoint instead of metadata.cacheControl
   const withCacheBreakpoint = result.filter(m => m.cacheBreakpoint).length;
   console.log(`[converter] ✅ Result: ${result.length} normalized msgs, ${withCacheBreakpoint} with cacheBreakpoint`);

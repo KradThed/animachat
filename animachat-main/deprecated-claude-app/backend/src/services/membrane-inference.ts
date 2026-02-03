@@ -191,13 +191,24 @@ export class MembraneInferenceService extends InferenceService {
     // 6. Find assistant name
     const assistantName = this.findAssistantName(participants, responderId);
 
-    // 7. Convert to membrane format
+    // 7. Determine formatter and tool mode (BEFORE converter, so we know which participant name to use)
+    const useNativeFormatter = model.provider === 'openrouter'
+      || model.provider === 'openai-compatible'
+      || (model.provider === 'anthropic' && format === 'standard');
+
+    // WORKAROUND: Membrane's buildNativeToolRequest() hardcodes participant === 'Claude'
+    // for role detection. When using native formatter, we must use 'Claude' as the assistant
+    // participant name so that Membrane correctly identifies assistant messages.
+    // See: membrane.ts line 862 — `const isAssistant = msg.participant === 'Claude';`
+    const membraneAssistantName = useNativeFormatter ? 'Claude' : assistantName;
+
+    // 8. Convert to membrane format
     // Note: effectiveCacheIndices not needed - converter reads _cacheControl directly from branch
     const normalizedMessages = convertToNormalizedMessages(
       messagesForConversion,
       participants,
       undefined,  // effectiveCacheIndices not used - _cacheControl is the source of truth
-      assistantName
+      membraneAssistantName
     );
 
     // CHANGED: Check for cacheBreakpoint instead of metadata.cacheControl
@@ -208,13 +219,8 @@ export class MembraneInferenceService extends InferenceService {
       console.log(`[MembraneInference] Cache positions in normalized: ${JSON.stringify(positions)}`);
     }
 
-    // 8. Determine formatter and tool mode
-    const useNativeFormatter = model.provider === 'openrouter'
-      || model.provider === 'openai-compatible'
-      || (model.provider === 'anthropic' && format === 'standard');
-
     // Create membrane instance
-    const membrane = this.createMembrane(model.provider, apiKey, endpoint, assistantName, useNativeFormatter);
+    const membrane = this.createMembrane(model.provider, apiKey, endpoint, membraneAssistantName, useNativeFormatter);
 
     // 9. Build request
     let actualModelId = modelPrefix
