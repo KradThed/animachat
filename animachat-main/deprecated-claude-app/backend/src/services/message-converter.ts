@@ -127,6 +127,18 @@ export function convertToNormalizedMessages(
       continue; // Skip normal push — we already added split messages
     }
 
+    // For Native mode (1-on-1 chats): add cache_control directly to last text block
+    // This is needed because Native formatter passes blocks directly to API without using cacheBreakpoint
+    // For XML/prefill mode, cacheBreakpoint is still used (handled by AnthropicXmlFormatter)
+    if (shouldCache && content.length > 0) {
+      for (let j = content.length - 1; j >= 0; j--) {
+        if (content[j].type === 'text') {
+          (content[j] as any).cache_control = { type: 'ephemeral' };
+          break;
+        }
+      }
+    }
+
     // CHANGED: Use cacheBreakpoint (new Membrane API) instead of metadata.cacheControl (ignored!)
     result.push({
       participant: participantName,
