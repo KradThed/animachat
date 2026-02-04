@@ -1,4 +1,5 @@
 import { Message, Conversation, Model, ModelSettings, Participant, GrantUsageDetails, GrantTokenUsage } from '@deprecated-claude/shared';
+import type { ToolDefinition, ToolCall, ToolResult } from '../tools/tool-registry.js';
 import { ContextManager } from './context-manager.js';
 import { InferenceService } from './inference.js';
 import { ContextWindow } from './context-strategies.js';
@@ -317,7 +318,13 @@ export class EnhancedInferenceService {
     participant?: Participant,
     onMetrics?: (metrics: any) => Promise<void>,
     participants?: Participant[],
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    toolOptions?: {
+      tools?: ToolDefinition[];
+      onToolCall?: (call: ToolCall) => void;
+      onToolResult?: (result: ToolResult) => void;
+      executeToolCall?: (call: ToolCall) => Promise<ToolResult>;
+    }
   ): Promise<void> {
     // If no conversation provided, fall back to original behavior
     if (!conversation) {
@@ -331,7 +338,9 @@ export class EnhancedInferenceService {
         'standard',
         participants || [],
         undefined,
-        undefined
+        undefined,
+        undefined,
+        toolOptions
       );
       return;
     }
@@ -541,7 +550,8 @@ export class EnhancedInferenceService {
       participants || [],
       participant?.id,
       conversation,
-      cacheMarkerIndices  // Pass cache marker indices for Chapter II prefill caching
+      cacheMarkerIndices,  // Pass cache marker indices for Chapter II prefill caching
+      toolOptions
     );
   }
   
