@@ -1,9 +1,10 @@
 import { WebSocket } from 'ws';
 import { IncomingMessage } from 'http';
-import { WsMessageSchema, WsMessage, Message, Participant } from '@deprecated-claude/shared';
+import { WsMessageSchema, WsMessage, Message, Participant, Conversation, ToolConfig } from '@deprecated-claude/shared';
 import { Database } from '../database/index.js';
 import { verifyToken } from '../middleware/auth.js';
 import { InferenceService } from '../services/inference.js';
+import { MembraneInferenceService } from '../services/membrane-inference.js';
 import { EnhancedInferenceService, validatePricingAvailable, PricingNotConfiguredError } from '../services/enhanced-inference.js';
 import { ContextManager } from '../services/context-manager.js';
 import { Logger } from '../utils/logger.js';
@@ -12,6 +13,9 @@ import { ModelLoader } from '../config/model-loader.js';
 import { roomManager } from './room-manager.js';
 import { USER_FACING_ERRORS } from '../utils/error-messages.js';
 import { checkContent, type UserContext } from '../services/content-filter.js';
+import { toolRegistry } from '../tools/tool-registry.js';
+import type { ToolCall, ToolResult } from '../tools/tool-registry.js';
+import { delegateWebsocketHandler } from '../delegate/delegate-handler.js';
 
 interface AuthenticatedWebSocket extends WebSocket {
   userId?: string;
@@ -52,6 +56,70 @@ function abortGeneration(userId: string, conversationId: string): boolean {
     return true;
   }
   return false;
+}
+
+/**
+ * Build tool options for inference based on toolConfig.
+ * For 1-on-1 chats: uses conversation.toolConfig
+ * For group chats: uses responder.toolConfig
+ * Returns undefined if no tools are available or tools are disabled.
+ */
+function buildToolOptions(
+  userId: string,
+  conversation: Conversation,
+  responder?: Participant
+): {
+  tools: any[];
+  onToolCall?: (call: ToolCall) => void;
+  onToolResult?: (result: ToolResult) => void;
+  executeToolCall: (call: ToolCall) => Promise<ToolResult>;
+} | undefined {
+  // Determine which toolConfig to use:
+  // - For 1-on-1 (standard) chats: conversation.toolConfig
+  // - For group chats: responder.toolConfig
+  // - Participant toolConfig takes precedence if both exist
+  const toolConfig: ToolConfig | undefined = responder?.toolConfig ?? conversation.toolConfig;
+
+  console.log('[buildToolOptions] Input:', {
+    userId,
+    conversationFormat: conversation.format,
+    conversationToolConfig: conversation.toolConfig,
+    responderToolConfig: responder?.toolConfig,
+    effectiveToolConfig: toolConfig
+  });
+
+  // If tools are explicitly disabled, return undefined
+  if (toolConfig?.toolsEnabled === false) {
+    console.log('[buildToolOptions] Tools disabled, returning undefined');
+    return undefined;
+  }
+
+  // Get all tools available to this user
+  const allTools = toolRegistry.getToolsForUser(userId);
+  console.log('[buildToolOptions] All tools for user:', allTools.length);
+
+  // Filter by toolConfig if present
+  const tools = toolConfig
+    ? toolRegistry.getToolsForParticipant(
+        toolRegistry.getToolsForUserWithSource(userId),
+        toolConfig
+      )
+    : allTools;
+
+  console.log('[buildToolOptions] Filtered tools:', tools.length, tools.map((t: any) => t.name));
+
+  if (tools.length === 0) {
+    console.log('[buildToolOptions] No tools available, returning undefined');
+    return undefined;
+  }
+
+  console.log('[buildToolOptions] Returning toolOptions with', tools.length, 'tools');
+  return {
+    tools,
+    executeToolCall: async (call: ToolCall): Promise<ToolResult> => {
+      return toolRegistry.executeTool(call, userId, toolConfig);
+    }
+  };
 }
 
 /**
@@ -333,6 +401,12 @@ interface ParallelInferenceParams {
   abortSignal: AbortSignal;
   creationSource: 'inference' | 'regeneration';
   conversationId: string; // For room broadcasts
+  toolOptions?: {
+    tools?: any[];
+    onToolCall?: (call: ToolCall) => void;
+    onToolResult?: (result: ToolResult) => void;
+    executeToolCall?: (call: ToolCall) => Promise<ToolResult>;
+  };
 }
 
 /**
@@ -361,7 +435,8 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
     userContext,
     abortSignal,
     creationSource,
-    conversationId
+    conversationId,
+    toolOptions
   } = params;
 
   // Track branches to generate
@@ -533,7 +608,7 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
         // Store metrics only for first branch to avoid duplicate counting
         if (branchIndex === 0) {
           await db.addMetrics(conversation.id, conversation.userId, metrics);
-          
+
           // Send metrics update to client
           safeSend({
             type: 'metrics_update',
@@ -544,7 +619,8 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
         }
       },
       participants,
-      abortSignal
+      abortSignal,
+      toolOptions
     );
     
     return branchContent;
@@ -560,9 +636,18 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
 }
 
 export function websocketHandler(ws: AuthenticatedWebSocket, req: IncomingMessage, db: Database) {
-  // Extract token from query params
+  // Extract token and params from query
   const url = new URL(req.url || '', `http://${req.headers.host}`);
   const token = url.searchParams.get('token');
+
+  // Check if this is a delegate connection
+  if (url.searchParams.get('delegate') === 'true' || url.searchParams.get('delegateId')) {
+    delegateWebsocketHandler(ws, req, db).catch(err => {
+      console.error('[WebSocket] Delegate handler error:', err);
+      ws.close(1011, 'Internal error');
+    });
+    return;
+  }
 
   if (!token) {
     ws.send(JSON.stringify({ type: 'error', error: 'Authentication required' }));
@@ -588,7 +673,8 @@ export function websocketHandler(ws: AuthenticatedWebSocket, req: IncomingMessag
     ws.isAlive = true;
   });
 
-  const baseInferenceService = new InferenceService(db);
+  // Use MembraneInferenceService for native tool support
+  const baseInferenceService = new MembraneInferenceService(db);
   const contextManager = new ContextManager();
   const inferenceService = new EnhancedInferenceService(baseInferenceService, contextManager);
 
@@ -1128,9 +1214,10 @@ async function handleChatMessage(
         userContext,
         abortSignal: abortController.signal,
         creationSource: 'inference',
-        conversationId: message.conversationId
+        conversationId: message.conversationId,
+        toolOptions: buildToolOptions(conversation.userId, conversation, responder)
       });
-    
+
     // DEBUG CAPTURE: Capture debug data for the first branch after completion
     try {
       const rawRequest = baseInferenceService.lastRawRequest;
@@ -1504,7 +1591,8 @@ async function handleRegenerate(
         userContext,
         abortSignal: abortController.signal,
         creationSource: 'regeneration',
-        conversationId: message.conversationId
+        conversationId: message.conversationId,
+        toolOptions: buildToolOptions(conversation.userId, conversation, responderParticipant)
       });
     } finally {
       endGeneration(conversation.userId, conversation.id);
@@ -1940,13 +2028,14 @@ async function handleEdit(
           userContext,
           abortSignal: abortController.signal,
           creationSource: 'inference',
-          conversationId: message.conversationId
+          conversationId: message.conversationId,
+          toolOptions: buildToolOptions(conversation.userId, conversation, responderParticipant)
         });
       } finally {
         endGeneration(conversation.userId, conversation.id);
         roomManager.endAiRequest(message.conversationId);
       }
-      
+
       // Capture debug request/response for researchers
       console.log('[DEBUG CAPTURE] Starting debug data capture for edit...');
       try {
@@ -2313,9 +2402,10 @@ async function handleContinue(
         userContext,
         abortSignal: abortController.signal,
         creationSource: 'inference',
-        conversationId
+        conversationId,
+        toolOptions: buildToolOptions(conversation.userId, conversation, responder)
       });
-      
+
       // DEBUG CAPTURE: Capture debug data for the first branch after completion
       try {
         const rawRequest = baseInferenceService.lastRawRequest;
