@@ -532,15 +532,23 @@ export function conversationRouter(db: Database): Router {
       }
       
       const conversation = await db.getConversation(req.params.id, req.userId);
-      if (!conversation) {
-        // getConversation already handles access control (owner or shared access)
+      if (!conversation || conversation.userId !== req.userId) {
         return res.status(404).json({ error: 'Conversation not found' });
       }
-      
+
       // Set the active branch
-      const success = await db.setActiveBranch(messageId, conversation.id, conversation.userId, branchId);
-      
+      const success = await db.setActiveBranch(messageId, conversation.id, conversation.userId, branchId, req.userId);
+
       if (success) {
+        // Broadcast to other users in the conversation room
+        roomManager.broadcastToRoom(conversation.id, {
+          type: 'active_branch_changed',
+          conversationId: conversation.id,
+          messageId,
+          branchId,
+          changedByUserId: req.userId
+        });
+
         res.json({ success: true });
       } else {
         res.status(400).json({ error: 'Failed to set active branch' });

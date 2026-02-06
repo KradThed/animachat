@@ -89,6 +89,19 @@ export interface UsageStats {
   };
 }
 
+// Per-user conversation UI state (event-sourced)
+interface UserConversationState {
+  speakingAs?: string;          // participantId the user is speaking as
+  selectedResponder?: string;   // participantId of AI that will respond
+  isDetached?: boolean;         // if true, user navigates independently
+  detachedBranches?: Record<string, string>; // messageId -> branchId (only used if isDetached)
+  readBranchIds?: string[];     // branch IDs this user has seen (for unread tracking)
+  lastReadAt?: string;          // ISO timestamp of last read action
+}
+
+// Migration version constant - increment when schema changes
+const UI_STATE_MIGRATION_VERSION = 1;
+
 export class Database {
   private users: Map<string, User> = new Map();
   private usersByEmail: Map<string, string> = new Map(); // email -> userId
@@ -133,6 +146,15 @@ export class Database {
   }> = new Map(); // keyId -> DelegateApiKey
   private delegateApiKeysByUser: Map<string, Set<string>> = new Map(); // userId -> keyIds
 
+  // Per-user UI state (event-sourced, replaces JSON files)
+  // Key: `${conversationId}::${userId}` (double colon to avoid collisions)
+  private userConversationStates: Map<string, UserConversationState> = new Map();
+
+  // Tracking migrated keys with version (for idempotency)
+  // Key: migrationKey ("shared:convId" or "user:convId:userId")
+  // Value: migrationVersion (1, 2, ...)
+  private migratedUIStateKeys: Map<string, number> = new Map();
+
   private eventStore: EventStore;
   // per user, contains conversation metadata events and participant events
   private userEventStore: BulkEventStore;
@@ -154,30 +176,45 @@ export class Database {
     this.personaStore = new PersonaStore();
     this.uiStateStore = new ConversationUIStateStore();
   }
-  
+
+  // Helper methods for user conversation state
+  private getUserStateKey(conversationId: string, userId: string): string {
+    return `${conversationId}::${userId}`;
+  }
+
+  private getOrCreateUserState(conversationId: string, userId: string): UserConversationState {
+    const key = this.getUserStateKey(conversationId, userId);
+    let state = this.userConversationStates.get(key);
+    if (!state) {
+      state = {};
+      this.userConversationStates.set(key, state);
+    }
+    return state;
+  }
+
   async init(): Promise<void> {
     if (this.initialized) return;
-
 
     await this.eventStore.init();
     await this.conversationEventStore.init();
     await this.userEventStore.init();
+    // NOTE: uiStateStore.init() kept temporarily for migration - will be removed after migration completes
     await this.uiStateStore.init();
 
-    // if needed
+    // Legacy database migration (events.jsonl -> sharded stores)
     await this.migrateDatabase();
-    
-    // Load all events and rebuild state
-    var allEvents = await this.eventStore.loadEvents();
 
-    // Replay events
+    // Load all main events and rebuild state
+    // This includes ui_state_migration_completed markers for idempotency
+    const allEvents = await this.eventStore.loadEvents();
     console.log(`Loading ${allEvents.length} events from disk...`);
 
     for (const event of allEvents) {
       await this.replayEvent(event);
     }
 
-    // Replay user events (TODO: make these load as needed. For now, it's so little data that this is fine)
+    // Replay user events (includes new UI state events: user_speaking_as_set, etc.)
+    // TODO: make these load lazily. For now, it's so little data that this is fine
     for await (const {id, events} of this.userEventStore.loadAllEvents()) {
       for (const event of events) {
         await this.replayEvent(event);
@@ -185,7 +222,13 @@ export class Database {
       // add that user to list of loaded users
       this.userLastAccessedTimes.set(id, new Date());
     }
-    
+
+    // Run UI state migration from JSON to events (if enabled)
+    // Set RUN_MIGRATION=true environment variable to run
+    if (process.env.RUN_MIGRATION === 'true') {
+      await this.migrateUIStateFromJSON();
+    }
+
     // Create test user if no users exist
     if (this.users.size === 0) {
       await this.createTestUser();
@@ -214,6 +257,94 @@ export class Database {
     }
 
     this.initialized = true;
+  }
+
+  // ==================== UNIFIED EVENT WRITE METHODS ====================
+  // These methods append events AND replay them atomically.
+  // This pattern ensures:
+  //   1. Durability: Event is written to disk before in-memory update
+  //   2. Consistency: In-memory state matches persisted state
+  //   3. Crash recovery: On restart, replay reconstructs correct state
+  //
+  // IMPORTANT: If replay fails after append succeeds, we log and re-throw.
+  //   The event IS persisted, so restart will replay it again.
+  //   Solution: log with context + re-throw (restart will replay and restore state)
+
+  private async appendAndReplayMainEvent(type: string, data: any): Promise<Event> {
+    const event: Event = {
+      timestamp: new Date(),
+      type,
+      data: { ...data }  // Shallow clone (contract: caller doesn't mutate after call)
+    };
+    await this.eventStore.appendEvent(event);
+    try {
+      await this.replayEvent(event);
+    } catch (replayError) {
+      console.error(`[CRITICAL] Replay failed after successful append`, {
+        type,
+        timestamp: event.timestamp.toISOString(),
+        conversationId: data.conversationId,
+        userId: data.userId,
+        migrationKey: data.migrationKey,
+        error: replayError
+      });
+      throw replayError;
+    }
+    return event;
+  }
+
+  private async appendAndReplayConversationEvent(
+    conversationId: string,
+    type: string,
+    data: any
+  ): Promise<Event> {
+    const event: Event = {
+      timestamp: new Date(),
+      type,
+      data: { ...data }
+    };
+    await this.conversationEventStore.appendEvent(conversationId, event);
+    try {
+      await this.replayEvent(event);
+    } catch (replayError) {
+      console.error(`[CRITICAL] Replay failed after successful append`, {
+        type,
+        conversationId,
+        timestamp: event.timestamp.toISOString(),
+        messageId: data.messageId,
+        branchId: data.branchId,
+        error: replayError
+      });
+      throw replayError;
+    }
+    return event;
+  }
+
+  private async appendAndReplayUserEvent(
+    userId: string,
+    type: string,
+    data: any
+  ): Promise<Event> {
+    const event: Event = {
+      timestamp: new Date(),
+      type,
+      data: { ...data }
+    };
+    await this.userEventStore.appendEvent(userId, event);
+    try {
+      await this.replayEvent(event);
+    } catch (replayError) {
+      console.error(`[CRITICAL] Replay failed after successful append`, {
+        type,
+        userId,
+        timestamp: event.timestamp.toISOString(),
+        conversationId: data.conversationId,
+        messageId: data.messageId,
+        error: replayError
+      });
+      throw replayError;
+    }
+    return event;
   }
 
   private async migrateDatabase(): Promise<void> {
@@ -1458,6 +1589,63 @@ export class Database {
         if (key) {
           key.isRevoked = true;
           key.revokedAt = new Date(revokedAt);
+        }
+        break;
+      }
+
+      // ==================== UI STATE EVENTS ====================
+      // These replace JSON file storage for crash consistency
+
+      case 'user_speaking_as_set': {
+        const { conversationId, userId, participantId } = event.data;
+        const state = this.getOrCreateUserState(conversationId, userId);
+        state.speakingAs = participantId;
+        break;
+      }
+
+      case 'user_responder_selected': {
+        const { conversationId, userId, participantId } = event.data;
+        const state = this.getOrCreateUserState(conversationId, userId);
+        state.selectedResponder = participantId;
+        break;
+      }
+
+      case 'user_detach_toggled': {
+        const { conversationId, userId, isDetached } = event.data;
+        const state = this.getOrCreateUserState(conversationId, userId);
+        state.isDetached = isDetached;
+        if (!isDetached) {
+          state.detachedBranches = {};  // Clear when re-attaching
+        }
+        break;
+      }
+
+      case 'user_detached_branch_set': {
+        const { conversationId, userId, messageId, branchId } = event.data;
+        const state = this.getOrCreateUserState(conversationId, userId);
+        if (!state.detachedBranches) state.detachedBranches = {};
+        state.detachedBranches[messageId] = branchId;
+        break;
+      }
+
+      case 'user_branches_read': {
+        const { conversationId, userId, branchIds, readAt } = event.data;
+        const state = this.getOrCreateUserState(conversationId, userId);
+        const existing = new Set(state.readBranchIds || []);
+        for (const id of branchIds) {
+          existing.add(id);
+        }
+        state.readBranchIds = Array.from(existing);
+        state.lastReadAt = readAt;
+        break;
+      }
+
+      case 'ui_state_migration_completed': {
+        const { migrationKey, migrationVersion } = event.data;
+        // Store max(version) - protection from reorder/backup restore
+        const prev = this.migratedUIStateKeys.get(migrationKey) || 0;
+        if (migrationVersion > prev) {
+          this.migratedUIStateKeys.set(migrationKey, migrationVersion);
         }
         break;
       }
@@ -2973,68 +3161,91 @@ export class Database {
   async setActiveBranch(messageId: string, conversationId: string, conversationOwnerUserId: string, branchId: string, changedByUserId?: string): Promise<boolean> {
     const message = await this.tryLoadAndVerifyMessage(messageId, conversationId, conversationOwnerUserId);
     if (!message) return false;
-    
+
     const branch = message.branches.find(b => b.id === branchId);
     if (!branch) return false;
 
-    // Create new message object with updated active branch
-    const updated = { ...message, activeBranchId: branchId };
-    this.messages.set(messageId, updated);
-
-    // Save to shared UI state store (NOT the append-only event log)
-    // This prevents branch navigation from bloating the conversation history
-    await this.uiStateStore.setSharedActiveBranch(conversationId, messageId, branchId);
+    // Use unified event write (append + replay atomically updates in-memory state)
+    await this.appendAndReplayConversationEvent(conversationId, 'active_branch_changed', {
+      messageId,
+      branchId,
+      changedByUserId
+    });
 
     // Don't update conversation timestamp for branch switches - it's just navigation
-    // await this.updateConversationTimestamp(conversationId, conversationOwnerUserId);
-    
-    // NOTE: We intentionally do NOT log active_branch_changed events anymore.
-    // Branch selections are stored in a separate mutable store to avoid event log bloat.
 
     return true;
   }
 
   // ==================== USER-SPECIFIC UI STATE ====================
   // These are per-user settings that are NEVER synced to other users
+  // Now event-sourced for crash consistency
 
-  async getUserConversationState(conversationId: string, userId: string) {
-    return this.uiStateStore.loadUser(conversationId, userId);
+  async getUserConversationState(conversationId: string, userId: string): Promise<UserConversationState> {
+    return this.getOrCreateUserState(conversationId, userId);
   }
 
   async setUserSpeakingAs(conversationId: string, userId: string, participantId: string | undefined): Promise<void> {
-    await this.uiStateStore.setSpeakingAs(conversationId, userId, participantId);
+    await this.appendAndReplayUserEvent(userId, 'user_speaking_as_set', {
+      conversationId,
+      userId,
+      participantId
+    });
   }
 
   async setUserSelectedResponder(conversationId: string, userId: string, participantId: string | undefined): Promise<void> {
-    await this.uiStateStore.setSelectedResponder(conversationId, userId, participantId);
+    await this.appendAndReplayUserEvent(userId, 'user_responder_selected', {
+      conversationId,
+      userId,
+      participantId
+    });
   }
 
   async setUserDetached(conversationId: string, userId: string, isDetached: boolean): Promise<void> {
-    await this.uiStateStore.setDetached(conversationId, userId, isDetached);
+    await this.appendAndReplayUserEvent(userId, 'user_detach_toggled', {
+      conversationId,
+      userId,
+      isDetached
+    });
   }
 
   async setUserDetachedBranch(conversationId: string, userId: string, messageId: string, branchId: string): Promise<void> {
-    await this.uiStateStore.setDetachedBranch(conversationId, userId, messageId, branchId);
+    await this.appendAndReplayUserEvent(userId, 'user_detached_branch_set', {
+      conversationId,
+      userId,
+      messageId,
+      branchId
+    });
   }
 
   async markBranchesAsRead(conversationId: string, userId: string, branchIds: string[]): Promise<void> {
-    await this.uiStateStore.markBranchesAsRead(conversationId, userId, branchIds);
+    await this.appendAndReplayUserEvent(userId, 'user_branches_read', {
+      conversationId,
+      userId,
+      branchIds,
+      readAt: new Date().toISOString()
+    });
   }
 
   async getReadBranchIds(conversationId: string, userId: string): Promise<string[]> {
-    return this.uiStateStore.getReadBranchIds(conversationId, userId);
+    const state = this.getOrCreateUserState(conversationId, userId);
+    return state.readBranchIds || [];
   }
 
-  // Get cached total branch count from state file (for unread tracking without loading full conversation)
+  // Get total branch count from conversation metadata (computed during replay)
   async getTotalBranchCount(conversationId: string): Promise<number> {
-    return this.uiStateStore.getTotalBranchCount(conversationId);
+    const conversation = this.conversations.get(conversationId);
+    return conversation?.totalBranchCount ?? 0;
   }
 
-  // Backfill branch count to state file (for migration of existing conversations)
+  // Backfill branch count - updates conversation metadata directly
+  // (Used for migration of existing conversations)
   async backfillBranchCount(conversationId: string, count: number): Promise<void> {
-    const state = await this.uiStateStore.loadShared(conversationId);
-    state.totalBranchCount = count;
-    await this.uiStateStore.saveShared(conversationId, state);
+    const conversation = this.conversations.get(conversationId);
+    if (conversation) {
+      const updated = { ...conversation, totalBranchCount: count };
+      this.conversations.set(conversationId, updated);
+    }
   }
 
   async updateMessage(messageId: string, conversationId: string, conversationOwnerUserId: string, message: Message, updatedByUserId?: string): Promise<boolean> {
@@ -5667,6 +5878,366 @@ export class Database {
     });
 
     return true;
+  }
+
+  // ==================== UI STATE MIGRATION ====================
+  // Migrate from JSON files to event-sourced storage
+
+  /**
+   * Build branch index from events (for migration validation)
+   * Returns messageId → Set<branchId>
+   *
+   * Handles:
+   * - message_created (initial branches)
+   * - message_branch_added (new branch)
+   * - message_branch_deleted (removes branch)
+   * - message_deleted (removes entire message)
+   */
+  private async buildBranchIndexForMigration(
+    conversationId: string
+  ): Promise<Map<string, Set<string>>> {
+    // messageId → Set<branchId>
+    const branchIndex = new Map<string, Set<string>>();
+
+    try {
+      const events = await this.conversationEventStore.loadEvents(conversationId);
+
+      for (const event of events) {
+        switch (event.type) {
+          case 'message_created': {
+            const { id, branches } = event.data;
+            const branchIds = new Set<string>();
+            for (const branch of branches || []) {
+              branchIds.add(branch.id);
+            }
+            branchIndex.set(id, branchIds);
+            break;
+          }
+          case 'message_branch_added': {
+            const { messageId, branch } = event.data;
+            const branches = branchIndex.get(messageId) || new Set();
+            branches.add(branch.id);
+            branchIndex.set(messageId, branches);
+            break;
+          }
+          case 'message_branch_deleted': {
+            const { messageId, branchId } = event.data;
+            const branches = branchIndex.get(messageId);
+            if (branches) branches.delete(branchId);
+            break;
+          }
+          case 'message_deleted': {
+            const { messageId } = event.data;
+            branchIndex.delete(messageId);
+            break;
+          }
+        }
+      }
+    } catch (error: any) {
+      if (error.code !== 'ENOENT') throw error;
+      // File doesn't exist - no events
+    }
+
+    return branchIndex;
+  }
+
+  /**
+   * Migration summary for logging
+   */
+  private migrationSummary = {
+    shared: { totalFiles: 0, migratedCount: 0, skippedCount: 0 },
+    user: { totalFiles: 0, migratedCount: 0, skippedCount: 0 },
+    errors: {
+      missingMessages: 0,
+      missingBranches: 0,
+      fallbacksApplied: 0,
+      noConversationEvents: 0,
+      jsonParseErrors: 0
+    }
+  };
+
+  /**
+   * Main migration entry point
+   */
+  async migrateUIStateFromJSON(): Promise<void> {
+    console.log('[Migration] Starting UI state migration v' + UI_STATE_MIGRATION_VERSION);
+
+    // Reset summary
+    this.migrationSummary = {
+      shared: { totalFiles: 0, migratedCount: 0, skippedCount: 0 },
+      user: { totalFiles: 0, migratedCount: 0, skippedCount: 0 },
+      errors: {
+        missingMessages: 0,
+        missingBranches: 0,
+        fallbacksApplied: 0,
+        noConversationEvents: 0,
+        jsonParseErrors: 0
+      }
+    };
+
+    // 1. Migrate shared state (activeBranches)
+    // Use uiStateStore paths so tests can override them
+    const sharedDir = (this.uiStateStore as any).sharedBaseDir || './data/conversation-state';
+    try {
+      const shards = await fsAsync.readdir(sharedDir);
+      for (const shard of shards) {
+        const shardPath = path.join(sharedDir, shard);
+        const stat = await fsAsync.stat(shardPath);
+        if (!stat.isDirectory()) continue;
+
+        const files = await fsAsync.readdir(shardPath);
+
+        for (const file of files) {
+          if (!file.endsWith('.json')) continue;
+          this.migrationSummary.shared.totalFiles++;
+
+          const conversationId = file.replace('.json', '');
+          const migrationKey = `shared:${conversationId}`;
+
+          // Idempotency: check marker event with version
+          const migratedVersion = this.migratedUIStateKeys.get(migrationKey) || 0;
+          if (migratedVersion >= UI_STATE_MIGRATION_VERSION) {
+            this.migrationSummary.shared.skippedCount++;
+            continue;
+          }
+
+          const filePath = path.join(shardPath, file);
+          await this.migrateSharedState(conversationId, filePath);
+          this.migrationSummary.shared.migratedCount++;
+        }
+      }
+    } catch (error: any) {
+      if (error.code !== 'ENOENT') throw error;
+      // Directory doesn't exist - no shared state to migrate
+    }
+
+    // 2. Migrate user state
+    await this.migrateAllUserStates();
+
+    // 3. Print summary
+    console.log('[Migration] === SUMMARY ===');
+    console.log(JSON.stringify(this.migrationSummary, null, 2));
+  }
+
+  /**
+   * Migrate shared conversation state (activeBranches)
+   */
+  private async migrateSharedState(
+    conversationId: string,
+    filePath: string
+  ): Promise<void> {
+    try {
+      // 1. Build branch index (minimal validator, no side effects)
+      const branchIndex = await this.buildBranchIndexForMigration(conversationId);
+
+      if (branchIndex.size === 0) {
+        console.warn(`[Migration] No conversation events for ${conversationId} - file missing or empty`);
+        this.migrationSummary.errors.noConversationEvents++;
+        // Still write marker to avoid re-processing
+        const migrationKey = `shared:${conversationId}`;
+        await this.appendAndReplayMainEvent('ui_state_migration_completed', {
+          migrationKey,
+          migrationVersion: UI_STATE_MIGRATION_VERSION,
+          scope: 'shared',
+          sourceFile: filePath,
+          migratedAt: new Date().toISOString(),
+          status: 'skipped_no_events'
+        });
+        return;
+      }
+
+      // 2. Read JSON state
+      let state: { activeBranches?: Record<string, string> };
+      try {
+        const data = await fsAsync.readFile(filePath, 'utf-8');
+        state = JSON.parse(data);
+      } catch (parseError) {
+        console.error(`[Migration] Failed to parse ${filePath}:`, parseError);
+        this.migrationSummary.errors.jsonParseErrors++;
+        return;
+      }
+
+      // 3. Migrate activeBranches with validation
+      for (const [messageId, branchId] of Object.entries(state.activeBranches || {})) {
+        const branches = branchIndex.get(messageId);
+
+        if (!branches) {
+          console.warn(`[Migration] Message ${messageId} not found in ${conversationId}`);
+          this.migrationSummary.errors.missingMessages++;
+          continue;
+        }
+
+        let finalBranchId = branchId;
+
+        if (!branches.has(finalBranchId)) {
+          console.warn(`[Migration] Branch ${branchId} not found on message ${messageId}`);
+          this.migrationSummary.errors.missingBranches++;
+
+          // Fallback: first branch
+          const fallbackBranch = branches.values().next().value;
+          if (fallbackBranch) {
+            finalBranchId = fallbackBranch;
+            this.migrationSummary.errors.fallbacksApplied++;
+          } else {
+            continue;
+          }
+        }
+
+        // 4. Write event through unified pattern
+        await this.appendAndReplayConversationEvent(conversationId, 'active_branch_changed', {
+          messageId,
+          branchId: finalBranchId,
+          isMigration: true
+        });
+      }
+
+      // 5. Write marker to main eventStore
+      const migrationKey = `shared:${conversationId}`;
+      await this.appendAndReplayMainEvent('ui_state_migration_completed', {
+        migrationKey,
+        migrationVersion: UI_STATE_MIGRATION_VERSION,
+        scope: 'shared',
+        sourceFile: filePath,
+        migratedAt: new Date().toISOString()
+      });
+
+    } catch (error) {
+      console.error(`[Migration] Error processing ${filePath}:`, error);
+    }
+  }
+
+  /**
+   * Migrate all per-user conversation states
+   */
+  private async migrateAllUserStates(): Promise<void> {
+    // Use uiStateStore paths so tests can override them
+    const userDir = (this.uiStateStore as any).userBaseDir || './data/user-conversation-state';
+    try {
+      const shards = await fsAsync.readdir(userDir);
+      for (const shard of shards) {
+        const shardPath = path.join(userDir, shard);
+        const shardStat = await fsAsync.stat(shardPath);
+        if (!shardStat.isDirectory()) continue;
+
+        const convDirs = await fsAsync.readdir(shardPath);
+
+        for (const conversationId of convDirs) {
+          const convPath = path.join(shardPath, conversationId);
+          const convStat = await fsAsync.stat(convPath);
+          if (!convStat.isDirectory()) continue;
+
+          const userFiles = await fsAsync.readdir(convPath);
+          for (const file of userFiles) {
+            if (!file.endsWith('.json')) continue;
+            this.migrationSummary.user.totalFiles++;
+
+            const userId = file.replace('.json', '');
+            const migrationKey = `user:${conversationId}:${userId}`;
+
+            // Idempotency
+            const migratedVersion = this.migratedUIStateKeys.get(migrationKey) || 0;
+            if (migratedVersion >= UI_STATE_MIGRATION_VERSION) {
+              this.migrationSummary.user.skippedCount++;
+              continue;
+            }
+
+            const filePath = path.join(convPath, file);
+            await this.migrateUserState(conversationId, userId, filePath);
+            this.migrationSummary.user.migratedCount++;
+          }
+        }
+      }
+    } catch (error: any) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+
+  /**
+   * Migrate single user's conversation state
+   */
+  private async migrateUserState(
+    conversationId: string,
+    userId: string,
+    filePath: string
+  ): Promise<void> {
+    try {
+      let state: UserConversationState;
+      try {
+        const data = await fsAsync.readFile(filePath, 'utf-8');
+        state = JSON.parse(data);
+      } catch (parseError) {
+        console.error(`[Migration] Failed to parse ${filePath}:`, parseError);
+        this.migrationSummary.errors.jsonParseErrors++;
+        return;
+      }
+
+      // Use structuredClone for migration (full protection for nested data)
+      const clonedState: UserConversationState = typeof structuredClone === 'function'
+        ? structuredClone(state)
+        : JSON.parse(JSON.stringify(state));
+
+      // 1. speakingAs
+      if (clonedState.speakingAs) {
+        await this.appendAndReplayUserEvent(userId, 'user_speaking_as_set', {
+          conversationId,
+          userId,
+          participantId: clonedState.speakingAs
+        });
+      }
+
+      // 2. selectedResponder
+      if (clonedState.selectedResponder) {
+        await this.appendAndReplayUserEvent(userId, 'user_responder_selected', {
+          conversationId,
+          userId,
+          participantId: clonedState.selectedResponder
+        });
+      }
+
+      // 3. isDetached
+      if (clonedState.isDetached !== undefined) {
+        await this.appendAndReplayUserEvent(userId, 'user_detach_toggled', {
+          conversationId,
+          userId,
+          isDetached: clonedState.isDetached
+        });
+      }
+
+      // 4. detachedBranches (nested object)
+      if (clonedState.detachedBranches) {
+        for (const [messageId, branchId] of Object.entries(clonedState.detachedBranches)) {
+          await this.appendAndReplayUserEvent(userId, 'user_detached_branch_set', {
+            conversationId,
+            userId,
+            messageId,
+            branchId
+          });
+        }
+      }
+
+      // 5. readBranchIds (array)
+      if (clonedState.readBranchIds && clonedState.readBranchIds.length > 0) {
+        await this.appendAndReplayUserEvent(userId, 'user_branches_read', {
+          conversationId,
+          userId,
+          branchIds: clonedState.readBranchIds,
+          readAt: clonedState.lastReadAt || new Date().toISOString()
+        });
+      }
+
+      // 6. Marker in mainEventStore (AFTER all user events)
+      const migrationKey = `user:${conversationId}:${userId}`;
+      await this.appendAndReplayMainEvent('ui_state_migration_completed', {
+        migrationKey,
+        migrationVersion: UI_STATE_MIGRATION_VERSION,
+        scope: 'user',
+        sourceFile: filePath,
+        migratedAt: new Date().toISOString()
+      });
+
+    } catch (error) {
+      console.error(`[Migration] Error processing user state ${filePath}:`, error);
+    }
   }
 
   // Close database connection
