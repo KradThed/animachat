@@ -1054,8 +1054,8 @@ watch(() => props.conversation, async (conversation) => {
       toolsEnabled.value = convToolConfig.toolsEnabled ?? true;
       enabledTools.value = convToolConfig.enabledTools ?? [];
       preferredDelegateId.value = convToolConfig.delegateId ?? null;
-      // If enabledTools has items, user is not in "all tools" mode
-      useAllToolsMode.value = (convToolConfig.enabledTools ?? []).length === 0;
+      // null/undefined = all tools mode, array (even empty) = selective mode
+      useAllToolsMode.value = convToolConfig.enabledTools === null || convToolConfig.enabledTools === undefined;
     } else {
       // Default values
       toolsEnabled.value = true;
@@ -1297,9 +1297,11 @@ function save() {
   }
   
   // Build tool configuration
+  // When useAllToolsMode is true, enabledTools should be null (allow all)
+  // When useAllToolsMode is false, enabledTools should be the array (selective mode)
   const toolConfig = {
     toolsEnabled: toolsEnabled.value,
-    enabledTools: enabledTools.value,
+    enabledTools: useAllToolsMode.value ? null : enabledTools.value,
     delegateId: preferredDelegateId.value,
     toolTimeout: 30000
   };

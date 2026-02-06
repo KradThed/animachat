@@ -483,9 +483,7 @@
               v-if="!allowAllTools"
               :model-value="getToolConfigField('enabledTools', [])"
               @update:model-value="(val) => setToolConfigField('enabledTools', val)"
-              :items="groupedToolItems.filter(i => i.type === 'tool')"
-              item-title="name"
-              item-value="name"
+              :items="[]"
               label="Select allowed tools"
               multiple
               chips
@@ -494,8 +492,8 @@
               density="compact"
               class="mb-3"
             >
-              <template v-slot:prepend-item>
-                <!-- Show grouped headers in dropdown -->
+              <template v-slot:no-data>
+                <!-- Custom grouped list replaces default items -->
                 <template v-for="(item, index) in groupedToolItems" :key="index">
                   <v-list-subheader v-if="item.type === 'header'" class="text-primary font-weight-bold">
                     <v-icon
@@ -524,8 +522,8 @@
                 </template>
               </template>
               <template v-slot:selection="{ item }">
-                <v-chip size="small" closable @click:close="toggleToolSelection(item.value)">
-                  {{ item.title }}
+                <v-chip size="small" closable @click:close="toggleToolSelection(item.raw)">
+                  {{ item.raw }}
                 </v-chip>
               </template>
             </v-select>
