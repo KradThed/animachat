@@ -531,8 +531,10 @@ export function conversationRouter(db: Database): Router {
         return res.status(400).json({ error: 'messageId and branchId are required' });
       }
       
+      // ACL is handled inside db.getConversation() — checks owner + collaboration shares
+      // Do NOT add owner-only check here: shared users must be able to switch branches
       const conversation = await db.getConversation(req.params.id, req.userId);
-      if (!conversation || conversation.userId !== req.userId) {
+      if (!conversation) {
         return res.status(404).json({ error: 'Conversation not found' });
       }
 

@@ -22,6 +22,7 @@ async function createTestDatabase(): Promise<Database> {
   (db as any).conversationEventStore.baseDir = path.join(TEST_DATA_DIR, 'conversations');
   (db as any).uiStateStore.sharedBaseDir = path.join(TEST_DATA_DIR, 'conversation-state');
   (db as any).uiStateStore.userBaseDir = path.join(TEST_DATA_DIR, 'user-conversation-state');
+  (db as any).uiEventLog.basePath = path.join(TEST_DATA_DIR, 'conversations');
   return db;
 }
 
@@ -106,16 +107,17 @@ describe('UI State Migration', () => {
       await db.init();
       await (db as any).migrateUIStateFromJSON();
 
-      // Verify: Load conversation and check activeBranchId
-      // We need to manually replay conversation events to verify
-      const events = await (db as any).conversationEventStore.loadEvents(CONV_ID);
-      const activeBranchEvent = events.find((e: any) =>
+      // Verify: migration writes to UIEventLog (.ui.jsonl), not conversationEventStore
+      const uiFilePath = path.join(TEST_DATA_DIR, 'conversations',
+        CONV_ID.substring(0, 2), CONV_ID.substring(2, 4), `${CONV_ID}.ui.jsonl`);
+      const content = await fs.readFile(uiFilePath, 'utf-8');
+      const uiEvents = content.trim().split('\n').filter((l: string) => l.trim()).map((l: string) => JSON.parse(l));
+      const activeBranchEvent = uiEvents.find((e: any) =>
         e.type === 'active_branch_changed' && e.data.messageId === MSG_ID
       );
 
       expect(activeBranchEvent).toBeDefined();
       expect(activeBranchEvent.data.branchId).toBe(BRANCH_ID);
-      expect(activeBranchEvent.data.isMigration).toBe(true);
 
       await db.close();
     });
@@ -194,11 +196,15 @@ describe('UI State Migration', () => {
       expect(summary.errors.missingBranches).toBe(1);
       expect(summary.errors.fallbacksApplied).toBe(1);
 
-      // Verify fallback was applied
-      const events = await (db as any).conversationEventStore.loadEvents(CONV_ID);
-      const activeBranchEvent = events.find((e: any) =>
+      // Verify fallback was applied — check UIEventLog (.ui.jsonl)
+      const uiFilePath = path.join(TEST_DATA_DIR, 'conversations',
+        CONV_ID.substring(0, 2), CONV_ID.substring(2, 4), `${CONV_ID}.ui.jsonl`);
+      const content = await fs.readFile(uiFilePath, 'utf-8');
+      const uiEvents = content.trim().split('\n').filter((l: string) => l.trim()).map((l: string) => JSON.parse(l));
+      const activeBranchEvent = uiEvents.find((e: any) =>
         e.type === 'active_branch_changed' && e.data.messageId === MSG_ID
       );
+      expect(activeBranchEvent).toBeDefined();
       expect(activeBranchEvent.data.branchId).toBe(EXISTING_BRANCH);
 
       await db.close();
