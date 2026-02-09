@@ -15,6 +15,7 @@ import { getBlobStore } from './blob-store.js';
 import { CollaborationStore } from './collaboration.js';
 import { PersonaStore } from './persona.js';
 import { ConversationUIStateStore } from './conversation-ui-state.js';
+import { UIEventLog } from './ui-event-log.js';
 import { SharePermission, ConversationShare, canChat, canDelete } from '@deprecated-claude/shared';
 import {
   Persona,
@@ -164,6 +165,7 @@ export class Database {
   private collaborationStore: CollaborationStore;
   private personaStore: PersonaStore;
   private uiStateStore: ConversationUIStateStore;
+  private uiEventLog: UIEventLog;
   private initialized: boolean = false;
 
   constructor() {
@@ -175,6 +177,9 @@ export class Database {
     this.collaborationStore = new CollaborationStore();
     this.personaStore = new PersonaStore();
     this.uiStateStore = new ConversationUIStateStore();
+    // UI event log uses SAME base path as conversations (./data/conversations)
+    // Files sharded the same way: ./data/conversations/{s1}/{s2}/{id}.ui.jsonl
+    this.uiEventLog = new UIEventLog('./data/conversations');
   }
 
   // Helper methods for user conversation state
@@ -405,26 +410,61 @@ export class Database {
     // if we haven't loaded this conversation
     // and this conversation exists (loading the user will populate that metadata)
     if (!this.conversationsLastAccessedTimes.has(conversationId) && this.conversations.has(conversationId)) {
-      // then load its messages and metrics
+      // Replay events + collect legacy active_branch_changed for UIEventLog migration
+      // SKIP active_branch_changed from replay — UIEventLog is the single source of truth
+      const legacyBranches: Record<string, string> = {};
       for (const event of await this.conversationEventStore.loadEvents(conversationId)) {
+        if (event.type === 'active_branch_changed' && event.data) {
+          legacyBranches[event.data.messageId] = event.data.branchId;
+          continue;  // SKIP — don't replay, just collect for migration
+        }
         await this.replayEvent(event);
       }
-      
-      // Apply saved branch selections from the shared UI state store
-      // (these are NOT in the event log to avoid bloat)
-      const sharedState = await this.uiStateStore.loadShared(conversationId);
-      for (const [messageId, branchId] of Object.entries(sharedState.activeBranches)) {
-        const message = this.messages.get(messageId);
-        if (message) {
-          const branch = message.branches.find(b => b.id === branchId);
-          if (branch) {
-            const updated = { ...message, activeBranchId: branchId };
-            this.messages.set(messageId, updated);
-          }
-        }
-      }
+
+      // Race-safe migration + get branches from .ui.jsonl
+      const branchesToApply = await this.uiEventLog.ensureMigratedAndGetBranches(
+        conversationId,
+        legacyBranches
+      );
+
+      // Apply UI state to messages (UIEventLog is the single source of truth)
+      this.applyBranchesToMessages(branchesToApply);
     }
     this.conversationsLastAccessedTimes.set(conversationId, new Date());
+  }
+
+  /**
+   * Apply branch selections from UIEventLog to in-memory messages.
+   * - Checks that branch exists on the message
+   * - Falls back to first branch if saved branch is gone (deterministic default)
+   */
+  private applyBranchesToMessages(branches: Record<string, string>): void {
+    let deadBranchCount = 0;
+
+    for (const [messageId, branchId] of Object.entries(branches)) {
+      const message = this.messages.get(messageId);
+      if (!message) continue;
+
+      // Check that branch exists — use b.id (real type field)
+      const branch = message.branches.find(b => b.id === branchId);
+
+      if (branch) {
+        const updated = { ...message, activeBranchId: branchId };
+        this.messages.set(messageId, updated);
+      } else {
+        // Fallback to first branch (deterministic, predictable default)
+        if (message.branches.length > 0) {
+          const fallback = message.branches[0];
+          const updated = { ...message, activeBranchId: fallback.id };
+          this.messages.set(messageId, updated);
+        }
+        deadBranchCount++;
+      }
+    }
+
+    if (deadBranchCount > 0) {
+      console.warn(`[Database] ${deadBranchCount} saved branches were deleted, using fallbacks`);
+    }
   }
 
   // Public method to ensure conversation events are loaded (for cached counts like totalBranchCount)
@@ -442,6 +482,7 @@ export class Database {
 
     // Clear cached UI state
     this.uiStateStore.clearCache(conversationId);
+    this.uiEventLog.clearCache(conversationId);
 
     this.conversationsLastAccessedTimes.delete(conversationId);
   }
@@ -3167,12 +3208,12 @@ export class Database {
     const branch = message.branches.find(b => b.id === branchId);
     if (!branch) return false;
 
-    // Use unified event write (append + replay atomically updates in-memory state)
-    await this.appendAndReplayConversationEvent(conversationId, 'active_branch_changed', {
-      messageId,
-      branchId,
-      changedByUserId
-    });
+    // Persist to UIEventLog (.ui.jsonl) first, then update memory (crash-safe order)
+    await this.uiEventLog.setActiveBranch(conversationId, messageId, branchId, changedByUserId);
+
+    // Update in-memory state
+    const updated = { ...message, activeBranchId: branchId };
+    this.messages.set(messageId, updated);
 
     // Don't update conversation timestamp for branch switches - it's just navigation
 
@@ -6085,12 +6126,14 @@ export class Database {
           }
         }
 
-        // 4. Write event through unified pattern
-        await this.appendAndReplayConversationEvent(conversationId, 'active_branch_changed', {
-          messageId,
-          branchId: finalBranchId,
-          isMigration: true
-        });
+        // 4. Write to UIEventLog (.ui.jsonl) instead of conversation JSONL
+        await this.uiEventLog.setActiveBranch(conversationId, messageId, finalBranchId);
+        // Update in-memory state if conversation is loaded
+        const msg = this.messages.get(messageId);
+        if (msg) {
+          const updatedMsg = { ...msg, activeBranchId: finalBranchId };
+          this.messages.set(messageId, updatedMsg);
+        }
       }
 
       // 5. Write marker to main eventStore
