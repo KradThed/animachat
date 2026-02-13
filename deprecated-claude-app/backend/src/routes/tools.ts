@@ -173,5 +173,36 @@ export function toolsRouter(deps: ToolsRouterDeps = {}): Router {
     }
   });
 
+  /**
+   * POST /api/tools/test
+   * Test a tool with empty input. 10s timeout.
+   */
+  router.post('/test', async (req: AuthRequest, res: Response) => {
+    if (!req.userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const { toolName } = req.body;
+    if (!toolName || typeof toolName !== 'string') {
+      return res.status(400).json({ error: 'toolName required' });
+    }
+
+    try {
+      const result = await registry.executeTool(
+        { id: `test-${Date.now()}`, name: toolName, input: {} },
+        req.userId,
+        { toolsEnabled: true, enabledTools: null, toolTimeout: 10_000 },
+      );
+      res.json({
+        success: !result.isError,
+        content: (typeof result.content === 'string'
+          ? result.content : JSON.stringify(result.content)
+        ).slice(0, 2000),
+      });
+    } catch (err: any) {
+      res.json({ success: false, content: err.message || 'Unknown error' });
+    }
+  });
+
   return router;
 }

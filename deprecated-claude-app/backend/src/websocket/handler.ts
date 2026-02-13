@@ -15,7 +15,10 @@ import { USER_FACING_ERRORS } from '../utils/error-messages.js';
 import { checkContent, type UserContext } from '../services/content-filter.js';
 import { toolRegistry } from '../tools/tool-registry.js';
 import type { ToolCall, ToolResult } from '../tools/tool-registry.js';
-import { delegateWebsocketHandler } from '../delegate/delegate-handler.js';
+import { delegateWebsocketHandler, resolveScopeChange, resolveScopeElevate } from '../delegate/delegate-handler.js';
+import { mcplHookManager } from '../services/mcpl-hook-manager.js';
+import { mcplEventQueue } from '../services/mcpl-event-queue.js';
+import type { McplContextInjection } from '@deprecated-claude/shared';
 
 interface AuthenticatedWebSocket extends WebSocket {
   userId?: string;
@@ -64,16 +67,21 @@ function abortGeneration(userId: string, conversationId: string): boolean {
  * For group chats: uses responder.toolConfig
  * Returns undefined if no tools are available or tools are disabled.
  */
-function buildToolOptions(
-  userId: string,
-  conversation: Conversation,
-  responder?: Participant
-): {
+interface ToolOptions {
   tools: any[];
+  snapshotHash: string;
+  toolCount: number;
   onToolCall?: (call: ToolCall) => void;
   onToolResult?: (result: ToolResult) => void;
   executeToolCall: (call: ToolCall) => Promise<ToolResult>;
-} | undefined {
+}
+
+function buildToolOptions(
+  userId: string,
+  conversation: Conversation,
+  responder?: Participant,
+  db?: import('../database/index.js').Database
+): ToolOptions | undefined {
   // Determine which toolConfig to use:
   // - For 1-on-1 (standard) chats: conversation.toolConfig
   // - For group chats: responder.toolConfig
@@ -94,8 +102,12 @@ function buildToolOptions(
     return undefined;
   }
 
-  // Get all tools available to this user
-  const allTools = toolRegistry.getToolsForUser(userId);
+  // Get all tools available to this user (filtering disabled servers if db available)
+  const conversationId = conversation.id;
+  const isServerEnabled = db
+    ? (serverId: string) => db.isServerEnabled(conversationId, serverId)
+    : undefined;
+  const allTools = toolRegistry.getToolsForUser(userId, isServerEnabled);
   console.log('[buildToolOptions] All tools for user:', allTools.length);
 
   // Filter by toolConfig if present
@@ -113,11 +125,15 @@ function buildToolOptions(
     return undefined;
   }
 
-  console.log('[buildToolOptions] Returning toolOptions with', tools.length, 'tools');
+  const snapshotHash = toolRegistry.computeToolsetHash(tools);
+
+  console.log('[buildToolOptions] Returning toolOptions with', tools.length, 'tools, hash:', snapshotHash);
   return {
     tools,
+    snapshotHash,
+    toolCount: tools.length,
     executeToolCall: async (call: ToolCall): Promise<ToolResult> => {
-      return toolRegistry.executeTool(call, userId, toolConfig);
+      return toolRegistry.executeTool(call, userId, toolConfig, conversationId);
     }
   };
 }
@@ -401,17 +417,13 @@ interface ParallelInferenceParams {
   abortSignal: AbortSignal;
   creationSource: 'inference' | 'regeneration';
   conversationId: string; // For room broadcasts
-  toolOptions?: {
-    tools?: any[];
-    onToolCall?: (call: ToolCall) => void;
-    onToolResult?: (result: ToolResult) => void;
-    executeToolCall?: (call: ToolCall) => Promise<ToolResult>;
-  };
+  toolOptions?: ToolOptions;
 }
 
 /**
  * Run inference on multiple branches in parallel.
  * Creates additional branches if samplingBranchCount > 1, then runs inference on all branches.
+ * Records tool snapshot events before inference for audit trail.
  * @returns Array of branch IDs that were generated
  */
 async function runParallelBranchInference(params: ParallelInferenceParams): Promise<string[]> {
@@ -438,6 +450,71 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
     conversationId,
     toolOptions
   } = params;
+
+  // Record tool snapshot for this inference turn (Phase 2c)
+  let effectiveSystemPrompt = systemPrompt;
+  if (toolOptions) {
+    try {
+      const turnId = initialBranchId; // use first branch ID as turn identifier
+      const toolsetChangeInfo = await db.recordToolsetForInference(
+        conversationId,
+        turnId,
+        toolOptions.tools,
+        toolOptions.snapshotHash
+      );
+
+      // Phase 2d: Inject toolset change notification into system prompt
+      if (toolsetChangeInfo.changed) {
+        const parts: string[] = [];
+        if (toolsetChangeInfo.added.length > 0) {
+          parts.push(`Added: ${toolsetChangeInfo.added.join(', ')}`);
+        }
+        if (toolsetChangeInfo.removed.length > 0) {
+          parts.push(`Removed: ${toolsetChangeInfo.removed.join(', ')}`);
+        }
+        const available = toolOptions.tools.map((t: any) => t.name).join(', ');
+        const changeNotice = `[System: Tool availability changed. ${parts.join('. ')}. Available: ${available}]`;
+        effectiveSystemPrompt = effectiveSystemPrompt
+          ? `${effectiveSystemPrompt}\n\n${changeNotice}`
+          : changeNotice;
+        console.log(`[ParallelInference] Toolset changed for conversation ${conversationId.substring(0, 8)}... +${toolsetChangeInfo.added.length}/-${toolsetChangeInfo.removed.length}`);
+      }
+    } catch (err) {
+      console.error('[ParallelInference] Failed to record toolset snapshot:', err);
+    }
+  }
+
+  // Phase 4: MCPL beforeInference hooks — collect context injections
+  try {
+    const injections = await mcplHookManager.beforeInference(
+      conversation.userId,
+      conversationId,
+      undefined,  // messagesSummary
+      0,          // hookDepth: top-level inference (user message or push event)
+    );
+    if (injections.length > 0) {
+      // Place injections by position (already sorted by serverId)
+      const systemInjections = injections.filter(i => i.position === 'system').map(i => i.content);
+      if (systemInjections.length > 0) {
+        effectiveSystemPrompt = effectiveSystemPrompt
+          ? `${effectiveSystemPrompt}\n\n${systemInjections.join('\n')}`
+          : systemInjections.join('\n');
+      }
+      // beforeUser and afterUser injections would modify historyMessages
+      // but historyMessages is const from destructuring — for MVP, append to system prompt
+      const beforeUserInjections = injections.filter(i => i.position === 'beforeUser').map(i => i.content);
+      const afterUserInjections = injections.filter(i => i.position === 'afterUser').map(i => i.content);
+      if (beforeUserInjections.length > 0 || afterUserInjections.length > 0) {
+        const contextNotes = [...beforeUserInjections, ...afterUserInjections].join('\n');
+        effectiveSystemPrompt = effectiveSystemPrompt
+          ? `${effectiveSystemPrompt}\n\n${contextNotes}`
+          : contextNotes;
+      }
+      console.log(`[ParallelInference] MCPL injected ${injections.length} context block(s)`);
+    }
+  } catch (err) {
+    console.error('[ParallelInference] MCPL beforeInference error:', err);
+  }
 
   // Track branches to generate
   const branchesToGenerate: { branchId: string; branchContent: string }[] = [
@@ -510,11 +587,11 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
   // Helper function to run inference for a single branch
   const runBranchInference = async (branchId: string, branchIndex: number) => {
     let branchContent = '';
-    
+
     await inferenceService.streamCompletion(
       modelConfig,
       historyMessages,
-      systemPrompt,
+      effectiveSystemPrompt,
       settings,
       conversation.userId,
       async (chunk: string, isComplete: boolean, contentBlocks?: any[], usage?: any) => {
@@ -630,7 +707,12 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
   await Promise.all(
     branchesToGenerate.map((branch, index) => runBranchInference(branch.branchId, index))
   );
-  
+
+  // Phase 4: MCPL afterInference hooks — fire-and-forget notify
+  mcplHookManager.afterInference(conversation.userId, conversationId).catch(err => {
+    console.error('[ParallelInference] MCPL afterInference error:', err);
+  });
+
   // Return the branch IDs that were generated
   return branchesToGenerate.map(b => b.branchId);
 }
@@ -680,8 +762,38 @@ export function websocketHandler(ws: AuthenticatedWebSocket, req: IncomingMessag
 
   ws.on('message', async (data) => {
     try {
-      const message = WsMessageSchema.parse(JSON.parse(data.toString()));
-      
+      const raw = JSON.parse(data.toString());
+
+      // Handle MCPL messages (not part of WsMessageSchema)
+      if (raw.type === 'mcpl/pause_queue' && raw.conversationId && ws.userId) {
+        mcplEventQueue.pause(raw.conversationId);
+        return;
+      }
+      if (raw.type === 'mcpl/resume_queue' && raw.conversationId && ws.userId) {
+        mcplEventQueue.resume(raw.conversationId);
+        return;
+      }
+      if ((raw.type === 'mcpl/scope_change_approved' || raw.type === 'mcpl/scope_change_denied') && raw.requestId && ws.userId) {
+        resolveScopeChange(
+          raw.requestId as string,
+          raw.type === 'mcpl/scope_change_approved',
+          db,
+          raw.type === 'mcpl/scope_change_approved' ? (raw.newCapabilities as string[] | undefined) : undefined,
+        );
+        return;
+      }
+      if ((raw.type === 'mcpl/scope_elevate_approved' || raw.type === 'mcpl/scope_elevate_denied') && raw.requestId && ws.userId) {
+        resolveScopeElevate(
+          raw.requestId as string,
+          raw.type === 'mcpl/scope_elevate_approved',
+          raw.remember as boolean | undefined,
+          db,
+        );
+        return;
+      }
+
+      const message = WsMessageSchema.parse(raw);
+
       if (!ws.userId) {
         ws.send(JSON.stringify({ type: 'error', error: 'Not authenticated' }));
         return;
@@ -729,7 +841,7 @@ export function websocketHandler(ws: AuthenticatedWebSocket, req: IncomingMessag
           // This is separate from WebSocket protocol-level ping/pong
           ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
           break;
-          
+
         default:
           ws.send(JSON.stringify({ type: 'error', error: 'Unknown message type' }));
       }
@@ -1215,7 +1327,7 @@ async function handleChatMessage(
         abortSignal: abortController.signal,
         creationSource: 'inference',
         conversationId: message.conversationId,
-        toolOptions: buildToolOptions(conversation.userId, conversation, responder)
+        toolOptions: buildToolOptions(conversation.userId, conversation, responder, db)
       });
 
     // DEBUG CAPTURE: Capture debug data for the first branch after completion
@@ -1592,7 +1704,7 @@ async function handleRegenerate(
         abortSignal: abortController.signal,
         creationSource: 'regeneration',
         conversationId: message.conversationId,
-        toolOptions: buildToolOptions(conversation.userId, conversation, responderParticipant)
+        toolOptions: buildToolOptions(conversation.userId, conversation, responderParticipant, db)
       });
     } finally {
       endGeneration(conversation.userId, conversation.id);
@@ -2029,7 +2141,7 @@ async function handleEdit(
           abortSignal: abortController.signal,
           creationSource: 'inference',
           conversationId: message.conversationId,
-          toolOptions: buildToolOptions(conversation.userId, conversation, responderParticipant)
+          toolOptions: buildToolOptions(conversation.userId, conversation, responderParticipant, db)
         });
       } finally {
         endGeneration(conversation.userId, conversation.id);
@@ -2403,7 +2515,7 @@ async function handleContinue(
         abortSignal: abortController.signal,
         creationSource: 'inference',
         conversationId,
-        toolOptions: buildToolOptions(conversation.userId, conversation, responder)
+        toolOptions: buildToolOptions(conversation.userId, conversation, responder, db)
       });
 
       // DEBUG CAPTURE: Capture debug data for the first branch after completion

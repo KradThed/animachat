@@ -198,6 +198,12 @@
 
         <!-- Fixed footer section - compact -->
         <div class="sidebar-footer">
+          <!-- MCPL queue widget -->
+          <McplQueueWidget
+            v-if="mcplQueueState.totalCount > 0"
+            :queue="mcplQueueState"
+            @toggle-pause="toggleQueuePause"
+          />
           <!-- Delegate status indicator -->
           <div class="sidebar-delegate-indicator px-2 py-1">
             <DelegateIndicator />
@@ -615,7 +621,27 @@
           <v-icon class="mr-2">mdi-clock-outline</v-icon>
           Your message was sent, but AI response is pending (another request in progress).
         </v-alert>
-        
+
+        <!-- MCPL scope change approval dialogs -->
+        <ScopeChangeDialog
+          v-for="req in pendingScopeChanges"
+          :key="req.requestId"
+          :request="req"
+          class="mb-2"
+          @approve="approveScopeChange"
+          @deny="denyScopeChange"
+        />
+
+        <!-- MCPL scope elevate approval dialogs -->
+        <ScopeElevateDialog
+          v-for="req in pendingScopeElevates"
+          :key="req.requestId"
+          :request="req"
+          class="mb-2"
+          @approve="approveScopeElevate"
+          @deny="denyScopeElevate"
+        />
+
         <!-- Drop zone wrapper for drag-and-drop attachments -->
         <div 
           class="input-drop-zone"
@@ -1219,6 +1245,9 @@ import ModelPillBar from '@/components/ModelPillBar.vue';
 import AddParticipantDialog from '@/components/AddParticipantDialog.vue';
 import { getModelColor } from '@/utils/modelColors';
 import { computeAuthenticity, type AuthenticityStatus } from '@/utils/authenticity';
+import ScopeChangeDialog from '@/components/ScopeChangeDialog.vue';
+import ScopeElevateDialog from '@/components/ScopeElevateDialog.vue';
+import McplQueueWidget from '@/components/McplQueueWidget.vue';
 
 const route = useRoute();
 const router = useRouter();
@@ -1306,6 +1335,82 @@ const isAiRequestQueued = ref(false); // True if our request was queued because 
 const hiddenFromAi = ref(false); // Toggle for sending messages hidden from AI
 const samplingBranches = ref(1); // Number of response branches to generate
 const showEventHistory = ref(false); // Toggle for event history panel
+
+// MCPL scope change state
+interface ScopeChangeServer { url: string; name: string; reason: string; }
+interface PendingScopeChange {
+  requestId: string;
+  conversationId: string;
+  delegateId: string;
+  delegateName: string;
+  servers: ScopeChangeServer[];
+  timeout: number;
+  receivedAt: number;
+}
+const pendingScopeChanges = ref<PendingScopeChange[]>([]);
+
+// MCPL scope elevate state
+interface PendingScopeElevate {
+  requestId: string;
+  conversationId: string;
+  delegateId: string;
+  delegateName: string;
+  featureSet: string;
+  label: string;
+  requestedCapabilities: string[];
+  reason: string;
+  timeout: number;
+  receivedAt: number;
+}
+const pendingScopeElevates = ref<PendingScopeElevate[]>([]);
+
+// MCPL queue state
+interface McplQueueItem { id: string; source: string; eventType: string; status: string; timestamp: string; }
+interface McplQueueState { items: McplQueueItem[]; totalCount: number; isPaused: boolean; }
+const mcplQueueState = ref<McplQueueState>({ items: [], totalCount: 0, isPaused: false });
+
+function toggleQueuePause() {
+  if (!currentConversation.value) return;
+  const type = mcplQueueState.value.isPaused ? 'mcpl/resume_queue' : 'mcpl/pause_queue';
+  store.state.wsService?.sendMessage({
+    type,
+    conversationId: currentConversation.value.id,
+  } as any);
+}
+
+function approveScopeChange(requestId: string) {
+  store.state.wsService?.sendMessage({
+    type: 'mcpl/scope_change_approved',
+    requestId,
+  } as any);
+  pendingScopeChanges.value = pendingScopeChanges.value.filter(s => s.requestId !== requestId);
+}
+
+function denyScopeChange(requestId: string) {
+  store.state.wsService?.sendMessage({
+    type: 'mcpl/scope_change_denied',
+    requestId,
+  } as any);
+  pendingScopeChanges.value = pendingScopeChanges.value.filter(s => s.requestId !== requestId);
+}
+
+function approveScopeElevate(requestId: string, remember: boolean) {
+  store.state.wsService?.sendMessage({
+    type: 'mcpl/scope_elevate_approved',
+    requestId,
+    remember,
+  } as any);
+  pendingScopeElevates.value = pendingScopeElevates.value.filter(s => s.requestId !== requestId);
+}
+
+function denyScopeElevate(requestId: string, remember: boolean) {
+  store.state.wsService?.sendMessage({
+    type: 'mcpl/scope_elevate_denied',
+    requestId,
+    remember,
+  } as any);
+  pendingScopeElevates.value = pendingScopeElevates.value.filter(s => s.requestId !== requestId);
+}
 
 // Computed: Check if this is a multiuser conversation (shared or has multiple users)
 const isMultiuserConversation = computed(() => {
@@ -2425,6 +2530,48 @@ onMounted(async () => {
           isAiRequestQueued.value = true;
         }
       });
+
+      // MCPL scope change approval requests
+      store.state.wsService.on('mcpl/scope_change_approval_needed', (data: any) => {
+        if (data.conversationId && data.conversationId !== currentConversation.value?.id) return;
+        pendingScopeChanges.value.push({
+          requestId: data.requestId,
+          conversationId: data.conversationId || '',
+          delegateId: data.delegateId,
+          delegateName: data.delegateName || data.delegateId,
+          servers: data.requestedCapabilities?.servers || [],
+          timeout: data.timeout || 300,
+          receivedAt: Date.now(),
+        });
+      });
+
+      // MCPL scope elevate approval requests
+      store.state.wsService.on('mcpl/scope_elevate_approval_needed', (data: any) => {
+        if (data.conversationId && data.conversationId !== currentConversation.value?.id) return;
+        pendingScopeElevates.value.push({
+          requestId: data.requestId,
+          conversationId: data.conversationId || '',
+          delegateId: data.delegateId,
+          delegateName: data.delegateName || data.delegateId,
+          featureSet: data.featureSet,
+          label: data.label,
+          requestedCapabilities: data.requestedCapabilities || [],
+          reason: data.reason || '',
+          timeout: data.timeout || 60,
+          receivedAt: Date.now(),
+        });
+      });
+
+      // MCPL queue updates
+      store.state.wsService.on('mcpl/queue_update', (data: any) => {
+        if (data.conversationId === currentConversation.value?.id) {
+          mcplQueueState.value = {
+            items: data.queue || [],
+            totalCount: data.totalCount || 0,
+            isPaused: data.isPaused || false,
+          };
+        }
+      });
     }
   });
   
@@ -2568,7 +2715,12 @@ watch(() => getConversationIdFromRoute(), async (newId, oldId) => {
   streamingMessageId.value = null;
   streamingBranchId.value = null;
   streamingError.value = null;
-  
+
+  // Clear MCPL state for previous conversation
+  pendingScopeChanges.value = [];
+  pendingScopeElevates.value = [];
+  mcplQueueState.value = { items: [], totalCount: 0, isPaused: false };
+
   if (newId) {
     console.log(`[ConversationView:watch] Route changed to: ${newId}`);
     const loadStart = Date.now();

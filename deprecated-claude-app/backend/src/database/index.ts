@@ -300,19 +300,91 @@ export class Database {
     return event;
   }
 
+  // ---------------------------------------------------------------------------
+  // Event Store Truncation
+  // ---------------------------------------------------------------------------
+
+  private static readonly EVENT_PAYLOAD_THRESHOLD = 16 * 1024; // 16KB
+
+  /** Only these event types can have their payloads truncated to BlobStore.
+   *  Rule: if replay reads data to restore state → don't truncate.
+   *  If audit-only → safe to truncate. */
+  private static readonly TRUNCATABLE_EVENTS = new Set([
+    'tool_result',
+    'tool_snapshot_written',
+    'push_event_received',
+    'push_event_processed',
+    'debug_request',
+  ]);
+
+  private async truncateEventPayload(type: string, data: any): Promise<any> {
+    if (!Database.TRUNCATABLE_EVENTS.has(type)) return data; // state events — as-is
+    const json = JSON.stringify(data);
+    if (Buffer.byteLength(json, 'utf8') <= Database.EVENT_PAYLOAD_THRESHOLD) return data;
+    const blobStore = getBlobStore();
+    const blobId = await blobStore.saveJsonBlob(data);
+    return {
+      _truncated: true,
+      blobId,
+      originalSize: Buffer.byteLength(json, 'utf8'),
+      summary: json.slice(0, 200),
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Replay Callbacks (dependency inversion — Database knows nothing about MCPL services)
+  // ---------------------------------------------------------------------------
+
+  private replayCallbacks: Map<string, (data: any) => void> = new Map();
+
+  onReplayEvent(type: string, callback: (data: any) => void): void {
+    this.replayCallbacks.set(type, callback);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Disabled Servers State (per-conversation)
+  // ---------------------------------------------------------------------------
+
+  private disabledServers: Map<string, Set<string>> = new Map(); // conversationId → Set<serverId>
+
+  isServerEnabled(conversationId: string, serverId: string): boolean {
+    return !this.disabledServers.get(conversationId)?.has(serverId);
+  }
+
+  async setServerEnabled(
+    conversationId: string,
+    serverId: string,
+    delegateId: string,
+    enabled: boolean,
+    source: 'agent' | 'user'
+  ): Promise<void> {
+    // _conversationId included for replay — replayEvent doesn't receive the partition key
+    await this.appendAndReplayConversationEvent(conversationId, 'server_enabled_changed', {
+      _conversationId: conversationId, serverId, delegateId, enabled, source,
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Append + Replay
+  // ---------------------------------------------------------------------------
+
   private async appendAndReplayConversationEvent(
     conversationId: string,
     type: string,
     data: any
   ): Promise<Event> {
+    // Truncate payload for disk if applicable (in-memory replay uses original data)
+    const diskData = await this.truncateEventPayload(type, data);
     const event: Event = {
       timestamp: new Date(),
       type,
-      data: { ...data }
+      data: { ...diskData }
     };
     await this.conversationEventStore.appendEvent(conversationId, event);
+    // Replay with original data (not truncated) for correct in-memory state
+    const replayEvent: Event = { ...event, data: { ...data } };
     try {
-      await this.replayEvent(event);
+      await this.replayEvent(replayEvent);
     } catch (replayError) {
       console.error(`[CRITICAL] Replay failed after successful append`, {
         type,
@@ -332,14 +404,18 @@ export class Database {
     type: string,
     data: any
   ): Promise<Event> {
+    // Truncate payload for disk if applicable (in-memory replay uses original data)
+    const diskData = await this.truncateEventPayload(type, data);
     const event: Event = {
       timestamp: new Date(),
       type,
-      data: { ...data }
+      data: { ...diskData }
     };
     await this.userEventStore.appendEvent(userId, event);
+    // Replay with original data (not truncated) for correct in-memory state
+    const replayEvent: Event = { ...event, data: { ...data } };
     try {
-      await this.replayEvent(event);
+      await this.replayEvent(replayEvent);
     } catch (replayError) {
       console.error(`[CRITICAL] Replay failed after successful append`, {
         type,
@@ -352,6 +428,18 @@ export class Database {
       throw replayError;
     }
     return event;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Public MCPL Event Methods
+  // ---------------------------------------------------------------------------
+
+  async appendMcplConversationEvent(conversationId: string, type: string, data: any): Promise<void> {
+    await this.appendAndReplayConversationEvent(conversationId, type, data);
+  }
+
+  async appendMcplUserEvent(userId: string, type: string, data: any): Promise<void> {
+    await this.appendAndReplayUserEvent(userId, type, data);
   }
 
   private async migrateDatabase(): Promise<void> {
@@ -1690,6 +1778,71 @@ export class Database {
         if (migrationVersion > prev) {
           this.migratedUIStateKeys.set(migrationKey, migrationVersion);
         }
+        break;
+      }
+
+      // ==================== TOOL SNAPSHOT EVENTS ====================
+
+      case 'tool_snapshot_written': {
+        const { conversationId: snapConvId, snapshotHash, tools: snapshotTools } = event.data;
+        if (snapConvId) {
+          this.lastToolsetHash.set(snapConvId, snapshotHash);
+          if (Array.isArray(snapshotTools)) {
+            this.lastToolsetSnapshot.set(snapConvId, snapshotTools.map((t: any) => t.name));
+          }
+        }
+        break;
+      }
+
+      case 'toolset_bound': {
+        // Lightweight — no state to rebuild (hash already set by tool_snapshot_written)
+        break;
+      }
+
+      // MCPL event store events
+      case 'push_event_received':
+      case 'push_event_processed':
+      case 'push_event_rate_limited':
+      case 'scope_change_resolved':
+        // Audit trail only — no in-memory state to rebuild
+        break;
+
+      case 'inference_request_completed': {
+        const cb = this.replayCallbacks.get('inference_request_completed');
+        if (cb) cb(event.data);
+        break;
+      }
+
+      case 'server_enabled_changed': {
+        const { serverId, enabled } = event.data;
+        // conversationId is implicit from the event store partition
+        // For replay, we need to find which conversation this belongs to
+        // The conversationId is passed via the event store key
+        if (!enabled) {
+          // We'll use a special _conversationId field if available
+          const convId = event.data._conversationId;
+          if (convId) {
+            if (!this.disabledServers.has(convId)) this.disabledServers.set(convId, new Set());
+            this.disabledServers.get(convId)!.add(serverId);
+          }
+        } else {
+          const convId = event.data._conversationId;
+          if (convId) {
+            this.disabledServers.get(convId)?.delete(serverId);
+          }
+        }
+        break;
+      }
+
+      case 'scope_policy_updated': {
+        const cb = this.replayCallbacks.get('scope_policy_updated');
+        if (cb) cb(event.data);
+        break;
+      }
+
+      case 'checkpoint_tree_updated': {
+        const cb = this.replayCallbacks.get('checkpoint_tree_updated');
+        if (cb) cb(event.data);
         break;
       }
 
@@ -3290,6 +3443,63 @@ export class Database {
       this.conversations.set(conversationId, updated);
     }
   }
+
+  // ==================== TOOL SNAPSHOT EVENTS ====================
+
+  /** Last known toolset hash per conversation (in-memory, rebuilt on replay) */
+  private lastToolsetHash: Map<string, string> = new Map();
+
+  /**
+   * Record which tools were available for an inference turn.
+   * Two-level optimization:
+   * - tool_snapshot_written: full tool list, emitted only when hash changes
+   * - toolset_bound: lightweight reference (~50 bytes), emitted every inference
+   *
+   * Returns the list of added/removed tool names (for system message injection).
+   */
+  async recordToolsetForInference(
+    conversationId: string,
+    turnId: string,
+    tools: Array<{ name: string; description: string; inputSchema: unknown }>,
+    snapshotHash: string
+  ): Promise<{ changed: boolean; added: string[]; removed: string[] }> {
+    const previousHash = this.lastToolsetHash.get(conversationId);
+    const changed = previousHash !== undefined && previousHash !== snapshotHash;
+    let added: string[] = [];
+    let removed: string[] = [];
+
+    // If hash changed (or first time), write full snapshot
+    if (previousHash !== snapshotHash) {
+      // Compute diff if we had a previous snapshot
+      if (changed && this.lastToolsetSnapshot.has(conversationId)) {
+        const prevNames = new Set(this.lastToolsetSnapshot.get(conversationId)!);
+        const currNames = new Set(tools.map(t => t.name));
+        added = [...currNames].filter(n => !prevNames.has(n));
+        removed = [...prevNames].filter(n => !currNames.has(n));
+      }
+
+      await this.appendAndReplayConversationEvent(conversationId, 'tool_snapshot_written', {
+        conversationId,
+        snapshotHash,
+        toolCount: tools.length,
+        tools: tools.map(t => ({ name: t.name, description: t.description })),
+      });
+      this.lastToolsetHash.set(conversationId, snapshotHash);
+      this.lastToolsetSnapshot.set(conversationId, tools.map(t => t.name));
+    }
+
+    // Always write lightweight binding
+    await this.appendAndReplayConversationEvent(conversationId, 'toolset_bound', {
+      turnId,
+      snapshotHash,
+      toolCount: tools.length,
+    });
+
+    return { changed, added, removed };
+  }
+
+  /** Last snapshot tool names per conversation (for computing diffs) */
+  private lastToolsetSnapshot: Map<string, string[]> = new Map();
 
   async updateMessage(messageId: string, conversationId: string, conversationOwnerUserId: string, message: Message, updatedByUserId?: string): Promise<boolean> {
     const oldMessage = await this.tryLoadAndVerifyMessage(messageId, conversationId, conversationOwnerUserId);

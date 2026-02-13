@@ -126,3 +126,11 @@ export async function revokeDelegateApiKey(keyId: string): Promise<{ success: bo
   const response = await api.delete(`/tools/api-keys/${keyId}`);
   return response.data;
 }
+
+/**
+ * Test a tool with empty input (10s timeout)
+ */
+export async function testTool(toolName: string): Promise<{ success: boolean; content: string }> {
+  const response = await api.post('/tools/test', { toolName });
+  return response.data;
+}

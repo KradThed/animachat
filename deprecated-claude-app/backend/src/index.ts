@@ -206,6 +206,39 @@ async function startServer() {
     const modelLoader = ModelLoader.getInstance();
     modelLoader.setDatabase(db);
     console.log('ModelLoader initialized with database');
+
+    // Initialize MCPL services with database
+    const { mcplEventQueue } = await import('./services/mcpl-event-queue.js');
+    mcplEventQueue.setDatabase(db);
+    const { mcplInferenceBroker } = await import('./services/mcpl-inference-broker.js');
+    mcplInferenceBroker.setDatabase(db);
+    const { registerMcplManagementTools } = await import('./tools/mcpl-management-tools.js');
+    registerMcplManagementTools(db);
+    const { mcplStateManager } = await import('./services/mcpl-state-manager.js');
+    mcplStateManager.setDatabase(db);
+
+    // Wire replay callback for inference budget (dependency inversion — no circular imports)
+    db.onReplayEvent('inference_request_completed', (data) => {
+      const ts = new Date(data.timestamp).getTime();
+      if (ts > Date.now() - 60 * 60 * 1000) {
+        mcplInferenceBroker.addCompletedTimestamp(ts);
+      }
+    });
+
+    // Wire replay callback for scope policies (dependency inversion)
+    const { setScopePolicy } = await import('./delegate/delegate-handler.js');
+    db.onReplayEvent('scope_policy_updated', (data) => {
+      if (data._userId && data.delegateId && data.policy) {
+        setScopePolicy(data._userId, data.delegateId, data.policy);
+      }
+    });
+
+    db.onReplayEvent('checkpoint_tree_updated', (data) => {
+      // Replay rebuilds tree structure + state snapshots (approach a)
+      mcplStateManager.replayCheckpointEvent(data);
+    });
+
+    console.log('MCPL services initialized with database');
     
     // Pre-populate OpenRouter pricing cache and register lazy refresh callback
     const openRouterService = new OpenRouterService(db);
