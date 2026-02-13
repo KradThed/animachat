@@ -47,6 +47,28 @@ export class DelegateManager {
   /** Pending tool calls keyed by requestId */
   private pendingCalls: Map<string, PendingToolCall> = new Map();
 
+  /**
+   * Stable serverId mapping: `{delegateId}:{serverName}` → UUID.
+   * Generated on first appearance, persists for the lifetime of the process.
+   * Survives delegate reconnects (same delegateId + serverName → same serverId).
+   */
+  private serverIdMap: Map<string, string> = new Map();
+
+  /**
+   * Get or create a stable serverId for a (delegateId, serverName) pair.
+   * The serverId is a UUID that stays stable across reconnects within the same process.
+   */
+  getOrCreateServerId(delegateId: string, serverName: string): string {
+    const key = `${delegateId}:${serverName}`;
+    let serverId = this.serverIdMap.get(key);
+    if (!serverId) {
+      serverId = randomUUID();
+      this.serverIdMap.set(key, serverId);
+      console.log(`[DelegateManager] New serverId for ${key}: ${serverId}`);
+    }
+    return serverId;
+  }
+
   // --------------------------------------------------------------------------
   // Delegate Lifecycle
   // --------------------------------------------------------------------------
@@ -189,7 +211,8 @@ export class DelegateManager {
     delegateId: string,
     userId: string,
     call: { id: string; name: string; input: Record<string, unknown> },
-    timeoutMs: number = 300_000  // 5min safety net — real timeout in ToolRegistry.executeWithTimeout()
+    timeoutMs: number = 300_000,  // 5min safety net — real timeout in ToolRegistry.executeWithTimeout()
+    scopeContext?: { featureSet: string; activeCapabilities: string[] },  // Phase 7 Batch 4c — scope tagging
   ): Promise<ToolResult> {
     const delegate = this.findDelegate(userId, delegateId);
     if (!delegate) {
@@ -221,6 +244,7 @@ export class DelegateManager {
         input: call.input,
       },
       timeout: timeoutMs,
+      ...(scopeContext ? { scopeContext } : {}),  // Phase 7 Batch 4c — scope tagging
     };
 
     return new Promise<ToolResult>((resolve, reject) => {

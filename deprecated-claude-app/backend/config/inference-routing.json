@@ -1,0 +1,6 @@
+{
+  "rules": [],
+  "default": {
+    "useConversationModel": true
+  }
+}

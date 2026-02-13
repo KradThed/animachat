@@ -613,10 +613,30 @@
                         @update:model-value="toggleToolSelection(item.name!)"
                       />
                     </template>
-                    <v-list-item-title>{{ item.name }}</v-list-item-title>
+                    <v-list-item-title>
+                      {{ item.name }}
+                      <v-tooltip v-if="item.delegateName" location="top" max-width="300">
+                        <template v-slot:activator="{ props: tp }">
+                          <v-icon v-bind="tp" size="x-small" class="ml-1" color="grey">mdi-information-outline</v-icon>
+                        </template>
+                        "{{ item.name?.split('__')[1] }}" from delegate "{{ item.delegateName }}".
+                        Prefixed for disambiguation when multiple delegates provide similar tools.
+                      </v-tooltip>
+                    </v-list-item-title>
                     <v-list-item-subtitle class="text-caption">
+                      <span v-if="item.delegateName" class="text-medium-emphasis">via {{ item.delegateName }} · </span>
                       {{ item.description?.slice(0, 60) }}{{ (item.description?.length || 0) > 60 ? '...' : '' }}
                     </v-list-item-subtitle>
+                    <template v-slot:append>
+                      <v-btn
+                        icon size="x-small" variant="text"
+                        :loading="testingTool === item.name"
+                        @click.stop="handleTestTool(item.name!)"
+                      >
+                        <v-icon size="small">mdi-play-circle-outline</v-icon>
+                        <v-tooltip activator="parent" location="top">Calls tool with empty input. May have side effects.</v-tooltip>
+                      </v-btn>
+                    </template>
                   </v-list-item>
                 </template>
               </template>
@@ -625,6 +645,16 @@
                 <!-- Empty - we handle rendering in prepend-item -->
               </template>
             </v-select>
+
+            <v-alert
+              v-if="testResult"
+              :type="testResult.ok ? 'success' : 'error'"
+              density="compact" closable class="mt-2 mb-2"
+              @click:close="testResult = null"
+            >
+              <strong>{{ testResult.tool }}</strong>
+              <code class="d-block text-caption mt-1" style="white-space:pre-wrap;max-height:100px;overflow-y:auto">{{ testResult.text }}</code>
+            </v-alert>
 
             <!-- Delegate Status Panel -->
             <DelegateStatusPanel class="mt-2 mb-3" @delegates-updated="onDelegatesUpdated" />
@@ -697,7 +727,7 @@ import ParticipantsSection from './ParticipantsSection.vue';
 import ModelSelector from './ModelSelector.vue';
 import ModelSpecificSettings from './ModelSpecificSettings.vue';
 import DelegateStatusPanel from './DelegateStatusPanel.vue';
-import { api, type ToolInfo, type DelegateInfo } from '@/services/api';
+import { api, testTool, type ToolInfo, type DelegateInfo } from '@/services/api';
 import { useStore } from '@/store';
 import { useDelegates } from '@/composables/useDelegates';
 
@@ -749,6 +779,23 @@ const enabledTools = ref<string[]>([]);
 const previousToolSelection = ref<string[]>([]);
 // Explicit flag to track if user selected "allow all" mode
 const useAllToolsMode = ref(true);
+
+// Tool test state
+const testingTool = ref<string | null>(null);
+const testResult = ref<{ tool: string; ok: boolean; text: string } | null>(null);
+
+async function handleTestTool(toolName: string) {
+  testingTool.value = toolName;
+  testResult.value = null;
+  try {
+    const r = await testTool(toolName);
+    testResult.value = { tool: toolName, ok: r.success, text: r.content };
+  } catch {
+    testResult.value = { tool: toolName, ok: false, text: 'Request failed' };
+  } finally {
+    testingTool.value = null;
+  }
+}
 
 // Use the useDelegates composable for real-time updates
 const {

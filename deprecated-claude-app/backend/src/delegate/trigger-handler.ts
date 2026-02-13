@@ -23,6 +23,7 @@ import { ContextManager } from '../services/context-manager.js';
 import { ModelLoader } from '../config/model-loader.js';
 import { toolRegistry } from '../tools/tool-registry.js';
 import { roomManager } from '../websocket/room-manager.js';
+import { mcplHookManager } from '../services/mcpl-hook-manager.js';
 import type { ToolCall, ToolResult } from '../tools/tool-registry.js';
 import type { TriggerInferenceMessage, TriggerInferenceResultMessage } from './protocol.js';
 
@@ -177,8 +178,33 @@ class TriggerHandler {
     // 7. Get conversation messages for context
     const messages = await db.getConversationMessages(msg.conversationId, userId);
 
+    // 7.5. Phase 7: MCPL beforeInference hooks — depth 0 (push event = top-level chain)
+    let mcplInjectedPrompt = '';
+    try {
+      const injections = await mcplHookManager.beforeInference(
+        userId,
+        msg.conversationId!,
+        undefined,  // messagesSummary
+        0,          // hookDepth: top-level inference
+      );
+      if (injections.length > 0) {
+        // system injections
+        const systemParts = injections.filter(i => i.position === 'system').map(i => i.content);
+        // beforeUser/afterUser — append to system prompt (same as handler.ts MVP approach)
+        const beforeUserParts = injections.filter(i => i.position === 'beforeUser').map(i => i.content);
+        const afterUserParts = injections.filter(i => i.position === 'afterUser').map(i => i.content);
+        mcplInjectedPrompt = [...systemParts, ...beforeUserParts, ...afterUserParts].join('\n');
+        console.log(`[TriggerHandler] MCPL injected ${injections.length} context block(s)`);
+      }
+    } catch (err) {
+      console.error('[TriggerHandler] MCPL beforeInference error:', err);
+    }
+
     // 8. Build system prompt and settings
-    const systemPrompt = responder.systemPrompt || msg.systemMessage || '';
+    const baseSystemPrompt = responder.systemPrompt || msg.systemMessage || '';
+    const systemPrompt = mcplInjectedPrompt
+      ? `${baseSystemPrompt}\n${mcplInjectedPrompt}`
+      : baseSystemPrompt;
 
     // Merge settings: conversation settings with participant overrides (same pattern as handler.ts)
     const inferenceSettings = conversation.format === 'standard'
@@ -197,11 +223,12 @@ class TriggerHandler {
     const inferenceService = new EnhancedInferenceService(baseInferenceService, contextManager);
 
     // 10. Build tool options (delegate tools available to this user)
-    const tools = toolRegistry.getToolsForUser(userId);
+    const isServerEnabled = (serverId: string) => db.isServerEnabled(msg.conversationId!, serverId);
+    const tools = toolRegistry.getToolsForUser(userId, isServerEnabled);
     const toolOptions = tools.length > 0 ? {
       tools,
       executeToolCall: async (call: ToolCall): Promise<ToolResult> => {
-        return toolRegistry.executeTool(call, userId);
+        return toolRegistry.executeTool(call, userId, undefined, msg.conversationId);
       },
     } : undefined;
 

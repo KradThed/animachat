@@ -190,6 +190,48 @@
               Create a key, then use it in your delegate's configuration instead of JWT tokens.
             </div>
 
+            <!-- Onboarding: shown when no keys AND no delegates -->
+            <v-card
+              v-if="delegateApiKeys.length === 0 && !hasConnectedDelegates"
+              variant="tonal" color="primary" class="mb-4"
+            >
+              <v-card-title class="text-subtitle-1">
+                <v-icon class="mr-2">mdi-rocket-launch</v-icon>
+                Get Started with Delegates
+              </v-card-title>
+              <v-card-text class="text-body-2">
+                <p class="mb-3">Delegates connect your local tools (filesystems, databases, APIs)
+                to AnimaChat conversations.</p>
+
+                <div class="d-flex align-start mb-3">
+                  <v-avatar size="24" color="primary" class="mr-3 mt-1 flex-shrink-0">
+                    <span class="text-caption font-weight-bold">1</span>
+                  </v-avatar>
+                  <div>
+                    <strong>Install CLI</strong><br>
+                    <code>npm install -g animachat-delegate</code>
+                  </div>
+                </div>
+                <div class="d-flex align-start mb-3">
+                  <v-avatar size="24" color="primary" class="mr-3 mt-1 flex-shrink-0">
+                    <span class="text-caption font-weight-bold">2</span>
+                  </v-avatar>
+                  <div>
+                    <strong>Create API key</strong> below — save it securely
+                  </div>
+                </div>
+                <div class="d-flex align-start">
+                  <v-avatar size="24" color="primary" class="mr-3 mt-1 flex-shrink-0">
+                    <span class="text-caption font-weight-bold">3</span>
+                  </v-avatar>
+                  <div>
+                    <strong>Configure &amp; run</strong><br>
+                    <code>animachat-delegate init &amp;&amp; animachat-delegate</code>
+                  </div>
+                </div>
+              </v-card-text>
+            </v-card>
+
             <!-- Existing Keys -->
             <h4 class="text-subtitle-1 mb-2">Your API Keys</h4>
             <v-list density="compact" v-if="delegateApiKeys.length > 0">
@@ -429,6 +471,7 @@ const delegateApiKeys = ref<DelegateApiKeyPublic[]>([]);
 const newDelegateKeyName = ref('');
 const creatingDelegateKey = ref(false);
 const newlyCreatedKey = ref<string | null>(null);
+const hasConnectedDelegates = ref(false);
 
 const newKey = ref({
   name: '',
@@ -645,8 +688,8 @@ async function copyToClipboard(text: string) {
   }
 }
 
-function onDelegatesUpdated(_delegates: any[]) {
-  // Optional: refresh delegate keys when delegates change
+function onDelegatesUpdated(delegates: any[]) {
+  hasConnectedDelegates.value = delegates.length > 0;
 }
 
 // Load data when dialog opens

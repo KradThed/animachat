@@ -22,6 +22,7 @@
  *   Delegate tools:  `{userId}:{delegateName}__{toolName}`
  */
 
+import { createHash } from 'crypto';
 import { Logger } from '../utils/logger.js';
 import type { ToolConfig } from '@deprecated-claude/shared';
 
@@ -31,6 +32,21 @@ import type { ToolConfig } from '@deprecated-claude/shared';
  * We use `__` (double underscore) as the delimiter.
  */
 const NS_SEP = '__';
+
+/**
+ * JSON.stringify replacer that sorts object keys for deterministic output.
+ * Avoids false-positive hash changes from key ordering differences.
+ */
+function sortedReplacer(_key: string, value: unknown): unknown {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const sorted: Record<string, unknown> = {};
+    for (const k of Object.keys(value as Record<string, unknown>).sort()) {
+      sorted[k] = (value as Record<string, unknown>)[k];
+    }
+    return sorted;
+  }
+  return value;
+}
 
 // Membrane-compatible tool types (mirrored from membrane to avoid import dependency)
 export interface ToolDefinition {
@@ -47,6 +63,7 @@ export interface ToolDefinition {
 export interface ToolDefinitionWithSource extends ToolDefinition {
   source: 'server' | 'delegate';
   delegateName?: string;  // normalized (lowercase) delegate name
+  serverId?: string;      // stable UUID for (delegateId, serverName) pair
 }
 
 export interface ToolResult {
@@ -63,13 +80,23 @@ export interface ToolCall {
 
 type ToolExecutor = (input: Record<string, unknown>) => Promise<ToolResult>;
 
+/** Extended executor for MCPL management tools that need userId + conversationId context */
+export type McplToolExecutor = (
+  input: Record<string, unknown>,
+  context: { userId: string; conversationId: string }
+) => Promise<ToolResult>;
+
 interface RegisteredTool {
   definition: ToolDefinition;
   source: 'server' | 'delegate';
   delegateName?: string;   // normalized (lowercase)
   displayName?: string;    // original case for UI
+  serverId?: string;       // stable UUID for (delegateId, serverName) pair
   userId?: string;
   execute: ToolExecutor;
+  /** MCPL management tools use this instead of execute */
+  mcplExecute?: McplToolExecutor;
+  isMcplManagement?: boolean;
 }
 
 export class ToolRegistry {
@@ -94,15 +121,37 @@ export class ToolRegistry {
   }
 
   /**
+   * Register an MCPL management tool that receives userId + conversationId context.
+   * Separate from regular ToolExecutor to avoid breaking existing executors.
+   */
+  registerMcplManagementTool(
+    name: string,
+    definition: ToolDefinition,
+    executor: McplToolExecutor
+  ): void {
+    const key = `server:${name}`;
+    this.serverTools.set(key, {
+      definition,
+      source: 'server',
+      execute: async () => ({ toolUseId: '', content: 'Missing context', isError: true }),
+      mcplExecute: executor,
+      isMcplManagement: true,
+    });
+    Logger.debug(`[ToolRegistry] Registered MCPL management tool: ${name}`);
+  }
+
+  /**
    * Register tools from a delegate (scoped to a user).
    * Tools are stored with prefixed names: `{delegateName}__{toolName}`
    * The executor receives the ORIGINAL (unprefixed) tool name.
+   *
+   * Each tool may carry a `serverId` (stable UUID for its MCP server origin).
    */
   registerDelegateTools(
     userId: string,
     delegateName: string,
     displayName: string,
-    tools: ToolDefinition[],
+    tools: Array<ToolDefinition & { serverId?: string }>,
     executor: (originalName: string, input: Record<string, unknown>) => Promise<ToolResult>
   ): void {
     for (const tool of tools) {
@@ -114,6 +163,7 @@ export class ToolRegistry {
         source: 'delegate',
         delegateName,
         displayName,
+        serverId: tool.serverId,
         userId,
         execute: (input) => executor(tool.name, input),  // delegate receives ORIGINAL name
       });
@@ -144,7 +194,18 @@ export class ToolRegistry {
    * Server tools are unprefixed; delegate tools have `{delegateName}__` prefix.
    * No conflict resolution needed — uniqueness is structural.
    */
-  getToolsForUser(userId: string): ToolDefinition[] {
+  /**
+   * Get all tool definitions available to a user.
+   * Server tools are unprefixed; delegate tools have `{delegateName}__` prefix.
+   * No conflict resolution needed — uniqueness is structural.
+   *
+   * @param isServerEnabled - Optional filter: (serverId) => boolean.
+   *   If provided, delegate tools from disabled servers are excluded.
+   */
+  getToolsForUser(
+    userId: string,
+    isServerEnabled?: (serverId: string) => boolean
+  ): ToolDefinition[] {
     const tools: ToolDefinition[] = [];
 
     // Global server tools (unprefixed)
@@ -156,6 +217,10 @@ export class ToolRegistry {
     const userPrefix = `${userId}:`;
     for (const [key, tool] of this.delegateTools) {
       if (key.startsWith(userPrefix)) {
+        // Filter by enabled state if provided
+        if (isServerEnabled && tool.serverId && !isServerEnabled(tool.serverId)) {
+          continue;
+        }
         tools.push(tool.definition);
       }
     }
@@ -179,7 +244,7 @@ export class ToolRegistry {
     const userPrefix = `${userId}:`;
     for (const [key, tool] of this.delegateTools) {
       if (key.startsWith(userPrefix)) {
-        tools.push({ ...tool.definition, source: 'delegate', delegateName: tool.delegateName });
+        tools.push({ ...tool.definition, source: 'delegate', delegateName: tool.delegateName, serverId: tool.serverId });
       }
     }
 
@@ -243,7 +308,8 @@ export class ToolRegistry {
   async executeTool(
     call: ToolCall,
     userId: string,
-    toolConfig?: ToolConfig
+    toolConfig?: ToolConfig,
+    conversationId?: string
   ): Promise<ToolResult> {
     const { id: toolUseId, name, input } = call;
     const timeout = toolConfig?.toolTimeout ?? 30000;
@@ -254,6 +320,13 @@ export class ToolRegistry {
     if (serverTool) {
       if (!this.isToolAllowedForParticipant(name, toolConfig)) {
         return { toolUseId, content: `Tool "${name}" is not allowed for this participant`, isError: true };
+      }
+      // MCPL management tools receive userId + conversationId context
+      if (serverTool.isMcplManagement && serverTool.mcplExecute) {
+        return this.executeWithTimeout(
+          serverTool.mcplExecute(input, { userId, conversationId: conversationId || '' }),
+          timeout, toolUseId, name
+        );
       }
       return this.executeWithTimeout(serverTool.execute(input), timeout, toolUseId, name);
     }
@@ -364,6 +437,33 @@ export class ToolRegistry {
       delegateTools: this.delegateTools.size,
       delegateToolsByUser,
     };
+  }
+
+  // --------------------------------------------------------------------------
+  // Tool Snapshot Hashing
+  // --------------------------------------------------------------------------
+
+  /**
+   * Compute a deterministic hash of a tool set.
+   * Uses canonical JSON (sorted keys) → SHA-256.
+   * Same tools in different order → same hash.
+   * Same tools with different key ordering in schemas → same hash.
+   */
+  computeToolsetHash(tools: ToolDefinition[]): string {
+    // Sort tools by name for deterministic order
+    const sorted = [...tools].sort((a, b) => a.name.localeCompare(b.name));
+    const canonical = JSON.stringify(sorted, sortedReplacer);
+    return `sha256:${createHash('sha256').update(canonical).digest('hex').substring(0, 16)}`;
+  }
+
+  /**
+   * Compute hash for all tools available to a user.
+   * Returns empty hash if no tools.
+   */
+  computeUserToolsetHash(userId: string): string {
+    const tools = this.getToolsForUser(userId);
+    if (tools.length === 0) return 'sha256:empty';
+    return this.computeToolsetHash(tools);
   }
 
   // --------------------------------------------------------------------------
