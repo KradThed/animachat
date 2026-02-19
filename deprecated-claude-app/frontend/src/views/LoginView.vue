@@ -498,7 +498,9 @@ async function submit() {
     if (pendingInvite) {
       router.push(`/invite/${pendingInvite}`);
     } else {
-      router.push('/conversation');
+      // Redirect to returnTo (from auth guard) or default conversation page
+      const returnTo = typeof route.query.returnTo === 'string' ? route.query.returnTo : '/conversation';
+      router.push(returnTo);
     }
   } catch (err: any) {
     // Check if it's a verification required error

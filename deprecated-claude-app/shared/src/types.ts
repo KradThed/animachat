@@ -223,6 +223,10 @@ export const ModelSettingsSchema = z.object({
   // Model-specific settings (dynamic based on model's configurableSettings)
   // Stored as flat key-value pairs, e.g., { "imageConfig.aspectRatio": "16:9" }
   modelSpecific: z.record(z.unknown()).optional(),
+
+  // Number of parallel response branches to generate (1-8)
+  // Set via ConversationSettingsDialog; read by backend handler as fallback
+  samplingBranches: z.number().min(1).max(8).optional(),
 });
 
 export type ModelSettings = z.infer<typeof ModelSettingsSchema>;

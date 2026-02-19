@@ -2737,12 +2737,14 @@ watch(() => getConversationIdFromRoute(), async (newId, oldId) => {
     try {
       await store.loadConversation(newId as string);
       console.log(`[ConversationView:watch] ✓ Conversation loaded in ${Date.now() - loadStart}ms, messages: ${store.state.allMessages.length}`);
+      // Sync samplingBranches from conversation settings (initial load)
+      samplingBranches.value = store.state.currentConversation?.settings?.samplingBranches || 1;
     } catch (error) {
       console.error(`[ConversationView:watch] ✗ Failed to load conversation:`, error);
     } finally {
       isLoadingConversation.value = false;
     }
-    
+
     await loadParticipants();
     await loadBookmarks();
     await loadCurrentConversationCollaborators();
@@ -3874,10 +3876,15 @@ async function handleDuplicated(newConversation: Conversation) {
 async function updateConversationSettings(updates: Partial<Conversation>) {
   if (currentConversation.value) {
     await store.updateConversation(currentConversation.value.id, updates);
-    
+
     // If format changed, reload participants to get the new defaults
     if ('format' in updates) {
       await loadParticipants();
+    }
+
+    // Sync samplingBranches if settings were part of the update
+    if ((updates as any).settings?.samplingBranches !== undefined) {
+      samplingBranches.value = (updates as any).settings.samplingBranches || 1;
     }
   }
 }

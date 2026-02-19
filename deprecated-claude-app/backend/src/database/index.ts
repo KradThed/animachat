@@ -147,6 +147,28 @@ export class Database {
   }> = new Map(); // keyId -> DelegateApiKey
   private delegateApiKeysByUser: Map<string, Set<string>> = new Map(); // userId -> keyIds
 
+  // Delegate entities — named delegate identities (e.g., "my-laptop", "work-server")
+  private delegates: Map<string, {
+    id: string;
+    userId: string;
+    namespace: string;
+    createdAt: Date;
+    lastSeenAt: Date | null;
+    deletedAt: Date | null;
+  }> = new Map(); // delegateId -> Delegate
+  private delegatesByUser: Map<string, Set<string>> = new Map(); // userId -> delegateIds
+
+  // Delegate keys — links API keys to delegate entities
+  private delegateEntityKeys: Map<string, {
+    id: string;
+    delegateId: string;
+    keyHash: string;
+    keyPrefix: string;
+    createdAt: Date;
+    revokedAt: Date | null;
+  }> = new Map(); // keyId -> DelegateKey
+  private delegateEntityKeysByDelegate: Map<string, Set<string>> = new Map(); // delegateId -> keyIds
+
   // Per-user UI state (event-sourced, replaces JSON files)
   // Key: `${conversationId}::${userId}` (double colon to avoid collisions)
   private userConversationStates: Map<string, UserConversationState> = new Map();
@@ -1720,6 +1742,71 @@ export class Database {
         if (key) {
           key.isRevoked = true;
           key.revokedAt = new Date(revokedAt);
+        }
+        break;
+      }
+
+      // Delegate entity events
+      case 'delegate_created': {
+        const { id, userId, namespace } = event.data;
+        if (!userId || !namespace) break;
+        this.delegates.set(id, {
+          id,
+          userId,
+          namespace,
+          createdAt: new Date(event.timestamp),
+          lastSeenAt: null,
+          deletedAt: null,
+        });
+        if (!this.delegatesByUser.has(userId)) {
+          this.delegatesByUser.set(userId, new Set());
+        }
+        this.delegatesByUser.get(userId)!.add(id);
+        break;
+      }
+
+      case 'delegate_key_created': {
+        const { id, delegateId, keyHash, keyPrefix } = event.data;
+        if (!delegateId) break;
+        this.delegateEntityKeys.set(id, {
+          id,
+          delegateId,
+          keyHash,
+          keyPrefix,
+          createdAt: new Date(event.timestamp),
+          revokedAt: null,
+        });
+        if (!this.delegateEntityKeysByDelegate.has(delegateId)) {
+          this.delegateEntityKeysByDelegate.set(delegateId, new Set());
+        }
+        this.delegateEntityKeysByDelegate.get(delegateId)!.add(id);
+        break;
+      }
+
+      case 'delegate_key_revoked': {
+        const { id, revokedAt: rAt } = event.data;
+        const dk = this.delegateEntityKeys.get(id);
+        if (dk) {
+          dk.revokedAt = new Date(rAt);
+        }
+        break;
+      }
+
+      case 'delegate_deleted': {
+        const { id } = event.data;
+        const del = this.delegates.get(id);
+        if (del) {
+          del.deletedAt = new Date(event.timestamp);
+          // Revoke all keys for this delegate
+          const keyIds = this.delegateEntityKeysByDelegate.get(id);
+          if (keyIds) {
+            for (const keyId of keyIds) {
+              const dk = this.delegateEntityKeys.get(keyId);
+              if (dk && !dk.revokedAt) {
+                dk.revokedAt = new Date(event.timestamp);
+              }
+            }
+          }
         }
         break;
       }
@@ -6131,6 +6218,269 @@ export class Database {
     });
 
     return true;
+  }
+
+  // ==================== DELEGATE ENTITIES ====================
+  // Named delegate identities with linked API keys
+
+  private static readonly NAMESPACE_REGEX = /^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$/;
+
+  /**
+   * Sanitize a string into a valid namespace.
+   * Used for migration of existing keys without delegate entities.
+   */
+  private sanitizeNamespace(name: string): string {
+    let ns = name
+      .toLowerCase()
+      .replace(/[^a-z0-9-]/g, '-')  // Replace invalid chars with -
+      .replace(/-+/g, '-')           // Collapse multiple dashes
+      .replace(/^-|-$/g, '')         // Trim leading/trailing dashes
+      .slice(0, 40);                 // Max 40 chars
+    // Ensure min 2 chars
+    if (ns.length < 2) ns = ns.padEnd(2, '0');
+    return ns;
+  }
+
+  /**
+   * Find or create a delegate entity for a user.
+   * Idempotent: returns existing delegate if (userId, namespace) already exists.
+   * Blocks reuse of soft-deleted namespaces.
+   */
+  async findOrCreateDelegate(
+    userId: string,
+    namespace: string
+  ): Promise<{ delegate: { id: string; userId: string; namespace: string; createdAt: Date; lastSeenAt: Date | null; deletedAt: Date | null }; created: boolean } | { error: string }> {
+    // Validate namespace format
+    if (!Database.NAMESPACE_REGEX.test(namespace)) {
+      return { error: `Invalid namespace format: "${namespace}". Must match ${Database.NAMESPACE_REGEX}` };
+    }
+
+    // Check for existing delegate with this namespace (active or deleted)
+    const userDelegateIds = this.delegatesByUser.get(userId);
+    if (userDelegateIds) {
+      for (const delId of userDelegateIds) {
+        const existing = this.delegates.get(delId);
+        if (existing && existing.namespace === namespace) {
+          if (existing.deletedAt) {
+            return { error: 'Namespace previously used, choose different name' };
+          }
+          return { delegate: existing, created: false };
+        }
+      }
+    }
+
+    // Create new delegate
+    const id = uuidv4();
+    const delegate = {
+      id,
+      userId,
+      namespace,
+      createdAt: new Date(),
+      lastSeenAt: null,
+      deletedAt: null,
+    };
+
+    this.delegates.set(id, delegate);
+    if (!this.delegatesByUser.has(userId)) {
+      this.delegatesByUser.set(userId, new Set());
+    }
+    this.delegatesByUser.get(userId)!.add(id);
+
+    await this.logUserEvent(userId, 'delegate_created', {
+      id,
+      userId,
+      namespace,
+    });
+
+    return { delegate, created: true };
+  }
+
+  /**
+   * Create a new API key linked to a delegate entity.
+   * Returns the full secret key (only returned once on creation).
+   */
+  async createKeyForDelegate(
+    delegateId: string
+  ): Promise<{ keyId: string; secretKey: string; keyPrefix: string } | null> {
+    const delegate = this.delegates.get(delegateId);
+    if (!delegate || delegate.deletedAt) return null;
+
+    const keyId = uuidv4();
+    const randomBytes = crypto.randomBytes(32);
+    const secretKey = `dak_${randomBytes.toString('base64url')}`;
+    const keyPrefix = secretKey.slice(0, 12);
+    const keyHash = await bcrypt.hash(secretKey, 10);
+
+    const keyData = {
+      id: keyId,
+      delegateId,
+      keyHash,
+      keyPrefix,
+      createdAt: new Date(),
+      revokedAt: null,
+    };
+
+    this.delegateEntityKeys.set(keyId, keyData);
+    if (!this.delegateEntityKeysByDelegate.has(delegateId)) {
+      this.delegateEntityKeysByDelegate.set(delegateId, new Set());
+    }
+    this.delegateEntityKeysByDelegate.get(delegateId)!.add(keyId);
+
+    await this.logUserEvent(delegate.userId, 'delegate_key_created', {
+      id: keyId,
+      delegateId,
+      keyHash,
+      keyPrefix,
+    });
+
+    return { keyId, secretKey, keyPrefix };
+  }
+
+  /**
+   * Validate a delegate entity key and return the delegate info.
+   * Checks both new delegate entity keys and legacy delegateApiKeys.
+   */
+  async validateDelegateApiKeyWithDelegate(
+    secretKey: string
+  ): Promise<{ userId: string; keyId: string; delegate?: { id: string; namespace: string } } | null> {
+    if (!secretKey.startsWith('dak_')) return null;
+
+    const keyPrefix = secretKey.slice(0, 12);
+
+    // First check delegate entity keys
+    for (const [keyId, key] of this.delegateEntityKeys) {
+      if (key.keyPrefix === keyPrefix) {
+        if (key.revokedAt) return null;
+
+        const isValid = await bcrypt.compare(secretKey, key.keyHash);
+        if (isValid) {
+          const delegate = this.delegates.get(key.delegateId);
+          if (!delegate || delegate.deletedAt) return null;
+
+          // Update last seen
+          delegate.lastSeenAt = new Date();
+
+          return {
+            userId: delegate.userId,
+            keyId,
+            delegate: { id: delegate.id, namespace: delegate.namespace },
+          };
+        }
+      }
+    }
+
+    // Fallback to legacy keys (backward compat)
+    return this.validateDelegateApiKey(secretKey);
+  }
+
+  /**
+   * Revoke a delegate entity key.
+   */
+  async revokeDelegateEntityKey(keyId: string): Promise<boolean> {
+    const key = this.delegateEntityKeys.get(keyId);
+    if (!key || key.revokedAt) return false;
+
+    key.revokedAt = new Date();
+
+    const delegate = this.delegates.get(key.delegateId);
+    if (delegate) {
+      await this.logUserEvent(delegate.userId, 'delegate_key_revoked', {
+        id: keyId,
+        revokedAt: key.revokedAt.toISOString(),
+      });
+    }
+
+    return true;
+  }
+
+  /**
+   * Soft-delete a delegate entity and revoke all its keys.
+   */
+  async softDeleteDelegate(delegateId: string): Promise<boolean> {
+    const delegate = this.delegates.get(delegateId);
+    if (!delegate || delegate.deletedAt) return false;
+
+    delegate.deletedAt = new Date();
+
+    // Revoke all keys
+    const keyIds = this.delegateEntityKeysByDelegate.get(delegateId);
+    if (keyIds) {
+      for (const keyId of keyIds) {
+        const key = this.delegateEntityKeys.get(keyId);
+        if (key && !key.revokedAt) {
+          key.revokedAt = delegate.deletedAt;
+        }
+      }
+    }
+
+    await this.logUserEvent(delegate.userId, 'delegate_deleted', {
+      id: delegateId,
+    });
+
+    return true;
+  }
+
+  /**
+   * Get all non-deleted delegates for a user.
+   */
+  getDelegatesForUser(userId: string): Array<{
+    id: string;
+    userId: string;
+    namespace: string;
+    createdAt: Date;
+    lastSeenAt: Date | null;
+    deletedAt: Date | null;
+  }> {
+    const delegateIds = this.delegatesByUser.get(userId);
+    if (!delegateIds) return [];
+
+    const results = [];
+    for (const delId of delegateIds) {
+      const del = this.delegates.get(delId);
+      if (del && !del.deletedAt) {
+        results.push(del);
+      }
+    }
+    return results.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+  }
+
+  /**
+   * Get non-revoked keys for a delegate entity.
+   */
+  getKeysForDelegate(delegateId: string): Array<{
+    id: string;
+    delegateId: string;
+    keyPrefix: string;
+    createdAt: Date;
+    revokedAt: Date | null;
+  }> {
+    const keyIds = this.delegateEntityKeysByDelegate.get(delegateId);
+    if (!keyIds) return [];
+
+    const results = [];
+    for (const keyId of keyIds) {
+      const key = this.delegateEntityKeys.get(keyId);
+      if (key && !key.revokedAt) {
+        results.push({
+          id: key.id,
+          delegateId: key.delegateId,
+          keyPrefix: key.keyPrefix,
+          createdAt: key.createdAt,
+          revokedAt: key.revokedAt,
+        });
+      }
+    }
+    return results.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+  }
+
+  /**
+   * Update lastSeenAt for a delegate entity.
+   */
+  updateDelegateLastSeen(delegateId: string): void {
+    const delegate = this.delegates.get(delegateId);
+    if (delegate) {
+      delegate.lastSeenAt = new Date();
+    }
   }
 
   // ==================== UI STATE MIGRATION ====================

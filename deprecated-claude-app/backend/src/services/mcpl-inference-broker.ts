@@ -20,6 +20,7 @@ import { ContextManager } from './context-manager.js';
 import { ModelLoader } from '../config/model-loader.js';
 import { roomManager } from '../websocket/room-manager.js';
 import { inferenceRouter } from '../config/inference-routing.js';
+import { inferenceChainTracker } from '../mcpl/inference-chain.js';
 
 // =============================================================================
 // Types
@@ -89,8 +90,50 @@ export class McplInferenceBroker {
     delegateId: string;
     userId: string;
     transport: McplTransport;
+    parentChainId?: string;   // Fix #5: chain tracking
+    parentFrameId?: string;   // Fix #5: frame tracking
   }): Promise<void> {
     const { requestId, serverId, conversationId, delegateId, userId, transport } = params;
+
+    // 0. Fix #5: Recursion protection — create or continue inference chain
+    let chainId: string | undefined;
+    let frameId: string | undefined;
+
+    if (params.parentChainId && params.parentFrameId) {
+      // Continue existing chain
+      const chainResult = inferenceChainTracker.continueChain(
+        params.parentChainId,
+        params.parentFrameId,
+        serverId,
+      );
+      if (!chainResult.allowed) {
+        console.warn(`[McplInferenceBroker] Chain rejected: ${chainResult.reason} (server: ${serverId}, request: ${requestId})`);
+        this.sendResponse(transport, {
+          type: 'mcpl/inference_response',
+          requestId,
+          success: false,
+          error: `Inference chain rejected: ${chainResult.reason}`,
+        });
+        return;
+      }
+      chainId = chainResult.chainId;
+      frameId = chainResult.frameId;
+    } else {
+      // New chain (no parent — first inference or parentChainId bypassed)
+      const chainResult = inferenceChainTracker.createChain(conversationId, serverId);
+      if (!chainResult.allowed) {
+        console.warn(`[McplInferenceBroker] Chain creation rejected: ${chainResult.reason} (server: ${serverId}, request: ${requestId})`);
+        this.sendResponse(transport, {
+          type: 'mcpl/inference_response',
+          requestId,
+          success: false,
+          error: `Inference request rejected: ${chainResult.reason}`,
+        });
+        return;
+      }
+      chainId = chainResult.chainId;
+      frameId = chainResult.frameId;
+    }
 
     // 1. Check rate limit
     this.pruneOldTimestamps();
@@ -187,6 +230,10 @@ export class McplInferenceBroker {
       });
     } finally {
       this.activeRequests.delete(requestId);
+      // Fix #5: always complete the frame, regardless of success/failure
+      if (chainId && frameId) {
+        inferenceChainTracker.completeFrame(chainId, frameId);
+      }
     }
   }
 

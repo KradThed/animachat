@@ -631,10 +631,11 @@
                       <v-btn
                         icon size="x-small" variant="text"
                         :loading="testingTool === item.name"
+                        :disabled="!!testingTool && testingTool !== item.name"
                         @click.stop="handleTestTool(item.name!)"
                       >
                         <v-icon size="small">mdi-play-circle-outline</v-icon>
-                        <v-tooltip activator="parent" location="top">Calls tool with empty input. May have side effects.</v-tooltip>
+                        <v-tooltip activator="parent" location="top">{{ testingTool && testingTool !== item.name ? 'Test in progress...' : 'Calls tool with empty input. May have side effects.' }}</v-tooltip>
                       </v-btn>
                     </template>
                   </v-list-item>
@@ -652,8 +653,8 @@
               density="compact" closable class="mt-2 mb-2"
               @click:close="testResult = null"
             >
-              <strong>{{ testResult.tool }}</strong>
-              <code class="d-block text-caption mt-1" style="white-space:pre-wrap;max-height:100px;overflow-y:auto">{{ testResult.text }}</code>
+              <strong v-text="testResult.tool"></strong>
+              <code class="d-block text-caption mt-1" style="white-space:pre-wrap;max-height:100px;overflow-y:auto" v-text="testResult.text"></code>
             </v-alert>
 
             <!-- Delegate Status Panel -->
@@ -785,6 +786,7 @@ const testingTool = ref<string | null>(null);
 const testResult = ref<{ tool: string; ok: boolean; text: string } | null>(null);
 
 async function handleTestTool(toolName: string) {
+  if (testingTool.value) return;  // T1: already testing, ignore click
   testingTool.value = toolName;
   testResult.value = null;
   try {
@@ -1097,6 +1099,11 @@ watch(() => props.conversation, async (conversation) => {
 watch(() => props.modelValue, async (isOpen) => {
   if (isOpen && props.conversation?.format === 'prefill') {
     await loadParticipants();
+  }
+  // T3: clear stale test state when dialog closes
+  if (!isOpen) {
+    testResult.value = null;
+    testingTool.value = null;
   }
 });
 

@@ -28,6 +28,7 @@ import PersonasView from './views/PersonasView.vue';
 import VerifyEmailView from './views/VerifyEmailView.vue';
 import ResetPasswordView from './views/ResetPasswordView.vue';
 import ArchiveView from './views/ArchiveView.vue';
+import AuthorizeDelegateView from './views/AuthorizeDelegateView.vue';
 import TermsView from './views/TermsView.vue';
 import PrivacyView from './views/PrivacyView.vue';
 
@@ -151,17 +152,26 @@ const router = createRouter({
       component: ArchiveView,
       meta: { requiresAuth: true },
     },
+    {
+      path: '/authorize-delegate',
+      name: 'authorize-delegate',
+      component: AuthorizeDelegateView,
+      meta: { requiresAuth: true },
+    },
   ],
 });
 
 // Navigation guard
 router.beforeEach((to, from, next) => {
   const token = localStorage.getItem('token');
-  
+
   if (to.meta.requiresAuth && !token) {
-    next('/login');
+    // Preserve full path + query string through login redirect
+    next({ path: '/login', query: { returnTo: to.fullPath } });
   } else if (to.path === '/login' && token) {
-    next('/conversation');
+    // If already logged in, redirect to returnTo or default
+    const returnTo = typeof to.query.returnTo === 'string' ? to.query.returnTo : '/conversation';
+    next(returnTo);
   } else {
     next();
   }

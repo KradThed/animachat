@@ -95,6 +95,10 @@ export const ToolCallRequestMessageSchema = z.object({
     featureSet: z.string(),
     activeCapabilities: z.array(z.string()),
   }).optional(),
+  inferenceContext: z.object({               // Fix #5 — chain/frame tracking for recursion prevention
+    chainId: z.string(),
+    frameId: z.string(),
+  }).optional(),
 });
 
 export const TriggerInferenceResultMessageSchema = z.object({
@@ -350,6 +354,19 @@ export const McplConnectServerResultMessageSchema = z.object({
   error: z.string().optional(),
 });
 
+/** Server → Delegate: MCPL error (access denied, rate limited, etc.) */
+export const McplErrorMessageSchema = z.object({
+  type: z.literal('mcpl/error'),
+  code: z.string(),                    // 'conversation_access_denied' | 'rate_limited' | ...
+  message: z.string(),                 // "Conversation not found or access denied" (never reveal existence)
+  retryAfterMs: z.number().optional(), // present when code === 'rate_limited' — delegate uses for backoff
+  inReplyTo: z.object({                // correlation — otherwise error is orphaned in logs
+    type: z.string(),                  // original message type
+    requestId: z.string().optional(),
+    seq: z.number().optional(),
+  }),
+});
+
 // =============================================================================
 // Union Types
 // =============================================================================
@@ -393,6 +410,7 @@ export const ServerToDelegateMessageSchema = z.discriminatedUnion('type', [
   McplScopeElevateResultMessageSchema,
   McplInferenceChunkMessageSchema,
   McplCheckpointListResponseMessageSchema,
+  McplErrorMessageSchema,
 ]);
 
 // =============================================================================
@@ -434,6 +452,7 @@ export type McplScopeElevateResultMessage = z.infer<typeof McplScopeElevateResul
 export type McplInferenceChunkMessage = z.infer<typeof McplInferenceChunkMessageSchema>;
 export type McplCheckpointListMessage = z.infer<typeof McplCheckpointListMessageSchema>;
 export type McplCheckpointListResponseMessage = z.infer<typeof McplCheckpointListResponseMessageSchema>;
+export type McplErrorMessage = z.infer<typeof McplErrorMessageSchema>;
 
 export type DelegateToServerMessage = z.infer<typeof DelegateToServerMessageSchema>;
 export type ServerToDelegateMessage = z.infer<typeof ServerToDelegateMessageSchema>;

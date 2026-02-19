@@ -40,6 +40,48 @@ import { WebSocketTransport, ReliableChannel } from './mcpl-transport.js';
 import type { McplTransport } from './mcpl-transport.js';
 import type { ScopeChangeStatus, McplFeatureSet, McplCapability, McplScopePolicy } from '@deprecated-claude/shared';
 import { expandWildcards, matchesPattern } from '../services/mcpl-wildcard.js';
+import { ConversationAccessCache } from '../mcpl/conversation-access.js';
+import { serverRegistry } from '../mcpl/server-registry.js';
+import { mcplRateLimiter, messageTypeToOpType } from '../middleware/rate-limiter.js';
+
+// =============================================================================
+// Conversation Access Cache (Fix #4 — CRITICAL)
+// =============================================================================
+
+// Per-connection instance created in handleDelegateConnection().
+// Singleton would leak across users — each connection gets its own cache.
+const conversationAccessCaches = new Map<string, ConversationAccessCache>();
+
+/**
+ * Extract conversationId from any MCPL message payload.
+ * Returns empty string if not present (e.g., scope_change_request with no conversationId).
+ */
+function extractConversationId(msg: Record<string, unknown>): string {
+  return (msg.conversationId as string) || '';
+}
+
+/**
+ * Send mcpl/error to delegate via transport.
+ * conversationId is never included in the error message (masked).
+ */
+function sendMcplError(
+  transport: McplTransport,
+  code: string,
+  message: string,
+  inReplyTo: { type: string; requestId?: string; seq?: number },
+  retryAfterMs?: number,
+): void {
+  const errorMsg: Record<string, unknown> = {
+    type: 'mcpl/error',
+    code,
+    message,
+    inReplyTo,
+  };
+  if (retryAfterMs !== undefined) {
+    errorMsg.retryAfterMs = retryAfterMs;
+  }
+  transport.send(errorMsg);
+}
 
 // =============================================================================
 // DelegateId Validation
@@ -346,7 +388,7 @@ export async function delegateWebsocketHandler(
     ws.close(1008, delegateIdResult.reason);
     return;
   }
-  const delegateId = delegateIdResult.delegateId;  // trimmed, validated
+  let delegateId = delegateIdResult.delegateId;  // trimmed, validated; may be overridden by DB namespace
 
   if (!token && !apiKey) {
     console.warn('[DelegateHandler] Missing token or apiKey');
@@ -357,14 +399,29 @@ export async function delegateWebsocketHandler(
   let userId: string;
 
   // Try API Key auth first (preferred)
+  // Uses validateDelegateApiKeyWithDelegate which checks both new delegate entity keys
+  // and legacy delegateApiKeys for backward compat.
   if (apiKey) {
-    const keyResult = await db.validateDelegateApiKey(apiKey);
+    const keyResult = await db.validateDelegateApiKeyWithDelegate(apiKey);
     if (!keyResult) {
       console.warn('[DelegateHandler] Invalid API key');
       ws.close(1008, 'Invalid API key (expired, revoked, or invalid)');
       return;
     }
     userId = keyResult.userId;
+
+    // Namespace from DB is source of truth; fallback to CLI-sent delegateId for legacy keys
+    const resolvedNamespace = keyResult.delegate?.namespace ?? delegateId;
+    if (keyResult.delegate && delegateId !== resolvedNamespace) {
+      console.warn(`[DelegateHandler] Namespace mismatch: CLI sent "${delegateId}", DB has "${resolvedNamespace}"`);
+    }
+    delegateId = resolvedNamespace;
+
+    // Update lastSeenAt
+    if (keyResult.delegate) {
+      db.updateDelegateLastSeen(keyResult.delegate.id);
+    }
+
     console.log(`[DelegateHandler] Delegate "${delegateId}" authenticated via API key (user: ${userId})`);
   } else {
     // Fallback to JWT auth
@@ -417,12 +474,23 @@ export async function delegateWebsocketHandler(
     ws.isAlive = true;
   });
 
+  // Per-connection access cache (Fix #4)
+  const accessCache = new ConversationAccessCache();
+  conversationAccessCaches.set(sessionId, accessCache);
+
   // Single message path — ALL messages through transport.
   // NOTE: When ReliableChannel is created in handleMcplHello, RC constructor calls
   // transport.onMessage(handleIncoming), replacing this handler. After that:
   // messages flow: transport → RC.handleIncoming → RC.messageHandler → handleDelegateMessage
+  //
+  // CRITICAL: handleDelegateMessage is async — caller MUST handle rejection.
+  // void + .catch() ensures no uncaught rejections escape.
   transport.onMessage((msg) => {
-    handleDelegateMessage(ws, transport, msg, userId, delegateId, sessionId, db);
+    void handleDelegateMessage(ws, transport, msg, userId, delegateId, sessionId, db, accessCache)
+      .catch((err) => {
+        console.error(`[DelegateHandler] Unhandled error in message handler for "${delegateId}":`, err);
+        ws.close(4500, 'internal_error');
+      });
   });
 
   // Handle disconnect — save RC state for resume
@@ -439,6 +507,9 @@ export async function delegateWebsocketHandler(
     if (ws.mcplSessionId) {
       mcplHookManager.unregisterServer(sessionId);
     }
+
+    // Clean up per-connection access cache (Fix #4)
+    conversationAccessCaches.delete(sessionId);
 
     // Unregister THIS session from delegate manager (fails pending calls)
     delegateManager.unregisterDelegate(sessionId);
@@ -463,17 +534,71 @@ export async function delegateWebsocketHandler(
 // Unified Message Handler (single message path)
 // =============================================================================
 
-function handleDelegateMessage(
+async function handleDelegateMessage(
   ws: DelegateWebSocket,
   transport: McplTransport,
   msg: Record<string, unknown>,
   userId: string,
   delegateId: string,
   sessionId: string,
-  db: Database
-): void {
+  db: Database,
+  accessCache: ConversationAccessCache,
+): Promise<void> {
   const type = msg.type as string;
   if (!type) return;
+
+  // ==========================================================================
+  // Fix #4: Dispatch-level conversation access guard
+  // All MCPL messages with a conversationId are checked BEFORE the switch.
+  // This is the ONLY place the check runs — no per-handler checks needed.
+  // ==========================================================================
+  if (type.startsWith('mcpl/')) {
+    const conversationId = extractConversationId(msg);
+    if (conversationId) {
+      const granted = await accessCache.checkOrFetch(userId, conversationId, db);
+      if (!granted) {
+        const activeTransport = ws.mcplTransport || transport;
+        sendMcplError(
+          activeTransport,
+          'conversation_access_denied',
+          'Conversation not found or access denied',  // never reveal existence
+          {
+            type,
+            requestId: (msg.requestId as string) || undefined,
+            seq: typeof msg.seq === 'number' ? msg.seq : undefined,
+          },
+        );
+        // conversationId masked in logs — only first 8 chars
+        const masked = conversationId.length > 8 ? conversationId.substring(0, 8) + '...' : '***';
+        console.warn(`[DelegateHandler] Access denied: delegate "${delegateId}" → conversation ${masked} (type: ${type})`);
+        return;
+      }
+    }
+  }
+
+  // ==========================================================================
+  // Fix #2: Rate limiting — after auth+access guard, before dispatch
+  // Per-user FIRST → global SECOND (reject cheap before touching shared state)
+  // ==========================================================================
+  const opType = messageTypeToOpType(type);
+  if (opType) {
+    const rateLimitResult = mcplRateLimiter.check(userId, opType);
+    if (!rateLimitResult.allowed) {
+      const activeTransport = ws.mcplTransport || transport;
+      sendMcplError(
+        activeTransport,
+        'rate_limited',
+        'Rate limited',  // don't leak timing in human message
+        {
+          type,
+          requestId: (msg.requestId as string) || undefined,
+          seq: typeof msg.seq === 'number' ? msg.seq : undefined,
+        },
+        rateLimitResult.retryAfterMs,
+      );
+      return;
+    }
+  }
 
   switch (type) {
     // Legacy messages
@@ -499,7 +624,7 @@ function handleDelegateMessage(
 
     // MCPL messages (arrive unwrapped if via ReliableChannel)
     case 'mcpl/hello':
-      handleMcplHello(ws, transport, msg as unknown as McplHelloMessage, userId, delegateId, sessionId, db);
+      handleMcplHello(ws, transport, msg as unknown as McplHelloMessage, userId, delegateId, sessionId, db, accessCache);
       break;
 
     case 'mcpl/beforeInference_response':
@@ -543,6 +668,8 @@ function handleDelegateMessage(
         delegateId,
         userId,
         transport: ws.mcplTransport || transport,
+        parentChainId: infMsg.parentChainId,     // Fix #5: chain tracking
+        parentFrameId: infMsg.parentFrameId,     // Fix #5: frame tracking
       });
       break;
     }
@@ -765,6 +892,18 @@ function handleToolManifest(
     ),
   }));
 
+  // Fix #3: Register unique (delegateId, serverName, serverId) tuples with ServerRegistry.
+  // Dedup to prevent spam when manifest has many tools from same server.
+  const registeredServers = new Set<string>();
+  for (const t of toolsWithServerId) {
+    const serverName = (t as any).serverName || '_default';
+    const key = `${delegateId}:${serverName}:${t.serverId}`;
+    if (!registeredServers.has(key)) {
+      registeredServers.add(key);
+      serverRegistry.register(delegateId, serverName, t.serverId);
+    }
+  }
+
   // Register tools in tool registry with prefixed names
   toolRegistry.registerDelegateTools(
     userId,
@@ -824,7 +963,8 @@ function handleMcplHello(
   userId: string,
   delegateId: string,
   _legacySessionId: string,
-  db: Database
+  db: Database,
+  accessCache: ConversationAccessCache,
 ): void {
   console.log(`[DelegateHandler] MCPL hello from "${delegateId}" (protocol: ${msg.protocolVersion}, capabilities: ${msg.capabilities.join(', ')})`);
 
@@ -860,8 +1000,13 @@ function handleMcplHello(
 
   // IMPORTANT: Set message handler BEFORE sending ack or resending buffered frames.
   // Otherwise responses to resent frames would be dropped (no handler).
+  // CRITICAL: handleDelegateMessage is async — use void + .catch() (Fix #4)
   reliable.onMessage((innerMsg) => {
-    handleDelegateMessage(ws, reliable, innerMsg, userId, delegateId, _legacySessionId, db);
+    void handleDelegateMessage(ws, reliable, innerMsg, userId, delegateId, _legacySessionId, db, accessCache)
+      .catch((err) => {
+        console.error(`[DelegateHandler] Unhandled error in RC message handler for "${delegateId}":`, err);
+        ws.close(4500, 'internal_error');
+      });
   });
 
   // Send mcpl/ack (first framed message)

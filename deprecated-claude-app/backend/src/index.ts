@@ -31,6 +31,7 @@ import avatarRouter from './routes/avatars.js';
 import blobRouter from './routes/blobs.js';
 import siteConfigRouter from './routes/site-config.js';
 import { toolsRouter } from './routes/tools.js';
+import { delegatesRouter } from './routes/delegates.js';
 import { websocketHandler } from './websocket/handler.js';
 // Import server tools for side-effect registration
 import './tools/server-tools.js';
@@ -149,6 +150,7 @@ app.use('/api/blobs', blobRouter); // No auth - blobs are served by ID (content-
 app.use('/api/system', systemRouter());
 app.use('/api/site-config', siteConfigRouter); // No auth - public site configuration
 app.use('/api/tools', authenticateToken, toolsRouter({ db })); // Tool registry, delegate status, API keys
+app.use('/api/delegates', delegatesRouter(db)); // Delegate entities, PKCE auth, keys (auth per-route)
 
 // Health check
 app.get('/api/health', (req, res) => {

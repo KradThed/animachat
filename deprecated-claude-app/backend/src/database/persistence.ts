@@ -12,32 +12,41 @@ export interface Event {
 export class EventStore {
   private filePath: string;
   private writeStream: fs.FileHandle | null = null;
-  
+  // Serialize concurrent writes to prevent interleaving on the same file handle.
+  private writeChain: Promise<void> = Promise.resolve();
+
   constructor(dataDir: string = './data', fileName: string = 'events.jsonl') {
     this.filePath = path.join(dataDir, fileName);
   }
-  
+
   async init(): Promise<void> {
     // Ensure data directory exists
     const dir = path.dirname(this.filePath);
     await fs.mkdir(dir, { recursive: true });
-    
+
     // Open file for appending
     this.writeStream = await fs.open(this.filePath, 'a');
   }
-  
+
   async appendEvent(event: Event): Promise<void> {
     if (!this.writeStream) {
       throw new Error('Event store not initialized');
     }
-    
+
     const line = JSON.stringify({
       ...event,
       timestamp: event.timestamp.toISOString()
     }) + '\n';
-    
-    await this.writeStream.write(line);
-    await this.writeStream.sync(); // Ensure it's written to disk
+
+    // Chain write+sync onto previous operation to guarantee ordering.
+    // writeChain swallows errors so the queue keeps moving;
+    // the caller gets the real error via the returned promise p.
+    const p = this.writeChain.then(async () => {
+      await this.writeStream!.write(line);
+      await this.writeStream!.sync();
+    });
+    this.writeChain = p.catch(() => {});
+    return p;
   }
   
   async loadEvents(): Promise<Event[]> {

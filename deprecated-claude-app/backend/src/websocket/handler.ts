@@ -392,6 +392,163 @@ function sendInsufficientCreditsError(ws: AuthenticatedWebSocket): void {
   }));
 }
 
+// =============================================================================
+// Fix #1: Hook Injection — block-aware beforeUser/afterUser injection
+// =============================================================================
+
+const MAX_INJECTION_CHARS = 4000; // sum of all injected text across all positions
+
+/**
+ * Apply beforeUser/afterUser injections into the last user message in historyMessages.
+ * Mutates historyMessages in-place (replaces the message at the found index).
+ *
+ * Block-aware: if active branch has `contentBlocks`, inject as new text blocks;
+ * if only `content` string, prepend/append to the string.
+ * Priority rule: `contentBlocks` wins — if both `content` and `contentBlocks` exist,
+ * inject into `contentBlocks` only, leave `content` untouched.
+ *
+ * Active branch invariant: uses `msg.activeBranchId` to find the branch — same
+ * source of truth as the inference resolver.
+ *
+ * Falls back to system prompt if no user messages found.
+ */
+function applyUserMessageInjections(
+  historyMessages: any[], // Message[]
+  beforeUser: McplContextInjection[],
+  afterUser: McplContextInjection[],
+  _effectiveSystemPrompt: string, // unused, kept for signature clarity
+  fallbackToSystemPrompt: (text: string) => void,
+): void {
+  // Sort injections deterministically: by serverId, then by original index
+  const sortInjections = (arr: McplContextInjection[]): McplContextInjection[] =>
+    arr.map((inj, idx) => ({ ...inj, _idx: idx }))
+      .sort((a, b) => a.serverId.localeCompare(b.serverId) || (a as any)._idx - (b as any)._idx)
+      .map(({ _idx, ...rest }) => rest as McplContextInjection);
+
+  const sortedBefore = sortInjections(beforeUser);
+  const sortedAfter = sortInjections(afterUser);
+
+  // Token budget: drop lowest priority (last in sorted order) if over budget
+  let totalChars = 0;
+  const budgetedBefore: McplContextInjection[] = [];
+  const budgetedAfter: McplContextInjection[] = [];
+  let truncatedCount = 0;
+
+  // beforeUser first, then afterUser
+  for (const inj of [...sortedBefore, ...sortedAfter]) {
+    if (totalChars + inj.content.length > MAX_INJECTION_CHARS) {
+      truncatedCount++;
+      continue;
+    }
+    totalChars += inj.content.length;
+    if (inj.position === 'beforeUser') {
+      budgetedBefore.push(inj);
+    } else {
+      budgetedAfter.push(inj);
+    }
+  }
+
+  if (truncatedCount > 0) {
+    console.warn(`[ParallelInference] injections_truncated: ${truncatedCount} injection(s) dropped (budget: ${MAX_INJECTION_CHARS} chars)`);
+  }
+
+  if (budgetedBefore.length === 0 && budgetedAfter.length === 0) {
+    return; // all truncated
+  }
+
+  // Find last user message (walk backwards)
+  let lastUserIdx = -1;
+  for (let i = historyMessages.length - 1; i >= 0; i--) {
+    const msg = historyMessages[i];
+    const activeBranch = msg.branches?.find((b: any) => b.id === msg.activeBranchId);
+    if (activeBranch?.role === 'user') {
+      lastUserIdx = i;
+      break;
+    }
+  }
+
+  if (lastUserIdx === -1) {
+    // Edge case: no user messages → fall back to system prompt (existing behavior)
+    const allContents = [
+      ...budgetedBefore.map(i => `[Context from ${i.serverId}]\n${i.content}`),
+      ...budgetedAfter.map(i => `[Context from ${i.serverId}]\n${i.content}`),
+    ].join('\n\n');
+    fallbackToSystemPrompt(allContents);
+    return;
+  }
+
+  const originalMsg = historyMessages[lastUserIdx];
+
+  // Deep clone branches (don't mutate cached DB objects)
+  const clonedBranches = originalMsg.branches.map((b: any) => ({
+    ...b,
+    // Deep clone contentBlocks if present
+    contentBlocks: b.contentBlocks ? b.contentBlocks.map((block: any) => ({ ...block })) : b.contentBlocks,
+  }));
+
+  // Find the active branch in cloned branches (same as inference resolver)
+  const activeBranch = clonedBranches.find((b: any) => b.id === originalMsg.activeBranchId);
+  if (!activeBranch) {
+    // Should not happen — log and bail
+    console.error('[ParallelInference] injection_branch_missing: activeBranch not found in cloned branches');
+    return;
+  }
+
+  // Determine injection path: contentBlocks wins if both exist
+  const hasContentBlocks = Array.isArray(activeBranch.contentBlocks) && activeBranch.contentBlocks.length > 0;
+
+  if (hasContentBlocks) {
+    // Block-aware path: inject as new { type: 'text', text: ... } blocks
+    // Schema invariant: verify text block shape is valid
+    const makeTextBlock = (inj: McplContextInjection): { type: 'text'; text: string } | null => {
+      const block = { type: 'text' as const, text: `[Context from ${inj.serverId}]\n${inj.content}` };
+      // Runtime type guard — text block must have type 'text' and text: string
+      if (typeof block.type !== 'string' || typeof block.text !== 'string') {
+        console.error('[ParallelInference] injection_block_schema_mismatch: invalid text block shape');
+        return null;
+      }
+      return block;
+    };
+
+    // beforeUser: unshift (trailing \n\n separator prevents "sticking" to user content)
+    for (let i = budgetedBefore.length - 1; i >= 0; i--) {
+      const block = makeTextBlock(budgetedBefore[i]);
+      if (block) {
+        block.text = block.text + '\n\n';
+        activeBranch.contentBlocks.unshift(block);
+      }
+    }
+
+    // afterUser: push (leading \n\n separator)
+    for (const inj of budgetedAfter) {
+      const block = makeTextBlock(inj);
+      if (block) {
+        block.text = '\n\n' + block.text;
+        activeBranch.contentBlocks.push(block);
+      }
+    }
+  } else {
+    // String-only path: modify content directly
+    let content = activeBranch.content || '';
+
+    // beforeUser: prepend
+    for (let i = budgetedBefore.length - 1; i >= 0; i--) {
+      const inj = budgetedBefore[i];
+      content = `[Context from ${inj.serverId}]\n${inj.content}\n\n${content}`;
+    }
+
+    // afterUser: append
+    for (const inj of budgetedAfter) {
+      content = `${content}\n\n[Context from ${inj.serverId}]\n${inj.content}`;
+    }
+
+    activeBranch.content = content;
+  }
+
+  // Replace message in array (historyMessages is const but array elements are mutable)
+  historyMessages[lastUserIdx] = { ...originalMsg, branches: clonedBranches };
+}
+
 /**
  * Parameters for running parallel branch inference.
  * This shared utility handles creating multiple branches and running inference on them in parallel.
@@ -500,15 +657,17 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
           ? `${effectiveSystemPrompt}\n\n${systemInjections.join('\n')}`
           : systemInjections.join('\n');
       }
-      // beforeUser and afterUser injections would modify historyMessages
-      // but historyMessages is const from destructuring — for MVP, append to system prompt
-      const beforeUserInjections = injections.filter(i => i.position === 'beforeUser').map(i => i.content);
-      const afterUserInjections = injections.filter(i => i.position === 'afterUser').map(i => i.content);
+      // Fix #1: beforeUser/afterUser — inject into last user message (block-aware)
+      // TODO(multi-path): when we add second inference path (e.g., batch/streaming split),
+      // move applyInjections() to service layer
+      const beforeUserInjections = injections.filter(i => i.position === 'beforeUser');
+      const afterUserInjections = injections.filter(i => i.position === 'afterUser');
       if (beforeUserInjections.length > 0 || afterUserInjections.length > 0) {
-        const contextNotes = [...beforeUserInjections, ...afterUserInjections].join('\n');
-        effectiveSystemPrompt = effectiveSystemPrompt
-          ? `${effectiveSystemPrompt}\n\n${contextNotes}`
-          : contextNotes;
+        applyUserMessageInjections(historyMessages, beforeUserInjections, afterUserInjections, effectiveSystemPrompt, (fallback) => {
+          effectiveSystemPrompt = effectiveSystemPrompt
+            ? `${effectiveSystemPrompt}\n\n${fallback}`
+            : fallback;
+        });
       }
       console.log(`[ParallelInference] MCPL injected ${injections.length} context block(s)`);
     }
@@ -1086,7 +1245,7 @@ async function handleChatMessage(
   }
   
   // Get sampling branches count (default 1)
-  const samplingBranchCount = (message as any).samplingBranches || 1;
+  const samplingBranchCount = (message as any).samplingBranches || conversation.settings?.samplingBranches || 1;
   if (samplingBranchCount > 1) {
     console.log(`[Chat] Sampling ${samplingBranchCount} response branches in parallel`);
   }
@@ -1493,7 +1652,7 @@ async function handleRegenerate(
   }
 
   // Get sampling branches count (default 1)
-  const samplingBranchCount = (message as any).samplingBranches || 1;
+  const samplingBranchCount = (message as any).samplingBranches || conversation.settings?.samplingBranches || 1;
   if (samplingBranchCount > 1) {
     console.log(`[Regenerate] Sampling ${samplingBranchCount} response branches in parallel`);
   }
@@ -1910,7 +2069,7 @@ async function handleEdit(
   // If this was a user message, automatically generate an assistant response (unless skipped)
   if (branch.role === 'user' && !message.skipRegeneration) {
     // Get sampling branches count (default 1)
-    const samplingBranchCount = (message as any).samplingBranches || 1;
+    const samplingBranchCount = (message as any).samplingBranches || conversation.settings?.samplingBranches || 1;
     if (samplingBranchCount > 1) {
       console.log(`[Edit] Sampling ${samplingBranchCount} response branches in parallel`);
     }
@@ -2273,7 +2432,7 @@ async function handleContinue(
   if (!ws.userId) return;
 
   const { conversationId, messageId, parentBranchId, responderId } = message;
-  const samplingBranchCount = (message as any).samplingBranches || 1;
+  const samplingBranchCount = (message as any).samplingBranches || conversation.settings?.samplingBranches || 1;
   
   if (samplingBranchCount > 1) {
     console.log(`[Continue] Sampling ${samplingBranchCount} response branches in parallel`);

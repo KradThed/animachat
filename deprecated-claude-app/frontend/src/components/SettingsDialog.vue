@@ -186,13 +186,13 @@
         <v-window-item value="delegates">
           <v-card-text style="max-height: 600px; overflow-y: auto; padding: 24px;">
             <div class="text-body-2 mb-4">
-              Delegate API keys allow your delegate applications to connect securely.
-              Create a key, then use it in your delegate's configuration instead of JWT tokens.
+              Delegates connect your local tools to AnimaChat conversations.
+              Use <code>animachat-delegate login</code> to authorize automatically, or manage delegates here.
             </div>
 
-            <!-- Onboarding: shown when no keys AND no delegates -->
+            <!-- Onboarding: shown when no delegates exist -->
             <v-card
-              v-if="delegateApiKeys.length === 0 && !hasConnectedDelegates"
+              v-if="delegateEntities.length === 0 && delegateApiKeys.length === 0"
               variant="tonal" color="primary" class="mb-4"
             >
               <v-card-title class="text-subtitle-1">
@@ -200,9 +200,6 @@
                 Get Started with Delegates
               </v-card-title>
               <v-card-text class="text-body-2">
-                <p class="mb-3">Delegates connect your local tools (filesystems, databases, APIs)
-                to AnimaChat conversations.</p>
-
                 <div class="d-flex align-start mb-3">
                   <v-avatar size="24" color="primary" class="mr-3 mt-1 flex-shrink-0">
                     <span class="text-caption font-weight-bold">1</span>
@@ -217,7 +214,8 @@
                     <span class="text-caption font-weight-bold">2</span>
                   </v-avatar>
                   <div>
-                    <strong>Create API key</strong> below — save it securely
+                    <strong>Login</strong><br>
+                    <code>animachat-delegate login</code>
                   </div>
                 </div>
                 <div class="d-flex align-start">
@@ -232,64 +230,74 @@
               </v-card-text>
             </v-card>
 
-            <!-- Existing Keys -->
-            <h4 class="text-subtitle-1 mb-2">Your API Keys</h4>
-            <v-list density="compact" v-if="delegateApiKeys.length > 0">
-              <v-list-item
-                v-for="key in delegateApiKeys"
-                :key="key.id"
+            <!-- Delegate Entities (new system) -->
+            <div v-if="delegateEntities.length > 0">
+              <h4 class="text-subtitle-1 mb-2">Your Delegates</h4>
+              <v-card
+                v-for="del in delegateEntities"
+                :key="del.id"
+                variant="outlined"
+                class="mb-3 pa-3"
               >
-                <template v-slot:prepend>
-                  <v-icon icon="mdi-key" size="small" class="mr-2" />
-                </template>
-                <v-list-item-title>{{ key.name }}</v-list-item-title>
-                <v-list-item-subtitle>
-                  {{ key.keyPrefix }}... ·
-                  <span v-if="key.lastUsedAt">Last used: {{ formatDate(key.lastUsedAt) }}</span>
-                  <span v-else class="text-grey">Never used</span>
-                </v-list-item-subtitle>
-                <template v-slot:append>
+                <div class="d-flex align-center mb-2">
+                  <v-icon
+                    :icon="del.isConnected ? 'mdi-circle' : 'mdi-circle-outline'"
+                    :color="del.isConnected ? 'success' : 'grey'"
+                    size="x-small"
+                    class="mr-2"
+                  />
+                  <strong>{{ del.namespace }}</strong>
+                  <v-chip
+                    v-if="del.isConnected"
+                    size="x-small"
+                    color="success"
+                    class="ml-2"
+                  >
+                    {{ del.toolCount }} tools
+                  </v-chip>
+                  <v-spacer />
                   <v-btn
                     icon="mdi-delete"
                     size="small"
                     variant="text"
                     color="error"
-                    @click="revokeDelegateKey(key.id, key.name)"
+                    @click="deleteDelegate(del.id, del.namespace)"
                   />
-                </template>
-              </v-list-item>
-            </v-list>
-            <div v-else class="text-grey text-body-2 mb-4">
-              No delegate API keys yet. Create one below.
+                </div>
+
+                <!-- Keys for this delegate -->
+                <div v-for="key in del.keys" :key="key.id" class="d-flex align-center ml-6 mb-1">
+                  <v-icon icon="mdi-key" size="x-small" class="mr-2 text-grey" />
+                  <span class="text-body-2 text-grey">{{ key.keyPrefix }}...</span>
+                  <span class="text-caption text-grey ml-2">{{ formatDate(key.createdAt) }}</span>
+                  <v-spacer />
+                  <v-btn
+                    icon="mdi-close"
+                    size="x-small"
+                    variant="text"
+                    color="error"
+                    @click="revokeEntityKey(key.id)"
+                  />
+                </div>
+
+                <v-btn
+                  size="small"
+                  variant="text"
+                  color="primary"
+                  class="ml-4 mt-1"
+                  @click="createEntityKey(del.id)"
+                >
+                  <v-icon size="small" class="mr-1">mdi-plus</v-icon>
+                  New Key
+                </v-btn>
+              </v-card>
             </div>
-
-            <v-divider class="my-4" />
-
-            <!-- Create New Key -->
-            <h4 class="text-subtitle-1 mb-2">Create New Key</h4>
-            <v-text-field
-              v-model="newDelegateKeyName"
-              label="Key Name"
-              placeholder="e.g., My Laptop, Work PC"
-              variant="outlined"
-              density="compact"
-              class="mb-2"
-            />
-            <v-btn
-              :disabled="!newDelegateKeyName.trim()"
-              :loading="creatingDelegateKey"
-              color="primary"
-              variant="elevated"
-              @click="createDelegateKey"
-            >
-              Create Key
-            </v-btn>
 
             <!-- Show newly created key -->
             <v-alert
               v-if="newlyCreatedKey"
               type="warning"
-              class="mt-4"
+              class="mb-4"
               closable
               @click:close="newlyCreatedKey = null"
             >
@@ -305,6 +313,60 @@
                 Copy to Clipboard
               </v-btn>
             </v-alert>
+
+            <v-divider class="my-4" />
+
+            <!-- Add Delegate Manually -->
+            <h4 class="text-subtitle-1 mb-2">Add Delegate</h4>
+            <div class="d-flex align-center ga-2">
+              <v-text-field
+                v-model="newDelegateName"
+                label="Delegate Name"
+                placeholder="e.g., my-laptop"
+                variant="outlined"
+                density="compact"
+                hint="lowercase letters, numbers, hyphens"
+                persistent-hint
+                style="max-width: 300px;"
+              />
+              <v-btn
+                :disabled="!isValidDelegateName"
+                :loading="creatingDelegate"
+                color="primary"
+                variant="elevated"
+                @click="addDelegate"
+              >
+                Create
+              </v-btn>
+            </div>
+
+            <!-- Legacy Keys (backward compat — shown if any exist) -->
+            <div v-if="delegateApiKeys.length > 0">
+              <v-divider class="my-4" />
+              <h4 class="text-subtitle-1 mb-2">Legacy API Keys</h4>
+              <div class="text-body-2 text-grey mb-2">
+                These keys were created before the delegate entity system.
+                They still work but are not linked to a named delegate.
+              </div>
+              <v-list density="compact">
+                <v-list-item v-for="key in delegateApiKeys" :key="key.id">
+                  <template v-slot:prepend>
+                    <v-icon icon="mdi-key" size="small" class="mr-2" />
+                  </template>
+                  <v-list-item-title>{{ key.name }}</v-list-item-title>
+                  <v-list-item-subtitle>{{ key.keyPrefix }}...</v-list-item-subtitle>
+                  <template v-slot:append>
+                    <v-btn
+                      icon="mdi-delete"
+                      size="small"
+                      variant="text"
+                      color="error"
+                      @click="revokeDelegateKey(key.id, key.name)"
+                    />
+                  </template>
+                </v-list-item>
+              </v-list>
+            </div>
 
             <v-divider class="my-4" />
 
@@ -435,7 +497,7 @@
 import { ref, computed, onMounted, watch } from 'vue';
 import { useTheme } from 'vuetify';
 import { useStore } from '@/store';
-import { api, getDelegateApiKeys, createDelegateApiKey, revokeDelegateApiKey, type DelegateApiKeyPublic } from '@/services/api';
+import { api, getDelegateApiKeys, createDelegateApiKey, revokeDelegateApiKey, type DelegateApiKeyPublic, getDelegateEntities, createDelegateEntity, createDelegateEntityKey, revokeDelegateEntityKey, deleteDelegateEntity, type DelegateEntity } from '@/services/api';
 import { UserGrantSummary } from '@deprecated-claude/shared';
 import CustomModelsTab from './CustomModelsTab.vue';
 import AvatarPacksTab from './AvatarPacksTab.vue';
@@ -466,12 +528,19 @@ const grantSummary = ref<UserGrantSummary | null>(null);
 const grantsLoading = ref(false);
 const grantsError = ref<string | null>(null);
 
-// Delegate API Keys state
+// Delegate API Keys state (legacy)
 const delegateApiKeys = ref<DelegateApiKeyPublic[]>([]);
 const newDelegateKeyName = ref('');
 const creatingDelegateKey = ref(false);
 const newlyCreatedKey = ref<string | null>(null);
 const hasConnectedDelegates = ref(false);
+
+// Delegate entities state (new system)
+const delegateEntities = ref<DelegateEntity[]>([]);
+const newDelegateName = ref('');
+const creatingDelegate = ref(false);
+const NAMESPACE_REGEX = /^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$/;
+const isValidDelegateName = computed(() => NAMESPACE_REGEX.test(newDelegateName.value));
 
 const newKey = ref({
   name: '',
@@ -692,12 +761,69 @@ function onDelegatesUpdated(delegates: any[]) {
   hasConnectedDelegates.value = delegates.length > 0;
 }
 
+// Delegate entity methods
+async function loadDelegateEntities() {
+  try {
+    const response = await getDelegateEntities();
+    delegateEntities.value = response.delegates;
+  } catch (error) {
+    console.error('Failed to load delegate entities:', error);
+  }
+}
+
+async function addDelegate() {
+  if (!isValidDelegateName.value || creatingDelegate.value) return;
+  creatingDelegate.value = true;
+  try {
+    await createDelegateEntity(newDelegateName.value);
+    newDelegateName.value = '';
+    await loadDelegateEntities();
+  } catch (error: any) {
+    console.error('Failed to create delegate:', error);
+    alert(error.response?.data?.error || 'Failed to create delegate');
+  } finally {
+    creatingDelegate.value = false;
+  }
+}
+
+async function createEntityKey(delegateId: string) {
+  try {
+    const response = await createDelegateEntityKey(delegateId);
+    newlyCreatedKey.value = response.secretKey;
+    await loadDelegateEntities();
+  } catch (error) {
+    console.error('Failed to create delegate key:', error);
+    alert('Failed to create key');
+  }
+}
+
+async function revokeEntityKey(keyId: string) {
+  if (!confirm('Revoke this API key? This cannot be undone.')) return;
+  try {
+    await revokeDelegateEntityKey(keyId);
+    await loadDelegateEntities();
+  } catch (error) {
+    console.error('Failed to revoke delegate key:', error);
+  }
+}
+
+async function deleteDelegate(delegateId: string, namespace: string) {
+  if (!confirm(`Delete delegate "${namespace}"? All its API keys will be revoked. This cannot be undone.`)) return;
+  try {
+    await deleteDelegateEntity(delegateId);
+    await loadDelegateEntities();
+  } catch (error) {
+    console.error('Failed to delete delegate:', error);
+  }
+}
+
 // Load data when dialog opens
 watch(() => props.modelValue, (isOpen) => {
   if (isOpen) {
     loadApiKeys();
     loadGrantSummary();
     loadDelegateApiKeys();
+    loadDelegateEntities();
   }
 });
 

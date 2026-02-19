@@ -127,6 +127,51 @@ export async function revokeDelegateApiKey(keyId: string): Promise<{ success: bo
   return response.data;
 }
 
+// =============================================================================
+// Delegate Entities
+// =============================================================================
+
+export interface DelegateEntityKey {
+  id: string;
+  keyPrefix: string;
+  createdAt: string;
+}
+
+export interface DelegateEntity {
+  id: string;
+  namespace: string;
+  createdAt: string;
+  lastSeenAt: string | null;
+  isConnected: boolean;
+  toolCount: number;
+  keys: DelegateEntityKey[];
+}
+
+export async function getDelegateEntities(): Promise<{ delegates: DelegateEntity[] }> {
+  const response = await api.get('/delegates');
+  return response.data;
+}
+
+export async function createDelegateEntity(namespace: string): Promise<{ id: string; namespace: string; created: boolean }> {
+  const response = await api.post('/delegates', { namespace });
+  return response.data;
+}
+
+export async function createDelegateEntityKey(delegateId: string): Promise<{ keyId: string; keyPrefix: string; secretKey: string; warning: string }> {
+  const response = await api.post(`/delegates/${delegateId}/keys`);
+  return response.data;
+}
+
+export async function revokeDelegateEntityKey(keyId: string): Promise<{ success: boolean }> {
+  const response = await api.delete(`/delegates/keys/${keyId}`);
+  return response.data;
+}
+
+export async function deleteDelegateEntity(delegateId: string): Promise<{ success: boolean }> {
+  const response = await api.delete(`/delegates/${delegateId}`);
+  return response.data;
+}
+
 /**
  * Test a tool with empty input (10s timeout)
  */
