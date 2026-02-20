@@ -428,6 +428,15 @@
             title="Event history"
           />
         </v-badge>
+
+        <v-btn
+          v-if="currentConversation"
+          :icon="showCheckpoints ? 'mdi-flag-checkered' : 'mdi-flag-outline'"
+          :color="showCheckpoints ? 'primary' : undefined"
+          variant="text"
+          @click.stop="showCheckpoints = !showCheckpoints"
+          title="Checkpoints"
+        />
       </v-app-bar>
 
       <!-- Messages Area with Event History Panel -->
@@ -496,6 +505,15 @@
           :is-mobile="isMobile"
           @close="showEventHistory = false"
           @navigate-to-message="handleEventNavigate"
+        />
+
+        <CheckpointPanel
+          v-if="showCheckpoints && currentConversation"
+          :conversation-id="currentConversation.id"
+          :is-mobile="isMobile"
+          :checkpoint-epoch="checkpointEpoch"
+          @close="showCheckpoints = false"
+          @rollback-complete="handleCheckpointRollback"
         />
       </div>
 
@@ -1235,6 +1253,7 @@ import { useDelegates } from '@/composables/useDelegates';
 import ShareDialog from '@/components/ShareDialog.vue';
 import CollaborationShareDialog from '@/components/CollaborationShareDialog.vue';
 import EventHistoryPanel from '@/components/EventHistoryPanel.vue';
+import CheckpointPanel from '@/components/CheckpointPanel.vue';
 import ManageSharesDialog from '@/components/ManageSharesDialog.vue';
 import DuplicateConversationDialog from '@/components/DuplicateConversationDialog.vue';
 import ArcLogo from '@/components/ArcLogo.vue';
@@ -1335,6 +1354,10 @@ const isAiRequestQueued = ref(false); // True if our request was queued because 
 const hiddenFromAi = ref(false); // Toggle for sending messages hidden from AI
 const samplingBranches = ref(1); // Number of response branches to generate
 const showEventHistory = ref(false); // Toggle for event history panel
+const showCheckpoints = ref(false); // Toggle for checkpoint panel
+// Monotonic counter — NOT reset on conversation switch (intentional: it's not conversation-specific,
+// it just signals "something changed". CheckpointPanel's watch(conversationId) handles the reset.)
+const checkpointEpoch = ref(0);
 
 // MCPL scope change state
 interface ScopeChangeServer { url: string; name: string; reason: string; }
@@ -2663,16 +2686,68 @@ onMounted(async () => {
   
   // Mark initialization as complete so route watcher can take over
   isInitialized.value = true;
+
+  // Register checkpoint broadcast listener
+  if (store.state.wsService) {
+    store.state.wsService.on('checkpoint_rolled_back', handleCheckpointBroadcast);
+  }
 });
+
+// --------------------------------------------------------------------------
+// Checkpoint Panel integration
+// --------------------------------------------------------------------------
+
+// Pending reload guard for loadMessages during broadcasts
+let loadingMessages = false;
+let pendingMessagesReload = false;
+
+async function reloadMessages(conversationId: string) {
+  if (loadingMessages) { pendingMessagesReload = true; return; }
+  loadingMessages = true;
+  try {
+    await store.loadMessages(conversationId);
+  } finally {
+    loadingMessages = false;
+    if (pendingMessagesReload) {
+      pendingMessagesReload = false;
+      void reloadMessages(conversationId);
+    }
+  }
+}
+
+// Named function reference for proper off() cleanup
+const handleCheckpointBroadcast = (data: any) => {
+  if (data.conversationId !== currentConversation.value?.id) return;
+  checkpointEpoch.value++;  // drives CheckpointPanel reload via prop watch
+  reloadMessages(data.conversationId);
+};
+
+// Handler for when user clicks rollback in CheckpointPanel (this tab)
+async function handleCheckpointRollback() {
+  const convId = store.state.currentConversation?.id;
+  if (!convId) return;
+  await store.loadMessages(convId);
+  await nextTick();
+  scrollToBottom();
+}
+
+// Mutual exclusion: close EventHistoryPanel when CheckpointPanel opens and vice versa
+watch(showCheckpoints, (v) => { if (v) showEventHistory.value = false; });
+watch(showEventHistory, (v) => { if (v) showCheckpoints.value = false; });
 
 onBeforeUnmount(() => {
   if (typeof window !== 'undefined') {
     window.removeEventListener('resize', updateMobileState);
   }
-  
+
   // Leave room when unmounting
   if (currentConversation.value && store.state.wsService) {
     store.state.wsService.leaveRoom(currentConversation.value.id);
+  }
+
+  // Unregister checkpoint broadcast listener
+  if (store.state.wsService) {
+    store.state.wsService.off('checkpoint_rolled_back', handleCheckpointBroadcast);
   }
 });
 

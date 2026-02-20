@@ -206,7 +206,7 @@ export class McplStateManager {
         this.states.set(conversationId, restored);
       } catch (err) {
         console.error(`[McplStateManager] Corrupt state in ${checkpointId}:`, err);
-        this.removeNode(tree, checkpointId);  // prevent infinite canRollback→commitRollback loop
+        this.removeNode(tree, checkpointId, conversationId);  // prevent infinite canRollback→commitRollback loop
         return { success: false, error: 'rollback_failed' };
       }
     }
@@ -240,6 +240,29 @@ export class McplStateManager {
     const check = this.canRollback(conversationId);
     if (!check.exists) return false;
     return this.commitRollback(conversationId, check.checkpointId).success;
+  }
+
+  /**
+   * Atomic can+commit — eliminates TOCTOU window between canRollback/commitRollback.
+   * Used by WS handler for checkpoint_rollback messages.
+   */
+  tryRollback(
+    conversationId: string,
+    checkpointId?: string,
+  ): { success: true; checkpointId: string } | { success: false; error: 'expired' | 'unknown' | 'no_checkpoints' | 'rollback_failed' } {
+    const check = this.canRollback(conversationId, checkpointId);
+    if (!check.exists) {
+      return { success: false, error: check.error };
+    }
+    const result = this.commitRollback(conversationId, check.checkpointId);
+    if (result.success) {
+      return { success: true, checkpointId: check.checkpointId };
+    }
+    // commitRollback failed — map error
+    return {
+      success: false,
+      error: result.error === 'checkpoint_expired' ? 'expired' : 'rollback_failed',
+    };
   }
 
   // --------------------------------------------------------------------------
@@ -343,6 +366,12 @@ export class McplStateManager {
       const seq = this.parseSeqFromId(id);
       if (seq !== null && seq >= tree.nextSeq) tree.nextSeq = seq;
 
+      // First-write-wins: skip duplicate checkpoint IDs (corrupted JSONL)
+      if (tree.nodes.has(id)) {
+        console.warn(`[McplStateManager] Replay skipping duplicate checkpoint ${id}`);
+        return;
+      }
+
       // Approach (a): restore state snapshot from event
       const stateSnapshot = (data.state as string) ?? null;
 
@@ -385,6 +414,15 @@ export class McplStateManager {
           try {
             this.states.set(conversationId, JSON.parse(node.state));
           } catch { /* corrupted — skip */ }
+        }
+      }
+
+    } else if (data.action === 'remove_node') {
+      const tree = this.trees.get(conversationId);
+      if (tree) {
+        const nodeId = data.nodeId as string;
+        if (nodeId && tree.nodes.has(nodeId)) {
+          this.removeNode(tree, nodeId, conversationId, false);  // persist=false: event already in log
         }
       }
 
@@ -621,8 +659,11 @@ export class McplStateManager {
    * Remove a node from tree (corrupt state, etc).
    * Reparents children to node's parent, adds tombstone in tree mode.
    * Prevents infinite canRollback→commitRollback loop on corrupt nodes.
+   *
+   * @param persist — if true, persist a remove_node event so the removal survives restart.
+   *                  Set to false during replay (the event already exists in the log).
    */
-  private removeNode(tree: ConversationTree, nodeId: string): void {
+  private removeNode(tree: ConversationTree, nodeId: string, conversationId?: string, persist = true): void {
     const node = tree.nodes.get(nodeId);
     if (!node) return;
 
@@ -655,6 +696,20 @@ export class McplStateManager {
     // If current pointed to removed node, move to parent
     if (tree.current === nodeId) {
       tree.current = node.parent ?? '';
+    }
+
+    // Persist removal so it survives restart (fire-and-forget)
+    if (persist && conversationId) {
+      const userId = this.userIds.get(conversationId);
+      if (userId) {
+        this.db?.appendMcplUserEvent(userId, 'checkpoint_tree_updated', {
+          _conversationId: conversationId,
+          action: 'remove_node',
+          nodeId,
+        } as Record<string, unknown>).catch(err =>
+          console.warn('[McplStateManager] Failed to persist remove_node event:', err)
+        );
+      }
     }
 
     console.warn(`[McplStateManager] Removed corrupt node ${nodeId}`);

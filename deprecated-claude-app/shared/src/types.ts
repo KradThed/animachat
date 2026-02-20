@@ -765,11 +765,95 @@ export const WsMessageSchema = z.discriminatedUnion('type', [
     isTyping: z.boolean()
   }),
   z.object({
+    type: z.literal('checkpoint_list'),
+    conversationId: z.string().uuid(),
+    requestId: z.string().min(1).optional(),
+  }),
+  z.object({
+    type: z.literal('checkpoint_rollback'),
+    conversationId: z.string().uuid(),
+    checkpointId: z.string(),
+    requestId: z.string().min(1).optional(),
+  }),
+  z.object({
+    type: z.literal('checkpoint_timeline'),
+    conversationId: z.string().uuid(),
+    requestId: z.string().min(1).optional(),
+  }),
+  z.object({
     type: z.literal('ping')
   })
 ]);
 
 export type WsMessage = z.infer<typeof WsMessageSchema>;
+
+// Checkpoint response schemas (server → client)
+export const CheckpointNodeSchema = z.object({
+  id: z.string(),
+  parent: z.string().nullable(),
+  children: z.array(z.string()),
+  createdAt: z.number(),
+  isCurrent: z.boolean(),
+  label: z.string(),
+  mutationCount: z.number(),
+});
+export type CheckpointNodeInfo = z.infer<typeof CheckpointNodeSchema>;
+
+export const CheckpointListResponseSchema = z.object({
+  type: z.literal('checkpoint_list_response'),
+  conversationId: z.string(),
+  current: z.string(),
+  checkpoints: z.array(CheckpointNodeSchema),
+  requestId: z.string().min(1).optional(),
+  error: z.enum(['conversation_access_denied']).optional(),
+});
+export type CheckpointListResponse = z.infer<typeof CheckpointListResponseSchema>;
+
+export const CheckpointRollbackResponseSchema = z.object({
+  type: z.literal('checkpoint_rollback_response'),
+  conversationId: z.string(),
+  success: z.boolean(),
+  checkpointId: z.string().optional(),
+  requestId: z.string().min(1).optional(),
+  error: z.enum([
+    'conversation_access_denied',
+    'checkpoint_expired',
+    'checkpoint_unknown',
+    'no_checkpoints',
+    'rollback_failed',
+  ]).optional(),
+});
+export type CheckpointRollbackResponse = z.infer<typeof CheckpointRollbackResponseSchema>;
+
+// Broadcast: other tabs/users get notified after successful rollback
+export const CheckpointRolledBackSchema = z.object({
+  type: z.literal('checkpoint_rolled_back'),
+  conversationId: z.string(),
+  checkpointId: z.string(),
+});
+export type CheckpointRolledBack = z.infer<typeof CheckpointRolledBackSchema>;
+
+// Timeline: chronological event list for a conversation
+export const CheckpointTimelineEventSchema = z.object({
+  timestamp: z.string().datetime(),
+  action: z.enum(['checkpoint', 'rollback', 'remove_node', 'mode_upgrade']),
+  checkpointId: z.string().optional(),
+  parentId: z.string().nullable().optional(),
+  label: z.string().optional(),
+  mutationCount: z.number().optional(),
+  nodeId: z.string().optional(),
+  mode: z.string().optional(),
+});
+export type CheckpointTimelineEvent = z.infer<typeof CheckpointTimelineEventSchema>;
+
+export const CheckpointTimelineResponseSchema = z.object({
+  type: z.literal('checkpoint_timeline_response'),
+  conversationId: z.string().uuid(),
+  events: z.array(CheckpointTimelineEventSchema),
+  requestId: z.string().min(1).optional(),
+  error: z.enum(['conversation_access_denied']).optional(),
+});
+export type CheckpointTimelineResponse = z.infer<typeof CheckpointTimelineResponseSchema>;
 
 // API Request/Response types
 export const CreateConversationRequestSchema = z.object({

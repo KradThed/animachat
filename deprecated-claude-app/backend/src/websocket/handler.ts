@@ -18,6 +18,7 @@ import type { ToolCall, ToolResult } from '../tools/tool-registry.js';
 import { delegateWebsocketHandler, resolveScopeChange, resolveScopeElevate } from '../delegate/delegate-handler.js';
 import { mcplHookManager } from '../services/mcpl-hook-manager.js';
 import { mcplEventQueue } from '../services/mcpl-event-queue.js';
+import { mcplStateManager } from '../services/mcpl-state-manager.js';
 import type { McplContextInjection } from '@deprecated-claude/shared';
 
 interface AuthenticatedWebSocket extends WebSocket {
@@ -1000,6 +1001,137 @@ export function websocketHandler(ws: AuthenticatedWebSocket, req: IncomingMessag
           // This is separate from WebSocket protocol-level ping/pong
           ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
           break;
+
+        case 'checkpoint_list': {
+          if (!ws.userId) { ws.close(1008, 'unauthorized'); break; }
+          const msg = message as Extract<WsMessage, { type: 'checkpoint_list' }>;
+          const convId = msg.conversationId;
+          const reqId = msg.requestId;
+
+          // Access check — same pattern as chat/regenerate/edit handlers
+          const conversation = await db.getConversation(convId, ws.userId);
+          if (!conversation) {
+            ws.send(JSON.stringify({
+              type: 'checkpoint_list_response',
+              conversationId: convId,
+              current: '',
+              checkpoints: [],
+              error: 'conversation_access_denied',
+              ...(reqId && { requestId: reqId }),
+            }));
+            break;
+          }
+
+          const result = mcplStateManager.getCheckpoints(convId);
+          ws.send(JSON.stringify({
+            type: 'checkpoint_list_response',
+            conversationId: convId,
+            current: result?.current ?? '',
+            checkpoints: result?.checkpoints ?? [],
+            ...(reqId && { requestId: reqId }),
+          }));
+          break;
+        }
+
+        case 'checkpoint_rollback': {
+          if (!ws.userId) { ws.close(1008, 'unauthorized'); break; }
+          const msg = message as Extract<WsMessage, { type: 'checkpoint_rollback' }>;
+          const convId = msg.conversationId;
+          const targetId = msg.checkpointId;
+          const reqId = msg.requestId;
+
+          // Access check — don't reveal conversation existence
+          const conversation = await db.getConversation(convId, ws.userId);
+          if (!conversation) {
+            ws.send(JSON.stringify({
+              type: 'checkpoint_rollback_response',
+              conversationId: convId,
+              success: false,
+              error: 'conversation_access_denied',
+              ...(reqId && { requestId: reqId }),
+            }));
+            break;
+          }
+
+          // Write-permission check — viewers cannot rollback (same pattern as chat/edit/regenerate)
+          const canChat = await db.canUserChatInConversation(convId, ws.userId);
+          if (!canChat) {
+            ws.send(JSON.stringify({
+              type: 'checkpoint_rollback_response',
+              conversationId: convId,
+              success: false,
+              error: 'conversation_access_denied',
+              ...(reqId && { requestId: reqId }),
+            }));
+            break;
+          }
+
+          // Atomic can+commit — eliminates TOCTOU between canRollback/commitRollback
+          const rollbackResult = mcplStateManager.tryRollback(convId, targetId);
+
+          if (!rollbackResult.success) {
+            const errorMap: Record<string, string> = {
+              'expired': 'checkpoint_expired',
+              'unknown': 'checkpoint_unknown',
+              'no_checkpoints': 'no_checkpoints',
+              'rollback_failed': 'rollback_failed',
+            };
+            ws.send(JSON.stringify({
+              type: 'checkpoint_rollback_response',
+              conversationId: convId,
+              success: false,
+              error: errorMap[rollbackResult.error] ?? 'rollback_failed',
+              ...(reqId && { requestId: reqId }),
+            }));
+            break;
+          }
+
+          ws.send(JSON.stringify({
+            type: 'checkpoint_rollback_response',
+            conversationId: convId,
+            success: true,
+            checkpointId: rollbackResult.checkpointId,
+            ...(reqId && { requestId: reqId }),
+          }));
+
+          // Broadcast to room so other tabs/users update
+          roomManager.broadcastToRoom(convId, {
+            type: 'checkpoint_rolled_back',
+            conversationId: convId,
+            checkpointId: rollbackResult.checkpointId,
+          }, ws); // exclude sender (they already handle via response)
+          break;
+        }
+
+        case 'checkpoint_timeline': {
+          if (!ws.userId) { ws.close(1008, 'unauthorized'); break; }
+          const msg = message as Extract<WsMessage, { type: 'checkpoint_timeline' }>;
+          const convId = msg.conversationId;
+          const reqId = msg.requestId;
+
+          // Read-only: getConversation (not canUserChatInConversation). Viewers can see timeline.
+          const conversation = await db.getConversation(convId, ws.userId);
+          if (!conversation) {
+            ws.send(JSON.stringify({
+              type: 'checkpoint_timeline_response',
+              conversationId: convId,
+              events: [],
+              error: 'conversation_access_denied',
+              ...(reqId && { requestId: reqId }),
+            }));
+            break;
+          }
+
+          // Pass conversation.userId (owner) since events live in owner's userEventStore
+          const events = await db.getCheckpointTimelineEvents(convId, conversation.userId);
+          ws.send(JSON.stringify({
+            type: 'checkpoint_timeline_response',
+            conversationId: convId,
+            events,
+            ...(reqId && { requestId: reqId }),
+          }));
+          break;
+        }
 
         default:
           ws.send(JSON.stringify({ type: 'error', error: 'Unknown message type' }));

@@ -17,6 +17,7 @@ import { PersonaStore } from './persona.js';
 import { ConversationUIStateStore } from './conversation-ui-state.js';
 import { UIEventLog } from './ui-event-log.js';
 import { SharePermission, ConversationShare, canChat, canDelete } from '@deprecated-claude/shared';
+import type { CheckpointTimelineEvent } from '@deprecated-claude/shared';
 import {
   Persona,
   PersonaHistoryBranch,
@@ -338,6 +339,9 @@ export class Database {
     'push_event_processed',
     'debug_request',
   ]);
+
+  /** Known checkpoint actions that appear in the timeline. Unknown actions are silently skipped. */
+  private static readonly KNOWN_TIMELINE_ACTIONS = new Set(['checkpoint', 'rollback', 'remove_node', 'mode_upgrade']);
 
   private async truncateEventPayload(type: string, data: any): Promise<any> {
     if (!Database.TRUNCATABLE_EVENTS.has(type)) return data; // state events — as-is
@@ -4444,6 +4448,71 @@ export class Database {
       }
     }
     return [];
+  }
+
+  /**
+   * Get checkpoint timeline events for a conversation.
+   * Loads from userEventStore (checkpoint events are keyed by userId),
+   * filters by conversationId, normalizes timestamps, sanitizes actions,
+   * and returns sorted oldest→newest.
+   */
+  async getCheckpointTimelineEvents(
+    conversationId: string,
+    ownerUserId: string,
+  ): Promise<CheckpointTimelineEvent[]> {
+    await this.loadUser(ownerUserId);
+    const allEvents = await this.userEventStore.loadEvents(ownerUserId);
+
+    const results: CheckpointTimelineEvent[] = [];
+
+    for (const e of allEvents) {
+      if (e.type !== 'checkpoint_tree_updated') continue;
+      if (e.data?._conversationId !== conversationId) continue;
+
+      // 1) Normalize timestamp strictly to ISO — skip corrupt entries
+      const t = e.timestamp instanceof Date ? e.timestamp : new Date(e.timestamp as any);
+      if (isNaN(+t)) {
+        console.warn('[Database] Skipping checkpoint event with invalid timestamp:', e.timestamp);
+        continue;
+      }
+      const timestamp = t.toISOString();
+
+      // 2) Sanitize action — enum in schema, skip unknown actions (they'd fail validation anyway)
+      const rawAction = e.data?.action as string;
+      if (!Database.KNOWN_TIMELINE_ACTIONS.has(rawAction)) continue;
+
+      // 3) Build event object with defensive coercions
+      const out: CheckpointTimelineEvent = {
+        timestamp,
+        action: rawAction as CheckpointTimelineEvent['action'],
+      };
+
+      // Defensive coercions: checkpointId/nodeId use !== null/undefined (not truthy)
+      // to avoid swallowing "0" or other falsy-but-valid values
+      if (e.data.checkpointId !== undefined && e.data.checkpointId !== null) {
+        out.checkpointId = String(e.data.checkpointId);
+      }
+      if (e.data.parentId !== undefined) {
+        out.parentId = e.data.parentId === null ? null : String(e.data.parentId);
+      }
+      if (e.data.label) out.label = String(e.data.label);
+      if (e.data.mutationCount !== undefined) {
+        const n = Number(e.data.mutationCount);
+        if (Number.isFinite(n)) out.mutationCount = n;
+      }
+      if (e.data.nodeId !== undefined && e.data.nodeId !== null) {
+        out.nodeId = String(e.data.nodeId);
+      }
+      if (e.data.mode) out.mode = String(e.data.mode);
+
+      results.push(out);
+    }
+
+    // Sort chronologically (oldest→newest). Makes contract explicit even if JSONL is already ordered.
+    // Frontend reverses for newest-first UX.
+    results.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+
+    return results;
   }
 
   /**
