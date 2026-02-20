@@ -89,6 +89,8 @@ export class BulkEventStore {
         return await eventStore.loadEvents();
     }
 
+    // M5: loadEventsUntil() removed — dead code after forkPoint = messages.length fix (C4).
+
     async *loadAllEvents() : AsyncGenerator<IdEvents, void, void> {
         const events = new Array<IdEvents>();
         let files = [];

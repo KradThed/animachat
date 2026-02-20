@@ -780,6 +780,32 @@ export const WsMessageSchema = z.discriminatedUnion('type', [
     conversationId: z.string().uuid(),
     requestId: z.string().min(1).optional(),
   }),
+  // Sub-agent WebSocket message types (H3)
+  z.object({
+    type: z.literal('subtask_queue_blocked'),
+    groupId: z.string(),
+    message: z.string(),
+  }),
+  z.object({
+    type: z.literal('subtask_status_changed'),
+    groupId: z.string(),
+    taskId: z.string(),
+    status: z.string(),
+  }),
+  z.object({
+    type: z.literal('subtask_group_finalized'),
+    groupId: z.string(),
+  }),
+  z.object({
+    type: z.literal('subtask_group_auto_finalized'),
+    groupId: z.string(),
+    reason: z.string(),
+  }),
+  z.object({
+    type: z.literal('system_turn_started'),
+    conversationId: z.string(),
+    message: z.string(),
+  }),
   z.object({
     type: z.literal('ping')
   })

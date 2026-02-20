@@ -191,6 +191,20 @@ export class Database {
   private uiEventLog: UIEventLog;
   private initialized: boolean = false;
 
+  // M5: convEventCounts removed — dead code after forkPoint = messages.length fix (C4).
+  // Sub-agent forkPoint is now computed as messages.length in SubAgentManager.spawnSubtask().
+
+  // Round 5: Optional SubAgentManager reference for lifecycle event routing in loadConversation().
+  // Set via setSubAgentManager() from index.ts startup.
+  private _subAgentManager: { replayQueuedUserTurn(event: any): void; replayLifecycleEvent(event: any): void } | null = null;
+
+  /**
+   * Round 5: Wire SubAgentManager for lifecycle event routing during conversation replay.
+   */
+  setSubAgentManager(manager: { replayQueuedUserTurn(event: any): void; replayLifecycleEvent(event: any): void }): void {
+    this._subAgentManager = manager;
+  }
+
   constructor() {
     this.eventStore = new EventStore('./data', 'mainEvents.jsonl');
     this.userEventStore = new BulkEventStore("./data/users");
@@ -532,6 +546,19 @@ export class Database {
           legacyBranches[event.data.messageId] = event.data.branchId;
           continue;  // SKIP — don't replay, just collect for migration
         }
+
+        // Round 5: Route sub-agent lifecycle events to SubAgentManager for runtime state restoration.
+        // These events MUST NOT create Message objects, but MUST restore runtime state
+        // (frozen conversations, queued messages, group state) so they survive restarts.
+        if (event.type === 'queued_user_turn') {
+          this._subAgentManager?.replayQueuedUserTurn(event);
+          continue;
+        }
+        if (event.type?.startsWith('subtask_')) {
+          this._subAgentManager?.replayLifecycleEvent(event);
+          continue;
+        }
+
         await this.replayEvent(event);
       }
 
@@ -785,14 +812,23 @@ export class Database {
     if (actionUserId && !eventData.userId && !eventData.sentByUserId && !eventData.deletedByUserId && !eventData.editedByUserId) {
       eventData.userId = actionUserId;
     }
-    
+
     const event: Event = {
       timestamp: new Date(),
       type,
       data: eventData
     };
-    
+
     await this.conversationEventStore.appendEvent(conversationId, event);
+    // M5: convEventCounts counter increment removed — dead code after C4 fix.
+  }
+
+  /**
+   * Append a sub-agent lifecycle event to the main conversation JSONL.
+   * These events are lightweight markers — actual branch content lives in BranchEventStore.
+   */
+  async appendSubAgentEvent(conversationId: string, type: string, data: any, userId?: string): Promise<void> {
+    await this.logConversationEvent(conversationId, type, data, userId);
   }
 
   private async logUserEvent(userId: string, type: string, data: any): Promise<void> {

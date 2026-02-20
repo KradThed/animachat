@@ -241,7 +241,62 @@ async function startServer() {
     });
 
     console.log('MCPL services initialized with database');
-    
+
+    // Initialize sub-agent system
+    const { BranchEventStore } = await import('./database/branch-event-store.js');
+    const {
+      LLMClientAdapter,
+      SubAgentContextBuilder,
+      SubAgentManager,
+      NotificationBus,
+      SystemTurnTrigger,
+      registerSubAgentTools,
+    } = await import('./sub-agents/index.js');
+
+    const branchStore = new BranchEventStore();
+    await branchStore.init();
+    _branchStore = branchStore;
+
+    // H4: LLM client adapter wraps the enhanced inference service
+    // Use MembraneInferenceService (same as handler.ts) for native tool support
+    const { EnhancedInferenceService } = await import('./services/enhanced-inference.js');
+    const { MembraneInferenceService } = await import('./services/membrane-inference.js');
+    const { ContextManager } = await import('./services/context-manager.js');
+    const baseInference = new MembraneInferenceService(db);
+    const contextManager = new ContextManager();
+    const enhancedInference = new EnhancedInferenceService(baseInference, contextManager);
+    const llmClient = new LLMClientAdapter(enhancedInference);
+
+    // Context builder
+    const contextBuilder = new SubAgentContextBuilder(db, branchStore);
+
+    // Notification bus
+    const { roomManager } = await import('./websocket/room-manager.js');
+    const notificationBus = new NotificationBus();
+    notificationBus.bridgeToWebSocket(roomManager);
+
+    // System turn trigger
+    const systemTurnTrigger = new SystemTurnTrigger(db, llmClient, roomManager);
+    notificationBus.bridgeToInferenceTrigger(systemTurnTrigger);
+
+    // Sub-agent manager
+    const subAgentManager = new SubAgentManager(
+      llmClient, contextBuilder, branchStore, notificationBus, db,
+    );
+    await subAgentManager.recoverOrphanedTasks();
+
+    // Register sub-agent tools
+    registerSubAgentTools(subAgentManager);
+
+    // Wire frozen parent gate to handler
+    const { setSubAgentManager } = await import('./websocket/handler.js');
+    setSubAgentManager(subAgentManager);
+
+    // Round 5: Wire SubAgentManager for lifecycle event routing during conversation replay
+    db.setSubAgentManager(subAgentManager);
+
+    console.log('Sub-agent system initialized');
+
     // Pre-populate OpenRouter pricing cache and register lazy refresh callback
     const openRouterService = new OpenRouterService(db);
     
@@ -285,10 +340,17 @@ async function startServer() {
 }
 
 // Handle graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('Shutting down gracefully...');
+// branchStore reference for shutdown (set during startServer)
+let _branchStore: { close(): Promise<void> } | null = null;
+
+async function gracefulShutdown(signal: string) {
+  console.log(`${signal} received. Shutting down gracefully...`);
+  await _branchStore?.close();
   await db.close();
   process.exit(0);
-});
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 startServer();

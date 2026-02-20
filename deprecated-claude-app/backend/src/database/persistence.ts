@@ -99,6 +99,9 @@ export class EventStore {
     });
   }
   
+  // M5: loadEventsUntil() removed — dead code after forkPoint = messages.length fix (C4).
+  // Sub-agent context builder now uses db.getConversationMessages() + slice.
+
   async close(): Promise<void> {
     if (this.writeStream) {
       await this.writeStream.close();

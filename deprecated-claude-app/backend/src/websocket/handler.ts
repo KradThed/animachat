@@ -26,6 +26,14 @@ interface AuthenticatedWebSocket extends WebSocket {
   isAlive?: boolean;
 }
 
+// Sub-agent frozen parent gate
+// Set via setSubAgentManager() from index.ts startup
+let _subAgentManager: { getBlockingGroupId(conversationId: string): string | null } | null = null;
+
+export function setSubAgentManager(manager: { getBlockingGroupId(conversationId: string): string | null }): void {
+  _subAgentManager = manager;
+}
+
 // Track active generations for abort support
 // Key: `${userId}:${conversationId}`, Value: AbortController
 const activeGenerations = new Map<string, AbortController>();
@@ -68,7 +76,7 @@ function abortGeneration(userId: string, conversationId: string): boolean {
  * For group chats: uses responder.toolConfig
  * Returns undefined if no tools are available or tools are disabled.
  */
-interface ToolOptions {
+export interface ToolOptions {
   tools: any[];
   snapshotHash: string;
   toolCount: number;
@@ -77,7 +85,7 @@ interface ToolOptions {
   executeToolCall: (call: ToolCall) => Promise<ToolResult>;
 }
 
-function buildToolOptions(
+export function buildToolOptions(
   userId: string,
   conversation: Conversation,
   responder?: Participant,
@@ -925,6 +933,16 @@ export function websocketHandler(ws: AuthenticatedWebSocket, req: IncomingMessag
       const raw = JSON.parse(data.toString());
 
       // Handle MCPL messages (not part of WsMessageSchema)
+      // M6: Intentional: Delegates bypass frozen gate.
+      // Delegate WS messages (tool manifests, push events, tool responses) serve the parent
+      // conversation's MCP servers. They must flow freely even when parent chat is frozen.
+      // Note: Sub-agents CAN access delegate MCP tools through ToolRegistry.executeTool() —
+      // delegate tools are registered in ToolRegistry via registerDelegateTools() in
+      // delegate-handler.ts. This is by design (unified tool architecture).
+      // Known MVP limitations for delegate tools in sub-agents:
+      //   - No per-server queue (concurrent sub-agents may overload delegate)
+      //   - No resource locking between parent and sub-agents
+      //   - No abort propagation to delegate on sub-agent cancel
       if (raw.type === 'mcpl/pause_queue' && raw.conversationId && ws.userId) {
         mcplEventQueue.pause(raw.conversationId);
         return;
@@ -1256,6 +1274,19 @@ async function handleChatMessage(
   if (!canChat) {
     ws.send(JSON.stringify({ type: 'error', error: 'You do not have permission to send messages in this conversation' }));
     return;
+  }
+
+  // Frozen parent gate: block new messages while sub-agents are active
+  if (_subAgentManager) {
+    const blockingGroupId = _subAgentManager.getBlockingGroupId(message.conversationId);
+    if (blockingGroupId) {
+      ws.send(JSON.stringify({
+        type: 'subtask_queue_blocked',
+        groupId: blockingGroupId,
+        message: 'Sub-agents are currently active. Use finalize_task_group to complete them first.',
+      }));
+      return;
+    }
   }
 
   // Content filter check with tiered moderation
