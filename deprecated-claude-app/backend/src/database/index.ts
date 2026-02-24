@@ -121,6 +121,7 @@ export class Database {
 
   private userLastAccessedTimes: Map<string, Date> = new Map(); // userId -> last accessed time
   private conversationsLastAccessedTimes: Map<string, Date> = new Map(); // conversationId -> last accessed time
+  private loadingConversations: Map<string, Promise<void>> = new Map(); // conversationId -> in-flight load promise
 
   private bookmarks: Map<string, Bookmark> = new Map(); // bookmarkId -> Bookmark
   private branchBookmarks: Map<string, string> = new Map(); // `${messageId}-${branchId}` -> bookmarkId
@@ -196,12 +197,12 @@ export class Database {
 
   // Round 5: Optional SubAgentManager reference for lifecycle event routing in loadConversation().
   // Set via setSubAgentManager() from index.ts startup.
-  private _subAgentManager: { replayQueuedUserTurn(event: any): void; replayLifecycleEvent(event: any): void } | null = null;
+  private _subAgentManager: { replayQueuedUserTurn(event: any): void; replayLifecycleEvent(event: any): void; recoverStaleGroupsForConversation(conversationId: string): Promise<void> } | null = null;
 
   /**
    * Round 5: Wire SubAgentManager for lifecycle event routing during conversation replay.
    */
-  setSubAgentManager(manager: { replayQueuedUserTurn(event: any): void; replayLifecycleEvent(event: any): void }): void {
+  setSubAgentManager(manager: { replayQueuedUserTurn(event: any): void; replayLifecycleEvent(event: any): void; recoverStaleGroupsForConversation(conversationId: string): Promise<void> }): void {
     this._subAgentManager = manager;
   }
 
@@ -535,9 +536,30 @@ export class Database {
 
   private async loadConversation(conversationId: string, conversationOwnerUserId: string) {
     await this.loadUser(conversationOwnerUserId); // user contains conversation metadata, need to do this first
-    // if we haven't loaded this conversation
-    // and this conversation exists (loading the user will populate that metadata)
-    if (!this.conversationsLastAccessedTimes.has(conversationId) && this.conversations.has(conversationId)) {
+
+    // this.conversations: all known conversations (metadata, populated at startup via loadUser)
+    // this.conversationsLastAccessedTimes: fully loaded conversations (messages replayed)
+    // Already loaded, or conversation doesn't exist at all → nothing to do
+    if (this.conversationsLastAccessedTimes.has(conversationId) || !this.conversations.has(conversationId)) {
+      this.conversationsLastAccessedTimes.set(conversationId, new Date());
+      return;
+    }
+
+    // Wait for any in-flight load of same conversation (prevents TOCTOU race)
+    const existing = this.loadingConversations.get(conversationId);
+    if (existing) {
+      await existing;
+      this.conversationsLastAccessedTimes.set(conversationId, new Date());
+      return;
+    }
+
+    // Start new load — store promise so concurrent callers wait
+    let resolve: () => void = () => {};
+    let reject: (err: unknown) => void = () => {};
+    const loadPromise = new Promise<void>((res, rej) => { resolve = res; reject = rej; });
+    this.loadingConversations.set(conversationId, loadPromise);
+
+    try {
       // Replay events + collect legacy active_branch_changed for UIEventLog migration
       // SKIP active_branch_changed from replay — UIEventLog is the single source of truth
       const legacyBranches: Record<string, string> = {};
@@ -570,8 +592,20 @@ export class Database {
 
       // Apply UI state to messages (UIEventLog is the single source of truth)
       this.applyBranchesToMessages(branchesToApply);
+
+      // SA-2: Recover stale sub-agent groups for this conversation after replay.
+      // recoverStaleGroups() at startup runs before conversations are loaded (groups empty),
+      // so per-conversation recovery after replay is the correct time.
+      await this._subAgentManager?.recoverStaleGroupsForConversation(conversationId);
+
+      resolve();
+      this.conversationsLastAccessedTimes.set(conversationId, new Date());
+    } catch (err) {
+      reject(err);
+      throw err;
+    } finally {
+      this.loadingConversations.delete(conversationId);
     }
-    this.conversationsLastAccessedTimes.set(conversationId, new Date());
   }
 
   /**
@@ -625,6 +659,34 @@ export class Database {
     this.uiStateStore.clearCache(conversationId);
     this.uiEventLog.clearCache(conversationId);
 
+    // Simple conversationId-keyed maps
+    this.disabledServers.delete(conversationId);
+    this.lastToolsetHash.delete(conversationId);
+    this.lastToolsetSnapshot.delete(conversationId);
+
+    // Two-phase delete: userConversationStates (keyed `${conversationId}::${userId}`)
+    const stateKeysToDelete: string[] = [];
+    for (const key of this.userConversationStates.keys()) {
+      if (key.startsWith(`${conversationId}::`)) {
+        stateKeysToDelete.push(key);
+      }
+    }
+    for (const key of stateKeysToDelete) {
+      this.userConversationStates.delete(key);
+    }
+
+    // Two-phase delete: bookmarks
+    const bookmarkIdsToDelete: string[] = [];
+    for (const [bookmarkId, bookmark] of this.bookmarks.entries()) {
+      if (bookmark.conversationId === conversationId) {
+        bookmarkIdsToDelete.push(bookmarkId);
+        this.branchBookmarks.delete(`${bookmark.messageId}-${bookmark.branchId}`);
+      }
+    }
+    for (const id of bookmarkIdsToDelete) {
+      this.bookmarks.delete(id);
+    }
+
     this.conversationsLastAccessedTimes.delete(conversationId);
   }
 
@@ -664,8 +726,8 @@ export class Database {
     this.userConversations.set(testUser.id, new Set());
     this.passwordHashes.set(testUser.email, hashedPassword);
     
-    this.logEvent('user_created', { user: testUser, passwordHash: hashedPassword });
-    
+    await this.logEvent('user_created', { user: testUser, passwordHash: hashedPassword });
+
     console.log('🧪 Test user created:');
     console.log('   Email: test@example.com');
     console.log('   Password: password123');
@@ -1432,6 +1494,72 @@ export class Database {
         break;
       }
       
+      case 'message_updated': {
+        const { messageId, message } = event.data;
+        if (message) {
+          const updatedMessage = {
+            ...message,
+            branches: (message.branches || []).map((branch: any) => ({
+              ...branch,
+              createdAt: new Date(branch.createdAt)
+            }))
+          };
+          this.messages.set(messageId, updatedMessage);
+        }
+        break;
+      }
+
+      case 'message_restored': {
+        const { message, conversationId } = event.data;
+        if (message) {
+          const restoredMessage = {
+            ...message,
+            createdAt: new Date(message.createdAt),
+            branches: (message.branches || []).map((branch: any) => ({
+              ...branch,
+              createdAt: new Date(branch.createdAt)
+            }))
+          };
+          this.messages.set(restoredMessage.id, restoredMessage);
+          const convMessages = this.conversationMessages.get(conversationId) || [];
+          if (!convMessages.includes(restoredMessage.id)) {
+            // Insert at correct position based on order
+            const insertIndex = convMessages.findIndex((id) => {
+              const m = this.messages.get(id);
+              return m && m.order > restoredMessage.order;
+            });
+            if (insertIndex === -1) {
+              convMessages.push(restoredMessage.id);
+            } else {
+              convMessages.splice(insertIndex, 0, restoredMessage.id);
+            }
+          }
+          this.conversationMessages.set(conversationId, convMessages);
+        }
+        break;
+      }
+
+      case 'message_branch_restored': {
+        const { messageId, branch } = event.data;
+        const msg = this.messages.get(messageId);
+        if (msg && branch) {
+          const restoredBranch = {
+            ...branch,
+            createdAt: new Date(branch.createdAt)
+          };
+          // Add branch if not already present
+          const hasBranch = msg.branches.some((b: any) => b.id === branch.id);
+          if (!hasBranch) {
+            const updated = {
+              ...msg,
+              branches: [...msg.branches, restoredBranch]
+            };
+            this.messages.set(messageId, updated);
+          }
+        }
+        break;
+      }
+
       case 'message_imported_raw': {
         // This event is logged when importing raw messages
         // The problem: we only store messageId and conversationId, not the full message
@@ -1503,7 +1631,9 @@ export class Database {
         const { participant } = event.data;
         this.participants.set(participant.id, participant);
         const convParticipants = this.conversationParticipants.get(participant.conversationId) || [];
-        convParticipants.push(participant.id);
+        if (!convParticipants.includes(participant.id)) {
+          convParticipants.push(participant.id);
+        }
         this.conversationParticipants.set(participant.conversationId, convParticipants);
         break;
       }
@@ -1712,12 +1842,35 @@ export class Database {
       }
       
       case 'password_reset': {
-        // Password was reset - clean up any lingering reset tokens for this user
-        const { userId } = event.data;
+        // Password was reset - restore hash + clean up any lingering reset tokens for this user
+        const { userId, email, passwordHash } = event.data;
+        if (email && passwordHash) {
+          this.passwordHashes.set(email, passwordHash);
+        }
         for (const [token, data] of this.passwordResetTokens.entries()) {
           if (data.userId === userId) {
             this.passwordResetTokens.delete(token);
           }
+        }
+        break;
+      }
+
+      case 'user_age_verified': {
+        const { userId, ageVerifiedAt } = event.data;
+        const user = this.users.get(userId);
+        if (user) {
+          user.ageVerified = true;
+          user.ageVerifiedAt = new Date(ageVerifiedAt);
+        }
+        break;
+      }
+
+      case 'user_tos_accepted': {
+        const { userId, tosAcceptedAt } = event.data;
+        const user = this.users.get(userId);
+        if (user) {
+          user.tosAccepted = true;
+          user.tosAcceptedAt = new Date(tosAcceptedAt);
         }
         break;
       }
@@ -1973,7 +2126,9 @@ export class Database {
         break;
       }
 
-      // Add more cases as needed
+      default:
+        console.warn(`[Replay] Unknown event type: ${event.type}`);
+        break;
       }
     } catch (error) {
       console.error(`Error replaying event ${event.type}:`, error);
@@ -2019,11 +2174,11 @@ export class Database {
     this.userLastAccessedTimes.set(user.id, new Date());
     
     // Store password separately (not in User object)
-    this.logEvent('user_created', { user, passwordHash: hashedPassword });
+    await this.logEvent('user_created', { user, passwordHash: hashedPassword });
 
     return user;
   }
-  
+
   // Age verification methods
   async setAgeVerified(userId: string): Promise<User | null> {
     const user = this.users.get(userId);
@@ -2033,7 +2188,7 @@ export class Database {
     user.ageVerifiedAt = new Date();
     this.users.set(userId, user);
     
-    this.logEvent('user_age_verified', { userId, ageVerifiedAt: user.ageVerifiedAt });
+    await this.logEvent('user_age_verified', { userId, ageVerifiedAt: user.ageVerifiedAt });
     return user;
   }
   
@@ -2051,7 +2206,7 @@ export class Database {
     user.tosAcceptedAt = new Date();
     this.users.set(userId, user);
     
-    this.logEvent('user_tos_accepted', { userId, tosAcceptedAt: user.tosAcceptedAt });
+    await this.logEvent('user_tos_accepted', { userId, tosAcceptedAt: user.tosAcceptedAt });
     return user;
   }
   
@@ -2157,7 +2312,7 @@ export class Database {
     // Delete token
     this.passwordResetTokens.delete(token);
     
-    await this.logEvent('password_reset', { userId: user.id });
+    await this.logEvent('password_reset', { userId: user.id, email: user.email, passwordHash: hashedPassword });
     
     return user;
   }

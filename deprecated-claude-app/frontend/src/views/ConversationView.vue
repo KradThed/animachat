@@ -660,8 +660,24 @@
           @deny="denyScopeElevate"
         />
 
+        <!-- Sub-agent status panel -->
+        <SubAgentPanel
+          v-if="subAgentState.active || subAgentState.finalized"
+          :active="subAgentState.active"
+          :groupId="subAgentState.groupId"
+          :tasks="subAgentState.tasks"
+          :finalized="subAgentState.finalized"
+          :autoFinalized="subAgentState.autoFinalized"
+          :queuedText="subAgentState.queuedText"
+          @send-queued="handleSendQueued"
+          @edit-queued="handleEditQueued"
+          @discard-queued="handleDiscardQueued"
+          @dismiss="resetSubAgentState"
+          @summarize-results="handleSummarizeResults"
+        />
+
         <!-- Drop zone wrapper for drag-and-drop attachments -->
-        <div 
+        <div
           class="input-drop-zone"
           :class="{ 'drop-zone-active': isDraggingOver }"
           @dragenter.prevent="handleDragEnter"
@@ -1237,7 +1253,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue';
+import { ref, reactive, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { isEqual } from 'lodash-es';
 import { useStore } from '@/store';
@@ -1267,6 +1283,7 @@ import { computeAuthenticity, type AuthenticityStatus } from '@/utils/authentici
 import ScopeChangeDialog from '@/components/ScopeChangeDialog.vue';
 import ScopeElevateDialog from '@/components/ScopeElevateDialog.vue';
 import McplQueueWidget from '@/components/McplQueueWidget.vue';
+import SubAgentPanel from '@/components/SubAgentPanel.vue';
 
 const route = useRoute();
 const router = useRouter();
@@ -1321,6 +1338,24 @@ const stuckDialog = ref(false);
 const stuckAnalyticsSubmitting = ref(false);
 let stuckCheckTimer: ReturnType<typeof setTimeout> | null = null;
 let contentStuckCheckTimer: ReturnType<typeof setTimeout> | null = null; // Secondary timer for "content but no completion"
+
+// Sub-agent panel state
+const subAgentState = reactive({
+  active: false,
+  groupId: null as string | null,
+  tasks: [] as Array<{ taskId: string; instructionPreview: string; status: string }>,
+  finalized: false,
+  autoFinalized: false,
+  queuedText: null as string | null,
+});
+const initialSubAgentState = {
+  active: false,
+  groupId: null as string | null,
+  tasks: [] as Array<{ taskId: string; instructionPreview: string; status: string }>,
+  finalized: false,
+  autoFinalized: false,
+  queuedText: null as string | null,
+};
 
 // Timeout for "content received but never completed" - used for image generation issues
 const CONTENT_STUCK_TIMEOUT_MS = 45000; // 45 seconds after last content with no completion
@@ -2595,6 +2630,23 @@ onMounted(async () => {
           };
         }
       });
+
+      // Sub-agent WS listeners
+      store.state.wsService.on('subtask_status_changed', handleSubtaskStatusChanged);
+      store.state.wsService.on('subtask_group_finalized', handleSubtaskGroupFinalized);
+      store.state.wsService.on('subtask_group_auto_finalized', handleSubtaskGroupFinalized);
+      store.state.wsService.on('subtask_queue_blocked', handleSubtaskQueueBlocked);
+      store.state.wsService.on('subtask_state_snapshot', handleSubtaskStateSnapshot);
+      store.state.wsService.on('subtask_queue_action_result', handleSubtaskQueueActionResult);
+      store.state.wsService.on('subtask_results_snapshot', handleSubtaskResultsSnapshot);
+
+      // Request initial sub-agent state for current conversation
+      if (currentConversation.value?.id) {
+        store.state.wsService.sendMessage({
+          type: 'subtask_get_state',
+          conversationId: currentConversation.value.id,
+        });
+      }
     }
   });
   
@@ -2735,6 +2787,155 @@ async function handleCheckpointRollback() {
 watch(showCheckpoints, (v) => { if (v) showEventHistory.value = false; });
 watch(showEventHistory, (v) => { if (v) showCheckpoints.value = false; });
 
+// ---------------------------------------------------------------------------
+// Sub-agent WS handlers
+// ---------------------------------------------------------------------------
+
+function handleSubtaskStatusChanged(data: any) {
+  if (!data.groupId) return;
+
+  // Detect group switch — new group started, clear old tasks
+  if (subAgentState.groupId && subAgentState.groupId !== data.groupId) {
+    subAgentState.tasks = [];
+    subAgentState.finalized = false;
+    subAgentState.queuedText = null;
+  }
+
+  // Set active
+  subAgentState.active = true;
+  subAgentState.groupId = data.groupId;
+
+  // Update or add task
+  const idx = subAgentState.tasks.findIndex(t => t.taskId === data.taskId);
+  if (idx >= 0) {
+    subAgentState.tasks[idx].status = data.status;
+    if (data.instructionPreview) {
+      subAgentState.tasks[idx].instructionPreview = data.instructionPreview;
+    }
+  } else if (data.taskId) {
+    subAgentState.tasks.push({
+      taskId: data.taskId,
+      instructionPreview: data.instructionPreview || '',
+      status: data.status,
+    });
+  }
+}
+
+function handleSubtaskGroupFinalized(data: any) {
+  if (!data.groupId) return;
+  // Only finalize if this is our current group (ignore stale events)
+  if (subAgentState.groupId && subAgentState.groupId !== data.groupId) return;
+  subAgentState.groupId = data.groupId;
+  subAgentState.finalized = true;
+  subAgentState.active = false;
+  subAgentState.autoFinalized = data.type === 'subtask_group_auto_finalized';
+
+  // Fetch full results from server
+  store.state.wsService.sendMessage({
+    type: 'subtask_get_results',
+    groupId: data.groupId,
+  });
+}
+
+function handleSubtaskResultsSnapshot(data: any) {
+  if (!data.groupId || data.groupId !== subAgentState.groupId) return;
+  if (data.status === 'not_found') {
+    console.warn(`[SubAgent] Results not found for group ${data.groupId}`);
+    return;
+  }
+  if (data.results && Array.isArray(data.results)) {
+    for (const r of data.results) {
+      const existing = subAgentState.tasks.find((t: any) => t.taskId === r.taskId);
+      if (existing) {
+        (existing as any).result = r.result || r.error || null;
+        (existing as any).resultTruncated = r.resultTruncated || false;
+      }
+    }
+  }
+}
+
+function handleSubtaskQueueBlocked(data: any) {
+  if (data.queuedText) {
+    subAgentState.queuedText = data.queuedText;
+  }
+}
+
+function handleSubtaskStateSnapshot(data: any) {
+  if (data.conversationId !== currentConversation.value?.id) return;
+  subAgentState.active = data.active ?? false;
+  subAgentState.groupId = data.groupId ?? null;
+  subAgentState.tasks = data.tasks ?? [];
+  subAgentState.finalized = data.finalized ?? false;
+  subAgentState.queuedText = data.queuedText ?? null;
+
+  // Auto-fetch results if finalized group has results (reconnect/refresh flow)
+  if (data.finalized && data.hasResults && data.groupId) {
+    store.state.wsService.sendMessage({
+      type: 'subtask_get_results',
+      groupId: data.groupId,
+    });
+  }
+}
+
+function handleSubtaskQueueActionResult(data: any) {
+  if (data.conversationId !== currentConversation.value?.id) return;
+  if (data.status === 'ok') {
+    // Full reset — sub-agent lifecycle complete after queue action
+    resetSubAgentState();
+  } else {
+    // Show error via snackbar (use existing store.notify if available, else console)
+    console.warn(`[SubAgent] Queue ${data.action} failed: ${data.status} - ${data.message || ''}`);
+  }
+}
+
+function handleSendQueued() {
+  if (!currentConversation.value?.id) return;
+  store.state.wsService?.sendMessage({
+    type: 'subtask_release_queued',
+    conversationId: currentConversation.value.id,
+  } as any);
+}
+
+function handleEditQueued() {
+  if (!currentConversation.value?.id) return;
+  // Copy queued text to input field
+  if (subAgentState.queuedText) {
+    messageInput.value = subAgentState.queuedText;
+  }
+  // Discard from server (wait for ack to clear queuedText)
+  store.state.wsService?.sendMessage({
+    type: 'subtask_discard_queued',
+    conversationId: currentConversation.value.id,
+  } as any);
+}
+
+function handleDiscardQueued() {
+  if (!currentConversation.value?.id) return;
+  store.state.wsService?.sendMessage({
+    type: 'subtask_discard_queued',
+    conversationId: currentConversation.value.id,
+  } as any);
+}
+
+function resetSubAgentState() {
+  Object.assign(subAgentState, {
+    active: false,
+    groupId: null,
+    tasks: [],
+    finalized: false,
+    autoFinalized: false,
+    queuedText: null,
+  });
+}
+
+async function handleSummarizeResults() {
+  if (!store.state.wsService?.isConnected) return;
+  // Set the input text and trigger sendMessage (which reads from messageInput.value)
+  messageInput.value = 'Summarize subtask results.';
+  await sendMessage();
+  // sendMessage already calls resetSubAgentState when subAgentState.finalized is true
+}
+
 onBeforeUnmount(() => {
   if (typeof window !== 'undefined') {
     window.removeEventListener('resize', updateMobileState);
@@ -2748,6 +2949,14 @@ onBeforeUnmount(() => {
   // Unregister checkpoint broadcast listener
   if (store.state.wsService) {
     store.state.wsService.off('checkpoint_rolled_back', handleCheckpointBroadcast);
+    // Sub-agent WS listener cleanup
+    store.state.wsService.off('subtask_status_changed', handleSubtaskStatusChanged);
+    store.state.wsService.off('subtask_group_finalized', handleSubtaskGroupFinalized);
+    store.state.wsService.off('subtask_group_auto_finalized', handleSubtaskGroupFinalized);
+    store.state.wsService.off('subtask_queue_blocked', handleSubtaskQueueBlocked);
+    store.state.wsService.off('subtask_state_snapshot', handleSubtaskStateSnapshot);
+    store.state.wsService.off('subtask_queue_action_result', handleSubtaskQueueActionResult);
+    store.state.wsService.off('subtask_results_snapshot', handleSubtaskResultsSnapshot);
   }
 });
 
@@ -2796,6 +3005,9 @@ watch(() => getConversationIdFromRoute(), async (newId, oldId) => {
   pendingScopeElevates.value = [];
   mcplQueueState.value = { items: [], totalCount: 0, isPaused: false };
 
+  // Reset sub-agent state (prevents stale data flash from previous conversation)
+  resetSubAgentState();
+
   if (newId) {
     console.log(`[ConversationView:watch] Route changed to: ${newId}`);
     const loadStart = Date.now();
@@ -2829,8 +3041,13 @@ watch(() => getConversationIdFromRoute(), async (newId, oldId) => {
     // Join the room for multi-user support
     if (store.state.wsService) {
       store.state.wsService.joinRoom(newId as string);
+      // Request sub-agent state snapshot for this conversation
+      store.state.wsService.sendMessage({
+        type: 'subtask_get_state',
+        conversationId: newId as string,
+      } as any);
     }
-    
+
     // Ensure DOM is updated before scrolling
     await nextTick();
 
@@ -3088,7 +3305,12 @@ async function sendMessage() {
   // const content = messageInput.value.trim();
   const content = messageInput.value;
   if (!content || isStreaming.value) return;
-  
+
+  // Dismiss finalized sub-agent panel when user sends next message
+  if (subAgentState.finalized) {
+    resetSubAgentState();
+  }
+
   // Stop typing notification immediately when sending
   stopTypingNotification();
   

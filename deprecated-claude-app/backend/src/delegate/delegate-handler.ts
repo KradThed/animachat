@@ -126,6 +126,8 @@ interface PendingScopeChange {
   timestamp: number;
 }
 
+// Not persisted — server restart clears all pending requests.
+// Delegates expecting ack should implement retry logic.
 const pendingScopeChanges = new Map<string, PendingScopeChange>();
 
 /**
@@ -195,7 +197,8 @@ interface PendingScopeElevate {
   timeout: ReturnType<typeof setTimeout>;
 }
 
-/** Pending scope elevations keyed by dedupKey (delegateId::featureSet::label) */
+// Not persisted — server restart clears all pending requests.
+// Delegates expecting ack should implement retry logic.
 const pendingScopeElevations = new Map<string, PendingScopeElevate>();
 
 function makeScopeElevateDedupKey(delegateId: string, featureSet: string, label: string): string {
@@ -640,6 +643,13 @@ async function handleDelegateMessage(
 
     case 'mcpl/push_event': {
       const pushMsg = msg as any;
+      // Validate source serverId belongs to this delegate
+      if (!mcplSessionManager.validateServerOwnership(userId, delegateId, pushMsg.source)) {
+        sendMcplError(ws.mcplTransport || transport, 'invalid_server',
+          'Server not registered for this delegate',
+          { type, requestId: pushMsg.requestId });
+        return;
+      }
       mcplEventQueue.push({
         id: pushMsg.id,
         source: pushMsg.source,
@@ -657,6 +667,13 @@ async function handleDelegateMessage(
 
     case 'mcpl/inference_request': {
       const infMsg = msg as any;
+      // Validate serverId belongs to this delegate
+      if (!mcplSessionManager.validateServerOwnership(userId, delegateId, infMsg.serverId)) {
+        sendMcplError(ws.mcplTransport || transport, 'invalid_server',
+          'Server not registered for this delegate',
+          { type, requestId: infMsg.requestId });
+        return;
+      }
       mcplInferenceBroker.handleInferenceRequest({
         requestId: infMsg.requestId,
         serverId: infMsg.serverId,
@@ -747,10 +764,19 @@ async function handleDelegateMessage(
     }
 
     case 'mcpl/state_set': {
-      // Phase 7 Batch 2b: set conversation state (fire-and-forget)
+      // Phase 7 Batch 2b: set conversation state
       const stateMsg = msg as any;
       mcplStateManager.setUserId(stateMsg.conversationId, userId);
       mcplStateManager.setState(stateMsg.conversationId, stateMsg.state);
+      // Send ack (consistent with state_patch), conditional for backward compat
+      if (stateMsg.requestId) {
+        const setTransport = ws.mcplTransport || transport;
+        setTransport.send({
+          type: 'mcpl/state_set_result',
+          requestId: stateMsg.requestId,
+          success: true,
+        });
+      }
       break;
     }
 
@@ -1239,6 +1265,18 @@ function handleFeatureSetsChanged(
 
   // Update session featureSets
   mcplSessionManager.updateFeatureSets(ws.mcplSessionId, newFeatureSets);
+
+  // Broadcast tools_changed to user (added/removed servers)
+  const addedServerIds = [...newKeys].filter(k => !oldKeys.has(k));
+  if (addedServerIds.length > 0 || removedIds.length > 0) {
+    roomManager.broadcastToUser(userId, {
+      type: 'mcpl/tools_changed',
+      delegateId,
+      addedServerIds,
+      removedServerIds: removedIds,
+      timestamp: Date.now(),
+    });
+  }
 
   // Update hook manager registrations
   if (session.capabilities.includes('context_hooks')) {

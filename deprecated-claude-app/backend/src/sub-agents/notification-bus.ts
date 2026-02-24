@@ -49,13 +49,14 @@ export class NotificationBus extends EventEmitter {
 
   /**
    * Notify about a single task status change.
-   * Broadcasts to UI.
+   * Broadcasts to UI with instructionPreview for panel display.
    */
   notifyParent(
     conversationId: string,
     groupId: string,
     taskId: string,
     status: SubAgentState,
+    instructionPreview?: string,
   ): void {
     // 1. UI broadcast
     this.roomManager?.broadcastToRoom(conversationId, {
@@ -63,6 +64,7 @@ export class NotificationBus extends EventEmitter {
       groupId,
       taskId,
       status,
+      ...(instructionPreview ? { instructionPreview } : {}),
     });
 
     this.emit('taskStatusChanged', { conversationId, groupId, taskId, status });
@@ -72,10 +74,10 @@ export class NotificationBus extends EventEmitter {
    * Signal that a task group has been finalized and the parent is unfrozen.
    * Broadcasts to UI only — no auto-wake (MVP).
    */
-  unfreezeParent(conversationId: string, groupId: string): void {
-    // UI broadcast
+  unfreezeParent(conversationId: string, groupId: string, autoFinalized: boolean = false): void {
+    // UI broadcast — use distinct event type so frontend can show CTA for auto-finalized groups
     this.roomManager?.broadcastToRoom(conversationId, {
-      type: 'subtask_group_finalized',
+      type: autoFinalized ? 'subtask_group_auto_finalized' : 'subtask_group_finalized',
       groupId,
     });
 

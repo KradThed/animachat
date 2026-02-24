@@ -76,8 +76,8 @@ export class McplEventQueue {
   /** Seen idempotency keys with expiry timestamps */
   private seenKeys: Map<string, number> = new Map();
 
-  /** Rate limiting: timestamps of processed events in the current hour window */
-  private processedTimestamps: number[] = [];
+  /** Rate limiting: timestamps of processed events in the current hour window, per user */
+  private processedTimestamps: Map<string, number[]> = new Map();
 
   /** Whether a conversation is currently processing */
   private processing: Set<string> = new Set();
@@ -138,15 +138,17 @@ export class McplEventQueue {
       return entry;
     }
 
-    // 2. Check rate limit
-    this.pruneOldTimestamps();
-    if (this.processedTimestamps.length >= this.config.maxPushesPerHour) {
+    // 2. Check rate limit (per-user)
+    const userId = event.userId;
+    this.pruneOldTimestamps(userId);
+    const userTimestamps = this.processedTimestamps.get(userId) || [];
+    if (userTimestamps.length >= this.config.maxPushesPerHour) {
       const entry: McplQueueEntry = {
         ...event,
         idempotencyKey: effectiveKey,
         status: 'rate_limited',
       };
-      console.warn(`[McplEventQueue] Rate limited: ${event.source}/${event.eventType} (${this.processedTimestamps.length}/${this.config.maxPushesPerHour} per hour)`);
+      console.warn(`[McplEventQueue] Rate limited: ${event.source}/${event.eventType} (${userTimestamps.length}/${this.config.maxPushesPerHour} per hour for user ${userId})`);
       if (this.db) {
         this.db.appendMcplConversationEvent(event.conversationId, 'push_event_rate_limited', {
           id: entry.id, source: entry.source, eventType: entry.eventType, status: entry.status,
@@ -257,11 +259,10 @@ export class McplEventQueue {
     for (const queue of this.queues.values()) {
       totalQueued += queue.filter(e => e.status === 'queued').length;
     }
-    this.pruneOldTimestamps();
     return {
       totalQueued,
       pausedConversations: this.paused.size,
-      processedThisHour: this.processedTimestamps.length,
+      processedThisHour: [...this.processedTimestamps.values()].reduce((sum, ts) => sum + ts.length, 0),
       maxPerHour: this.config.maxPushesPerHour,
       seenKeys: this.seenKeys.size,
     };
@@ -300,7 +301,9 @@ export class McplEventQueue {
     try {
       await this.executeEvent(entry);
       entry.status = 'completed';
-      this.processedTimestamps.push(Date.now());
+      const userTs = this.processedTimestamps.get(entry.userId) || [];
+      userTs.push(Date.now());
+      this.processedTimestamps.set(entry.userId, userTs);
       console.log(`[McplEventQueue] Completed: ${entry.source}/${entry.eventType} (${entry.id})`);
     } catch (err) {
       entry.status = 'failed';
@@ -390,11 +393,19 @@ export class McplEventQueue {
   // --------------------------------------------------------------------------
 
   /**
-   * Remove timestamps older than 1 hour.
+   * Remove timestamps older than 1 hour for a specific user.
    */
-  private pruneOldTimestamps(): void {
+  private pruneOldTimestamps(userId: string): void {
     const oneHourAgo = Date.now() - 60 * 60 * 1000;
-    this.processedTimestamps = this.processedTimestamps.filter(t => t > oneHourAgo);
+    const timestamps = this.processedTimestamps.get(userId);
+    if (timestamps) {
+      const pruned = timestamps.filter(t => t > oneHourAgo);
+      if (pruned.length > 0) {
+        this.processedTimestamps.set(userId, pruned);
+      } else {
+        this.processedTimestamps.delete(userId);
+      }
+    }
   }
 
   // --------------------------------------------------------------------------

@@ -29,6 +29,8 @@ import { LLMClientAdapter } from './llm-client-adapter.js';
 import { SubAgentContextBuilder } from './context-builder.js';
 import { InferenceRunner } from './inference-runner.js';
 import type { NotificationBus } from './notification-bus.js';
+import type { ResourceCoordinator } from '../services/resource-coordinator.js';
+import type { McplHookManager } from '../services/mcpl-hook-manager.js';
 import {
   LEASE_MS,
   FINALIZE_GRACE_MS,
@@ -45,6 +47,7 @@ import type {
   SpawnSubtaskParams,
   SpawnSubtasksParams,
   QueuedUserMessage,
+  SubAgentStateSnapshot,
 } from './types.js';
 
 // =============================================================================
@@ -52,6 +55,7 @@ import type {
 // =============================================================================
 
 interface FinalizeResultCacheEntry {
+  conversationId: string;
   results: SubAgentResult[];
   expiresAt: number;
 }
@@ -80,8 +84,13 @@ export class SubAgentManager {
   private finalizeResultCache: Map<string, FinalizeResultCacheEntry> = new Map();
   private cacheCleanupTimer: NodeJS.Timeout | null = null;
 
-  // Round 5: Queued user messages (depth=1 per conversation, in-memory)
+  // Queued user messages (depth=1 per user per conversation, in-memory)
+  // Key: `${conversationId}:${userId}` — per-user queue prevents privacy leaks in shared conversations
   private queuedMessages: Map<string, QueuedUserMessage> = new Map();
+
+  // Global concurrency cap across all groups
+  private globalRunning = 0;
+  private readonly MAX_GLOBAL_CONCURRENT = 10;
 
   constructor(
     private llmClient: LLMClientAdapter,
@@ -89,6 +98,8 @@ export class SubAgentManager {
     private branchStore: BranchEventStore,
     private notificationBus: NotificationBus,
     private db: Database,
+    private resourceCoordinator?: ResourceCoordinator,
+    private hookManager?: McplHookManager,
   ) {
     // Prune expired cache entries every 60 seconds
     this.cacheCleanupTimer = setInterval(() => this.pruneExpiredCache(), 60_000);
@@ -164,9 +175,28 @@ export class SubAgentManager {
       }, userId);
     }
 
-    // C4: forkPoint = messages.length (snapshot saved in task)
+    // C4: forkPoint = snapshot of how many messages to include from parent.
+    // Also save forkBranchId — the activeBranchId of the last INCLUDED message,
+    // so context-builder can walk the correct branch path.
     const messages = await this.db.getConversationMessages(conversationId, userId);
-    const forkPoint = messages.length;
+    let forkPoint = messages.length;
+    const last = messages[messages.length - 1];
+    const lastBranch = last?.branches.find(b => b.id === last.activeBranchId);
+
+    // If last turn = assistant (we're inside the tool-loop), the in-progress message
+    // has tool_use blocks without matching tool_result — API rejects this.
+    // Sub-agent needs context BEFORE the in-progress assistant message.
+    if (lastBranch?.role === 'assistant') forkPoint = Math.max(0, forkPoint - 1);
+
+    // forkBranchId: branch of last INCLUDED message (safe for forkPoint=0).
+    // Validate activeBranchId actually exists in branches (corrupted state protection).
+    let forkBranchId: string | null = null;
+    if (forkPoint > 0) {
+      const m = messages[forkPoint - 1];
+      const active = m?.activeBranchId ?? null;
+      const exists = active && m?.branches?.some(b => b.id === active);
+      forkBranchId = exists ? active : (m?.branches?.[0]?.id ?? null);
+    }
 
     // Create task
     const taskId = uuidv4();
@@ -178,6 +208,7 @@ export class SubAgentManager {
       instruction,
       state: 'QUEUED',
       forkPoint,
+      forkBranchId,
       result: null,
       error: null,
       metrics: { iterations: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0, durationMs: 0 },
@@ -195,6 +226,7 @@ export class SubAgentManager {
       userId,
       instruction,
       forkPoint,
+      forkBranchId,
       timestamp: Date.now(),
     }, userId);
 
@@ -206,22 +238,122 @@ export class SubAgentManager {
 
   /**
    * Spawn multiple sub-agent tasks as a batch.
+   *
+   * Critical ordering:
+   *   1. Validate input (before creating any state)
+   *   2. Compute forkPoint ONCE
+   *   3. Create group + ALL tasks in-memory (NO awaits between)
+   *   4. Persist events (can await here — all tasks already in group.tasks Map)
+   *   5. Start tasks (maybeStartTasks)
+   *
+   * This prevents the race where task 1 errors → auto-finalize → task 2 "group not found".
    */
   async spawnSubtasks(params: SpawnSubtasksParams): Promise<SubAgentTask[]> {
-    const groupId = uuidv4();
-    const tasks: SubAgentTask[] = [];
+    const {
+      conversationId,
+      userId,
+      maxConcurrent = 3,
+      leaseMs = LEASE_MS,
+    } = params;
 
+    // Step 1: Input validation BEFORE creating any state
+    if (!params.instructions?.length) {
+      throw new Error('instructions must be a non-empty array');
+    }
+    for (const inst of params.instructions) {
+      if (typeof inst !== 'string' || inst.trim() === '') {
+        throw new Error('each instruction must be a non-empty string');
+      }
+    }
+
+    // Step 2: Compute forkPoint ONCE (same logic as spawnSubtask)
+    const messages = await this.db.getConversationMessages(conversationId, userId);
+    let forkPoint = messages.length;
+    const last = messages[messages.length - 1];
+    const lastBranch = last?.branches.find(b => b.id === last.activeBranchId);
+    if (lastBranch?.role === 'assistant') forkPoint = Math.max(0, forkPoint - 1);
+
+    let forkBranchId: string | null = null;
+    if (forkPoint > 0) {
+      const m = messages[forkPoint - 1];
+      const active = m?.activeBranchId ?? null;
+      const exists = active && m?.branches?.some(b => b.id === active);
+      forkBranchId = exists ? active : (m?.branches?.[0]?.id ?? null);
+    }
+
+    // Step 3: Create group + ALL tasks in-memory — NO awaits between task creation
+    const groupId = uuidv4();
+    const group: TaskGroup = {
+      groupId,
+      conversationId,
+      userId,
+      tasks: new Map(),
+      config: { maxConcurrent, leaseMs },
+      createdAt: Date.now(),
+      finalizedAt: null,
+    };
+
+    const tasks: SubAgentTask[] = [];
     for (const instruction of params.instructions) {
-      const task = await this.spawnSubtask({
-        conversationId: params.conversationId,
-        userId: params.userId,
-        instruction,
+      const taskId = uuidv4();
+      const task: SubAgentTask = {
+        taskId,
         groupId,
-        maxConcurrent: params.maxConcurrent,
-        leaseMs: params.leaseMs,
-      });
+        conversationId,
+        userId,
+        instruction,
+        state: 'QUEUED',
+        forkPoint,
+        forkBranchId,
+        result: null,
+        error: null,
+        metrics: { iterations: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0, durationMs: 0 },
+        createdAt: Date.now(),
+        completedAt: null,
+      };
+      group.tasks.set(taskId, task);
       tasks.push(task);
     }
+
+    // Add group to memory AFTER all tasks are in the Map
+    this.groups.set(groupId, group);
+
+    // Step 4: Persist events (can await — all tasks already in group.tasks)
+    try {
+      await this.db.appendSubAgentEvent(conversationId, 'subtask_group_created', {
+        groupId,
+        conversationId,
+        userId,
+        config: group.config,
+        timestamp: Date.now(),
+      }, userId);
+
+      for (const task of tasks) {
+        await this.db.appendSubAgentEvent(conversationId, 'subtask_spawned', {
+          groupId,
+          taskId: task.taskId,
+          conversationId,
+          userId,
+          instruction: task.instruction,
+          forkPoint,
+          forkBranchId,
+          timestamp: Date.now(),
+        }, userId);
+      }
+    } catch (err) {
+      // Clean ALL state for this group — prevent zombie group in memory
+      this.groups.delete(groupId);
+      this.finalizingGroups.delete(groupId);
+      for (const task of tasks) {
+        this.startingTasks.delete(task.taskId);
+        const timer = this.leaseTimers.get(task.taskId);
+        if (timer) { clearTimeout(timer); this.leaseTimers.delete(task.taskId); }
+      }
+      throw new Error(`Failed to persist sub-agent group: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Step 5: Start tasks
+    this.maybeStartTasks(group);
 
     return tasks;
   }
@@ -234,7 +366,7 @@ export class SubAgentManager {
    * Poll task group status (non-blocking).
    * Falls back to finalizeResultCache if group has been deleted.
    */
-  pollSubtasks(groupId: string): { tasks: SubAgentResult[]; allTerminal: boolean } {
+  pollSubtasks(groupId: string, conversationId?: string): { tasks: SubAgentResult[]; allTerminal: boolean } {
     const group = this.groups.get(groupId);
     if (!group) {
       // C3: Check cache for recently finalized groups
@@ -243,6 +375,11 @@ export class SubAgentManager {
         return { tasks: cached.results, allTerminal: true };
       }
       return { tasks: [], allTerminal: true };
+    }
+
+    // BUG 11: Ownership validation
+    if (conversationId && group.conversationId !== conversationId) {
+      throw new Error('Group does not belong to this conversation');
     }
 
     const tasks: SubAgentResult[] = [];
@@ -270,7 +407,7 @@ export class SubAgentManager {
    * Get results for a task group (only returns results for completed tasks).
    * Falls back to finalizeResultCache if group has been deleted.
    */
-  getSubtaskResults(groupId: string): { results: SubAgentResult[] } {
+  getSubtaskResults(groupId: string, conversationId?: string): { results: SubAgentResult[] } {
     const group = this.groups.get(groupId);
     if (!group) {
       // C3: Check cache for recently finalized groups
@@ -279,6 +416,11 @@ export class SubAgentManager {
         return { results: cached.results };
       }
       return { results: [] };
+    }
+
+    // BUG 11: Ownership validation
+    if (conversationId && group.conversationId !== conversationId) {
+      throw new Error('Group does not belong to this conversation');
     }
 
     const results: SubAgentResult[] = [];
@@ -298,6 +440,42 @@ export class SubAgentManager {
     return { results };
   }
 
+  /**
+   * Like getSubtaskResults but also returns conversationId for access control
+   * and a `found` flag to distinguish "group exists but empty results" from "group not found".
+   */
+  getSubtaskResultsWithMeta(groupId: string): {
+    found: boolean;
+    results: SubAgentResult[];
+    conversationId: string | null;
+  } {
+    const group = this.groups.get(groupId);
+    if (group) {
+      const results: SubAgentResult[] = [];
+      for (const task of group.tasks.values()) {
+        if (TERMINAL_STATUSES.includes(task.state)) {
+          results.push({
+            taskId: task.taskId,
+            instruction: task.instruction,
+            state: task.state,
+            result: task.result,
+            error: task.error,
+            metrics: task.metrics,
+          });
+        }
+      }
+      return { found: true, results, conversationId: group.conversationId };
+    }
+
+    // Check cache for recently finalized groups
+    const cached = this.finalizeResultCache.get(groupId);
+    if (cached && cached.expiresAt > Date.now()) {
+      return { found: true, results: cached.results, conversationId: cached.conversationId };
+    }
+
+    return { found: false, results: [], conversationId: null };
+  }
+
   // --------------------------------------------------------------------------
   // Cancel & Finalize
   // --------------------------------------------------------------------------
@@ -305,9 +483,14 @@ export class SubAgentManager {
   /**
    * Cancel all running tasks in a group.
    */
-  async cancelSubtasks(groupId: string): Promise<void> {
+  async cancelSubtasks(groupId: string, conversationId?: string): Promise<void> {
     const group = this.groups.get(groupId);
     if (!group) return;
+
+    // BUG 11: Ownership validation
+    if (conversationId && group.conversationId !== conversationId) {
+      throw new Error('Group does not belong to this conversation');
+    }
 
     for (const task of group.tasks.values()) {
       if (!TERMINAL_STATUSES.includes(task.state)) {
@@ -322,7 +505,7 @@ export class SubAgentManager {
    * C3: Returns {status:'already_finalized'} if group was already finalized (e.g. by auto-finalize).
    * C5: Uses try/finally to guarantee group is always cleaned up.
    */
-  async finalizeTaskGroup(groupId: string): Promise<FinalizeResult> {
+  async finalizeTaskGroup(groupId: string, autoFinalized: boolean = false, conversationId?: string): Promise<FinalizeResult> {
     // C3: Already finalized — return cached results
     const cached = this.finalizeResultCache.get(groupId);
     if (cached && cached.expiresAt > Date.now()) {
@@ -352,6 +535,11 @@ export class SubAgentManager {
         results: [],
         queuedUserTurn: null,
       };
+    }
+
+    // SA-3: Ownership validation (matches pollSubtasks/cancelSubtasks pattern)
+    if (conversationId && group.conversationId !== conversationId) {
+      throw new Error('Group does not belong to this conversation');
     }
 
     // C2: Mark as finalizing to block new spawns
@@ -412,20 +600,21 @@ export class SubAgentManager {
 
       // C3: Cache results before deleting group
       this.finalizeResultCache.set(groupId, {
+        conversationId: group.conversationId,
         results,
         expiresAt: Date.now() + FINALIZE_CACHE_TTL_MS,
       });
 
       // Notify bus
-      this.notificationBus.unfreezeParent(group.conversationId, groupId);
+      this.notificationBus.unfreezeParent(group.conversationId, groupId, autoFinalized);
 
+      // Check if the group owner has a queued message
+      const ownerQueued = this.getQueuedMessage(group.conversationId, group.userId);
       return {
         status: 'ok',
         groupId,
         results,
-        queuedUserTurn: this.queuedMessages.has(group.conversationId)
-          ? this.queuedMessages.get(group.conversationId)!.text
-          : null,
+        queuedUserTurn: ownerQueued?.text ?? null,
       };
     } finally {
       // C5: Always clean up — prevents stuck groups on throw
@@ -457,32 +646,32 @@ export class SubAgentManager {
 
   /**
    * Queue a user message while the parent conversation is frozen.
-   * Depth=1: only one queued message per conversation.
+   * Depth=1 per user per conversation — each user gets their own queue slot.
    */
   queueUserMessage(msg: QueuedUserMessage): void {
-    if (this.queuedMessages.has(msg.conversationId)) {
-      throw new Error(
-        `A message is already queued for conversation ${msg.conversationId}. ` +
-        'Only one message can be queued while sub-agents are active.',
-      );
+    const key = `${msg.conversationId}:${msg.userId}`;
+    if (this.queuedMessages.has(key)) {
+      // Idempotent: already queued for this user — caller should resend subtask_queue_blocked
+      return;
     }
-    this.queuedMessages.set(msg.conversationId, msg);
+    this.queuedMessages.set(key, msg);
   }
 
   /**
-   * Get the queued user message for a conversation (if any).
+   * Get the queued user message for a specific user in a conversation (if any).
    */
-  getQueuedMessage(conversationId: string): QueuedUserMessage | null {
-    return this.queuedMessages.get(conversationId) ?? null;
+  getQueuedMessage(conversationId: string, userId: string): QueuedUserMessage | null {
+    return this.queuedMessages.get(`${conversationId}:${userId}`) ?? null;
   }
 
   /**
    * Release (send) the queued user message after finalize.
    */
-  releaseQueuedMessage(conversationId: string): QueuedUserMessage | null {
-    const msg = this.queuedMessages.get(conversationId);
+  releaseQueuedMessage(conversationId: string, userId: string): QueuedUserMessage | null {
+    const key = `${conversationId}:${userId}`;
+    const msg = this.queuedMessages.get(key);
     if (msg) {
-      this.queuedMessages.delete(conversationId);
+      this.queuedMessages.delete(key);
     }
     return msg ?? null;
   }
@@ -490,8 +679,77 @@ export class SubAgentManager {
   /**
    * Cancel (discard) the queued user message.
    */
-  cancelQueuedMessage(conversationId: string): void {
-    this.queuedMessages.delete(conversationId);
+  cancelQueuedMessage(conversationId: string, userId: string): void {
+    this.queuedMessages.delete(`${conversationId}:${userId}`);
+  }
+
+  // --------------------------------------------------------------------------
+  // State Snapshot (for UI panel)
+  // --------------------------------------------------------------------------
+
+  /**
+   * Get current sub-agent state for a conversation + user.
+   * Used by subtask_get_state WS handler to hydrate SubAgentPanel on page refresh.
+   *
+   * Checks:
+   *   1. Active in-memory group (live sub-agents)
+   *   2. FinalizeResultCache (post-finalize, group already deleted)
+   *   3. Returns empty state if no sub-agent activity
+   */
+  getStateSnapshot(conversationId: string, userId: string): SubAgentStateSnapshot {
+    // 1. Check active group
+    const group = this.findGroupForConversation(conversationId);
+    if (group) {
+      const tasks = [...group.tasks.values()].map(t => ({
+        taskId: t.taskId,
+        instructionPreview: truncateInstruction(t.instruction),
+        status: t.state,
+      }));
+      const queuedMsg = this.getQueuedMessage(conversationId, userId);
+      return {
+        active: group.finalizedAt === null,
+        groupId: group.groupId,
+        tasks,
+        finalized: group.finalizedAt !== null,
+        hasResults: group.finalizedAt !== null,
+        queuedText: queuedMsg?.text ?? null,
+      };
+    }
+
+    // 2. Check finalizeResultCache (post-finalize refresh)
+    for (const [groupId, entry] of this.finalizeResultCache) {
+      if (entry.conversationId === conversationId && entry.expiresAt > Date.now()) {
+        const tasks = entry.results.map(r => ({
+          taskId: r.taskId,
+          instructionPreview: truncateInstruction(r.instruction),
+          status: r.state,
+        }));
+        const queuedMsg = this.getQueuedMessage(conversationId, userId);
+        return {
+          active: false,
+          groupId,
+          tasks,
+          finalized: true,
+          hasResults: true,
+          queuedText: queuedMsg?.text ?? null,
+        };
+      }
+    }
+
+    // 3. No sub-agent activity
+    return { active: false, groupId: null, tasks: [], finalized: false, hasResults: false, queuedText: null };
+  }
+
+  /**
+   * Find the active (non-finalized) group for a conversation.
+   */
+  private findGroupForConversation(conversationId: string): TaskGroup | null {
+    for (const group of this.groups.values()) {
+      if (group.conversationId === conversationId) {
+        return group;
+      }
+    }
+    return null;
   }
 
   // --------------------------------------------------------------------------
@@ -519,18 +777,79 @@ export class SubAgentManager {
         }
 
         if (!found) {
-          // Orphaned task — we can't know the original group, just log it
-          console.warn(`[SubAgentManager] Orphaned branch file found: ${taskId}`);
+          // SA-4: Delete orphaned branch file (task is no longer tracked in any group)
+          console.warn(`[SubAgentManager] Deleting orphaned branch file: ${taskId}`);
+          try {
+            await this.branchStore.deleteTask(taskId);
+          } catch (err) {
+            console.error(`[SubAgentManager] Failed to delete orphaned branch ${taskId}:`, err);
+          }
           recovered++;
         }
       }
 
       if (recovered > 0) {
-        console.log(`[SubAgentManager] Found ${recovered} orphaned branch files (not re-launched)`);
+        console.log(`[SubAgentManager] Cleaned up ${recovered} orphaned branch files`);
       }
     } catch (error) {
       console.warn('[SubAgentManager] Failed to scan for orphaned tasks:', error);
     }
+  }
+
+  /**
+   * BUG 1: Recover stale groups after restart.
+   * After replay, groups with non-terminal tasks are stuck forever.
+   * Transition them to ERROR (with lifecycle events) then finalize.
+   */
+  /**
+   * Recover stale groups globally (called at startup for any pre-loaded groups).
+   */
+  async recoverStaleGroups(): Promise<void> {
+    for (const [groupId, group] of this.groups) {
+      await this.recoverStaleGroup(groupId, group);
+    }
+  }
+
+  /**
+   * Recover stale groups for a specific conversation (called after loadConversation replay).
+   * Groups with non-terminal tasks are marked ERROR and auto-finalized.
+   */
+  async recoverStaleGroupsForConversation(conversationId: string): Promise<void> {
+    for (const [groupId, group] of this.groups) {
+      if (group.conversationId !== conversationId) continue;
+      await this.recoverStaleGroup(groupId, group);
+    }
+  }
+
+  private async recoverStaleGroup(groupId: string, group: TaskGroup): Promise<void> {
+    if (group.finalizedAt !== null) return;
+    const nonTerminal = [...group.tasks.values()].filter(
+      t => !TERMINAL_STATUSES.includes(t.state),
+    );
+    if (nonTerminal.length === 0) return;
+
+    console.log(`[Recovery] Group ${groupId}: ${nonTerminal.length} non-terminal tasks, marking ERROR`);
+
+    for (const task of nonTerminal) {
+      this.transitionTask(task, 'ERROR');
+      task.error = 'Interrupted by server restart';
+      task.completedAt = Date.now();
+      // Persist lifecycle event (transitionTask only changes state in memory)
+      await this.db.appendSubAgentEvent(task.conversationId, 'subtask_error', {
+        groupId: task.groupId,
+        taskId: task.taskId,
+        conversationId: task.conversationId,
+        error: task.error,
+        timestamp: Date.now(),
+      }, task.userId).catch(err =>
+        console.error(`[Recovery] Failed to log subtask_error: ${err.message}`)
+      );
+    }
+
+    // finalizeTaskGroup sees all tasks terminal → skips cancel → writes group_finalized event
+    this.finalizeTaskGroup(groupId, true).catch(err =>
+      console.error(`[Recovery] Failed to finalize stale group ${groupId}:`, err)
+    );
   }
 
   /**
@@ -556,10 +875,13 @@ export class SubAgentManager {
    */
   replayQueuedUserTurn(event: Event): void {
     const data = event.data;
-    this.queuedMessages.set(data._conversationId, {
+    const conversationId = data.conversationId;
+    const userId = data.userId;
+    const key = `${conversationId}:${userId}`;
+    this.queuedMessages.set(key, {
       messageId: data.messageId,
-      conversationId: data._conversationId,
-      userId: data.userId,
+      conversationId,
+      userId,
       text: data.text,
       createdAt: data.createdAt,
       groupId: data.groupId,
@@ -580,6 +902,7 @@ export class SubAgentManager {
       case 'subtask_completed':
       case 'subtask_cancelled':
       case 'subtask_failed':
+      case 'subtask_error':
         this.replayTaskTerminal(event.data, event.type);
         break;
       case 'subtask_group_finalized':
@@ -587,9 +910,14 @@ export class SubAgentManager {
         this.replayGroupFinalized(event.data);
         break;
       case 'queued_user_turn_released':
-      case 'queued_user_turn_cancelled':
-        this.queuedMessages.delete(event.data._conversationId ?? event.data.conversationId);
+      case 'queued_user_turn_cancelled': {
+        const convId = event.data._conversationId ?? event.data.conversationId;
+        const uid = event.data.userId;
+        if (convId && uid) {
+          this.queuedMessages.delete(`${convId}:${uid}`);
+        }
         break;
+      }
       default:
         // Ignore unknown subtask_ event types
         break;
@@ -622,6 +950,7 @@ export class SubAgentManager {
       instruction: data.instruction,
       state: 'QUEUED', // will be updated by terminal events
       forkPoint: data.forkPoint ?? 0,
+      forkBranchId: data.forkBranchId ?? null,
       result: null,
       error: null,
       metrics: { iterations: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0, durationMs: 0 },
@@ -645,6 +974,7 @@ export class SubAgentManager {
         task.state = 'CANCELLED';
         break;
       case 'subtask_failed':
+      case 'subtask_error':
         task.state = 'ERROR';
         task.error = data.error ?? null;
         break;
@@ -688,11 +1018,17 @@ export class SubAgentManager {
    * M1: No OPEN state in running count.
    */
   private maybeStartTasks(group: TaskGroup): void {
+    // BUG 3: Global concurrency cap
+    if (this.globalRunning >= this.MAX_GLOBAL_CONCURRENT) return;
+
     const runningCount = [...group.tasks.values()].filter(
       t => t.state === 'RUNNING',
     ).length;
 
-    const available = group.config.maxConcurrent - runningCount;
+    const available = Math.min(
+      group.config.maxConcurrent - runningCount,
+      this.MAX_GLOBAL_CONCURRENT - this.globalRunning,
+    );
     if (available <= 0) return;
 
     const queued = [...group.tasks.values()].filter(t => t.state === 'QUEUED');
@@ -747,6 +1083,8 @@ export class SubAgentManager {
       this.contextBuilder,
       this.branchStore,
       this.db,
+      this.resourceCoordinator,
+      this.hookManager,
     );
     this.runners.set(task.taskId, runner);
 
@@ -760,6 +1098,9 @@ export class SubAgentManager {
       }
     }, group.config.leaseMs);
     this.leaseTimers.set(task.taskId, leaseTimer);
+
+    // BUG 3: Track global concurrency
+    this.globalRunning++;
 
     // Run asynchronously
     runner.run()
@@ -792,10 +1133,8 @@ export class SubAgentManager {
           task.groupId,
           task.taskId,
           'FINALIZED',
+          truncateInstruction(task.instruction),
         );
-
-        // Start next queued task
-        this.maybeStartTasks(group);
 
         // C6: Auto-finalize safety net — check if ALL tasks in group are terminal
         this.maybeAutoFinalize(group);
@@ -829,13 +1168,21 @@ export class SubAgentManager {
           task.groupId,
           task.taskId,
           'ERROR',
+          truncateInstruction(task.instruction),
         );
-
-        // Start next queued task
-        this.maybeStartTasks(group);
 
         // C6: Auto-finalize safety net — check if ALL tasks in group are terminal
         this.maybeAutoFinalize(group);
+      })
+      .finally(() => {
+        // BUG 3: Guaranteed decrement + unblock tasks from ALL groups waiting for global slot
+        this.globalRunning--;
+        this.maybeStartTasks(group);
+        for (const g of this.groups.values()) {
+          if (g.groupId !== group.groupId && g.finalizedAt === null) {
+            this.maybeStartTasks(g);
+          }
+        }
       });
   }
 
@@ -852,8 +1199,11 @@ export class SubAgentManager {
     const allTerminal = [...group.tasks.values()].every(
       t => TERMINAL_STATUSES.includes(t.state),
     );
+    const hasQueued = [...group.tasks.values()].some(
+      t => t.state === 'QUEUED',
+    );
 
-    if (allTerminal) {
+    if (allTerminal && !hasQueued) {
       console.log(`[SubAgentManager] All tasks terminal in group ${group.groupId}, auto-finalizing`);
 
       // Broadcast auto-finalize notification to UI
@@ -864,7 +1214,7 @@ export class SubAgentManager {
         'FINALIZED',
       );
 
-      this.finalizeTaskGroup(group.groupId).catch(err =>
+      this.finalizeTaskGroup(group.groupId, true).catch(err =>
         console.error(`[SubAgentManager] Auto-finalize failed for group ${group.groupId}: ${err.message}`)
       );
     }
@@ -946,4 +1296,19 @@ export class SubAgentManager {
       }
     }
   }
+}
+
+// =============================================================================
+// Module-level Helpers
+// =============================================================================
+
+/** Max chars for instructionPreview in WS broadcasts (reduces traffic). */
+const INSTRUCTION_PREVIEW_MAX = 80;
+
+/**
+ * Truncate instruction for WS broadcasts. Full text stays in task memory/branch log.
+ */
+function truncateInstruction(instruction: string): string {
+  if (instruction.length <= INSTRUCTION_PREVIEW_MAX) return instruction;
+  return instruction.slice(0, INSTRUCTION_PREVIEW_MAX) + '...';
 }

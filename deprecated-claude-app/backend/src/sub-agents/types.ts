@@ -48,6 +48,7 @@ export interface SubAgentTask {
   instruction: string;
   state: SubAgentState;
   forkPoint: number;           // messages.length in parent conversation at fork time
+  forkBranchId: string | null; // activeBranchId of the last message at fork time (for branch-aware history)
   result: string | null;       // Final summary from sub-agent
   error: string | null;        // Error message if state === 'ERROR'
   metrics: TaskMetrics;
@@ -123,6 +124,7 @@ export interface SubAgentLifecycleEvent {
   userId: string;
   instruction?: string;
   forkPoint?: number;
+  forkBranchId?: string | null;
   state?: SubAgentState;
   result?: string;
   error?: string;
@@ -151,6 +153,19 @@ export interface SpawnSubtasksParams {
   instructions: string[];
   maxConcurrent?: number;
   leaseMs?: number;
+}
+
+// =============================================================================
+// State Snapshot (for UI panel)
+// =============================================================================
+
+export interface SubAgentStateSnapshot {
+  active: boolean;
+  groupId: string | null;
+  tasks: Array<{ taskId: string; instructionPreview: string; status: string }>;
+  finalized: boolean;
+  hasResults?: boolean;
+  queuedText: string | null;
 }
 
 // =============================================================================

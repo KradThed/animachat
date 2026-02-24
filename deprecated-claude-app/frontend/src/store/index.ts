@@ -1434,17 +1434,35 @@ export function createStore(): {
       });
 
       state.wsService.on('stream', (data: any) => {
-        // console.log('Store handling stream:', data);
         const message = state.allMessages.find(m => m.id === data.messageId);
+        if (!message) {
+          if (data.isComplete) console.warn(`[Store:stream] Message NOT FOUND: ${data.messageId}, isComplete=${data.isComplete}`);
+          return;
+        }
         if (message) {
           const branch = message.branches.find(b => b.id === data.branchId);
+          if (!branch) {
+            if (data.isComplete) console.warn(`[Store:stream] Branch NOT FOUND: ${data.branchId} in message ${data.messageId}`);
+            return;
+          }
           if (branch) {
-            branch.content += data.content;
+            // On isComplete, if server provides fullContent (recovered from contentBlocks
+            // when onChunk didn't stream text during tool loops, or content was filtered),
+            // use it as the authoritative final content instead of appending the empty chunk.
+            if (data.isComplete && data.fullContent != null) {
+              branch.content = data.fullContent;
+            } else {
+              branch.content += data.content;
+            }
+            if (data.isComplete) {
+              console.log(`[Store:stream] isComplete: fullContent=${data.fullContent?.length ?? 'null'}, branch.content=${branch.content.length}`);
+            }
             // Update content blocks if provided
             if (data.contentBlocks) {
               branch.contentBlocks = data.contentBlocks;
-              // Force Vue reactivity for contentBlocks updates (especially during thinking)
-              // Without this, empty content chunks with only contentBlocks won't trigger re-renders
+            }
+            // Force Vue reactivity on every isComplete or contentBlocks update
+            if (data.isComplete || data.contentBlocks) {
               state.messagesVersion++;
             }
 
@@ -1470,6 +1488,8 @@ export function createStore(): {
         // The server handles preserveActiveBranch logic for parallel generation
         const index = state.allMessages.findIndex(m => m.id === data.message.id);
         if (index !== -1) {
+          const firstBranch = data.message.branches?.[0];
+          console.log(`[Store:message_edited] id=${data.message.id.slice(0,8)} branch.content=${firstBranch?.content?.length ?? 'none'}`);
           // Check for new branches before updating (for notifications)
           const oldMessage = state.allMessages[index];
           const oldBranchIds = new Set(oldMessage.branches.map(b => b.id));

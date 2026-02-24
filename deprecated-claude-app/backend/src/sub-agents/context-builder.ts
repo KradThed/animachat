@@ -4,12 +4,11 @@
  * Builds the message array for sub-agent inference calls.
  *
  * Strategy:
- *   1. Load parent conversation messages (hydrated Message[])
- *   2. Slice to forkPoint (first N messages = parent context preamble)
- *   3. Load branch events from BranchEventStore
+ *   1. NO parent conversation history — sub-agent is a clean worker
+ *   2. Synthetic user message as "task anchor" (models follow user turns better)
+ *   3. Load branch events from BranchEventStore (sub-agent's own tool-loop history)
  *   4. Hydrate branch events into Message[] format
- *   5. Concatenate preamble + branch messages
- *   6. Prepend task instruction as a system-level directive
+ *   5. System prompt with task instruction + rules
  */
 
 import { v4 as uuidv4 } from 'uuid';
@@ -27,7 +26,7 @@ export interface ContextBuildParams {
   userId: string;
   taskId: string;
   taskInstruction: string;
-  forkPoint: number;
+  // forkPoint/forkBranchId: stored in SubAgentTask for potential future use, not used in MVP context builder
 }
 
 export interface BuiltContext {
@@ -51,7 +50,7 @@ export class SubAgentContextBuilder {
    * Build full context for a sub-agent inference call.
    */
   async buildContext(params: ContextBuildParams): Promise<BuiltContext> {
-    const { conversationId, userId, taskId, taskInstruction, forkPoint } = params;
+    const { conversationId, userId, taskId, taskInstruction } = params;
 
     // 1. Get conversation metadata
     const conversation = await this.db.getConversation(conversationId, userId);
@@ -62,27 +61,32 @@ export class SubAgentContextBuilder {
     // 2. Get participants
     const participants = await this.db.getConversationParticipants(conversationId, userId);
 
-    // 3. Load parent conversation messages and slice to forkPoint
-    const allMessages = await this.db.getConversationMessages(conversationId, userId);
-
-    // C4: Belt+suspenders assert — forkPoint was snapshotted as messages.length at spawn time.
-    // Messages cannot shrink during group lifetime because parent is frozen.
-    if (allMessages.length < forkPoint) {
-      console.error(
-        `[ContextBuilder] Messages shrank: expected >=${forkPoint}, got ${allMessages.length}. ` +
-        `Using all available messages as fallback.`,
-      );
-    }
-    const preamble = forkPoint > 0 ? allMessages.slice(0, forkPoint) : allMessages;
-
-    // 4. Load branch events and hydrate into messages
+    // 3. Sub-agent starts with NO parent history — all context in instruction.
+    //    Branch events from previous tool-loop iterations are loaded (sub-agent's own history).
     const branchEvents = await this.branchStore.loadEvents(taskId);
     const branchMessages = hydrateBranchEvents(branchEvents);
 
-    // 5. Concatenate preamble + branch messages
-    const messages = [...preamble, ...branchMessages];
+    // 4. Synthetic user message as "task anchor" — models follow user turns better than system-only.
+    //    Uses contentBlocks with text block (consistent with system message format).
+    //    Deterministic IDs from taskId — stable across iterations, less noise in logs.
+    const syntheticBranchId = `synthetic-branch:${taskId}`;
+    const syntheticUser: Message = {
+      id: `synthetic:${taskId}`,
+      conversationId,
+      branches: [{
+        id: syntheticBranchId,
+        role: 'user',
+        content: `Task: ${taskInstruction}`,
+        contentBlocks: [{ type: 'text', text: `Task: ${taskInstruction}` }],
+        createdAt: new Date(),
+      }],
+      activeBranchId: syntheticBranchId,
+      order: (branchMessages[0]?.order ?? 0) - 1,
+    };
 
-    // 6. Build system prompt with task instruction
+    const messages = [syntheticUser, ...branchMessages];
+
+    // 5. Build system prompt with task instruction
     const assistantParticipant = participants.find(p => p.type === 'assistant');
     const baseSystemPrompt = assistantParticipant?.systemPrompt || conversation.systemPrompt || '';
     const systemPrompt = buildSubAgentSystemPrompt(baseSystemPrompt, taskInstruction);
@@ -96,19 +100,22 @@ export class SubAgentContextBuilder {
 // =============================================================================
 
 /**
- * Build system prompt for sub-agent with task instruction prepended.
+ * Build system prompt for sub-agent with task instruction + execution rules.
  */
 function buildSubAgentSystemPrompt(basePrompt: string, taskInstruction: string): string {
   const taskBlock = [
     '## Sub-Agent Task',
     '',
-    'You are a sub-agent working on a specific subtask within a larger conversation.',
-    'Focus exclusively on the following task and produce a clear, concise summary when done.',
+    'You are a focused sub-agent executing a specific task.',
+    `Your task: ${taskInstruction}`,
     '',
-    `**Task:** ${taskInstruction}`,
-    '',
-    'When you have completed the task, provide a final summary of your findings or results.',
-    'Do not ask follow-up questions — complete the task autonomously.',
+    'RULES:',
+    '- Execute tools to complete the task. Do NOT discuss or comment on the task.',
+    '- Do NOT reference any debugging, errors, or meta-discussion.',
+    '- Return concrete results only.',
+    '- Do not ask follow-up questions — complete the task autonomously.',
+    '- Do not list or describe available tools — just use them.',
+    '- If a tool returns a limit error, STOP calling tools and return your results immediately.',
   ].join('\n');
 
   return basePrompt ? `${taskBlock}\n\n---\n\n${basePrompt}` : taskBlock;

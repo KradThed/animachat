@@ -28,6 +28,8 @@ export interface LLMRunOptions {
     executeToolCall?: (call: ToolCall) => Promise<ToolResult>;
   };
   abortSignal?: AbortSignal;
+  maxToolDepth?: number;
+  maxToolCalls?: number;
 }
 
 export interface LLMRunResult {
@@ -90,13 +92,40 @@ export class LLMClientAdapter {
       }
     };
 
-    // Build tool options with tracking callbacks
+    // maxToolCalls soft-stop: single counter in executeToolCall (no off-by-one)
+    let toolCallCount = 0;
+    let toolsDisabled = false;
+    const maxToolCalls = options.maxToolCalls ?? 50;
+
+    // Build tool options with tracking callbacks + maxToolCalls safety cap
     const fullToolOptions = toolOptions
       ? {
           tools: toolOptions.tools,
-          onToolCall: (call: ToolCall) => { toolCalls.push(call); },
+          onToolCall: (call: ToolCall) => {
+            toolCalls.push(call);
+          },
           onToolResult: (result: ToolResult) => { toolResults.push(result); },
-          executeToolCall: toolOptions.executeToolCall,
+          executeToolCall: async (call: ToolCall): Promise<ToolResult> => {
+            toolCallCount++;
+            if (toolsDisabled) {
+              return {
+                toolUseId: call.id,
+                content: 'Tools disabled. Return your final answer.',
+                isError: true,
+              };
+            }
+            // > not >=: allow exactly maxToolCalls executions, disable on (maxToolCalls+1)th
+            if (toolCallCount > maxToolCalls) {
+              toolsDisabled = true;
+              console.warn(`[LLMClientAdapter] maxToolCalls (${maxToolCalls}) exceeded, disabling tools`);
+              return {
+                toolUseId: call.id,
+                content: `Tool call limit reached (${maxToolCalls}). Return your final answer now.`,
+                isError: true,
+              };
+            }
+            return toolOptions.executeToolCall!(call);
+          },
         }
       : undefined;
 
@@ -118,9 +147,17 @@ export class LLMClientAdapter {
         participants,
         abortSignal,
         fullToolOptions,
+        options.maxToolDepth,  // Passed to Membrane StreamOptions.maxToolDepth
       );
     } catch (error) {
-      throw new Error(`LLM inference failed: ${error instanceof Error ? error.message : String(error)}`);
+      const msg = error instanceof Error ? error.message : String(error);
+      // "Generation aborted" = normal cancellation (abortSignal fired).
+      // Return partial content — InferenceRunner.run() checks this.cancelled
+      // and returns summary: null for cancelled tasks.
+      if (msg === 'Generation aborted' || abortSignal?.aborted) {
+        return { content: content || '', contentBlocks, toolCalls, toolResults, usage };
+      }
+      throw new Error(`LLM inference failed: ${msg}`);
     }
 
     return { content, contentBlocks, toolCalls, toolResults, usage };

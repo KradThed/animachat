@@ -780,26 +780,86 @@ export const WsMessageSchema = z.discriminatedUnion('type', [
     conversationId: z.string().uuid(),
     requestId: z.string().min(1).optional(),
   }),
-  // Sub-agent WebSocket message types (H3)
+  // Sub-agent WebSocket message types
+  // Client → Server
+  z.object({
+    type: z.literal('subtask_get_state'),
+    conversationId: z.string().uuid(),
+  }),
+  z.object({
+    type: z.literal('subtask_release_queued'),
+    conversationId: z.string().uuid(),
+  }),
+  z.object({
+    type: z.literal('subtask_discard_queued'),
+    conversationId: z.string().uuid(),
+  }),
+  z.object({
+    type: z.literal('subtask_get_results'),
+    groupId: z.string().uuid(),
+  }),
+  // Server → Client
   z.object({
     type: z.literal('subtask_queue_blocked'),
-    groupId: z.string(),
-    message: z.string(),
+    groupId: z.string().uuid(),
+    queuedText: z.string(),
   }),
   z.object({
     type: z.literal('subtask_status_changed'),
-    groupId: z.string(),
+    groupId: z.string().uuid(),
     taskId: z.string(),
     status: z.string(),
+    instructionPreview: z.string().optional(),
   }),
   z.object({
     type: z.literal('subtask_group_finalized'),
-    groupId: z.string(),
+    groupId: z.string().uuid(),
   }),
   z.object({
     type: z.literal('subtask_group_auto_finalized'),
-    groupId: z.string(),
+    groupId: z.string().uuid(),
     reason: z.string(),
+  }),
+  z.object({
+    type: z.literal('subtask_state_snapshot'),
+    conversationId: z.string().uuid(),
+    active: z.boolean(),
+    groupId: z.string().uuid().nullable(),
+    tasks: z.array(z.object({
+      taskId: z.string(),
+      instructionPreview: z.string(),
+      status: z.string(),
+    })),
+    finalized: z.boolean(),
+    hasResults: z.boolean().optional(),
+    queuedText: z.string().nullable(),
+  }),
+  z.object({
+    type: z.literal('subtask_queue_action_result'),
+    conversationId: z.string().uuid(),
+    action: z.enum(['release', 'discard']),
+    status: z.enum(['ok', 'no_queued', 'still_running', 'already_released']),
+    message: z.string().optional(),
+  }),
+  z.object({
+    type: z.literal('subtask_results_snapshot'),
+    groupId: z.string().uuid(),
+    status: z.enum(['ok', 'not_found']),
+    results: z.array(z.object({
+      taskId: z.string(),
+      instruction: z.string(),
+      state: z.string(),
+      result: z.string().nullable(),
+      resultTruncated: z.boolean(),
+      error: z.string().nullable(),
+      metrics: z.object({
+        iterations: z.number(),
+        inputTokens: z.number(),
+        outputTokens: z.number(),
+        toolCalls: z.number(),
+        durationMs: z.number(),
+      }).optional(),
+    })),
   }),
   z.object({
     type: z.literal('system_turn_started'),

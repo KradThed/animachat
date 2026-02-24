@@ -218,12 +218,21 @@ async function startServer() {
     registerMcplManagementTools(db);
     const { mcplStateManager } = await import('./services/mcpl-state-manager.js');
     mcplStateManager.setDatabase(db);
+    const { mcplHookManager } = await import('./services/mcpl-hook-manager.js');
 
     // Wire replay callback for inference budget (dependency inversion — no circular imports)
+    let warnedMissingUserId = false;
     db.onReplayEvent('inference_request_completed', (data) => {
+      if (!data._userId) {
+        if (!warnedMissingUserId) {
+          console.warn('[Replay] inference_request_completed without userId — skipping rate limit restore');
+          warnedMissingUserId = true;
+        }
+        return;
+      }
       const ts = new Date(data.timestamp).getTime();
       if (ts > Date.now() - 60 * 60 * 1000) {
-        mcplInferenceBroker.addCompletedTimestamp(ts);
+        mcplInferenceBroker.addCompletedTimestamp(data._userId, ts);
       }
     });
 
@@ -279,11 +288,19 @@ async function startServer() {
     const systemTurnTrigger = new SystemTurnTrigger(db, llmClient, roomManager);
     notificationBus.bridgeToInferenceTrigger(systemTurnTrigger);
 
-    // Sub-agent manager
+    // Resource coordinator for write tool locking (prevents concurrent file corruption)
+    const { ResourceCoordinator } = await import('./services/resource-coordinator.js');
+    const resourceCoordinator = new ResourceCoordinator();
+    _resourceCoordinator = resourceCoordinator;
+
+    // Sub-agent manager (BUG 4: pass mcplHookManager for sub-agent inference hooks)
     const subAgentManager = new SubAgentManager(
       llmClient, contextBuilder, branchStore, notificationBus, db,
+      resourceCoordinator, mcplHookManager,
     );
     await subAgentManager.recoverOrphanedTasks();
+    // SA-2: recoverStaleGroups moved to per-conversation recovery in loadConversation().
+    // At startup, groups Map is empty (conversations not yet loaded), so global recovery finds nothing.
 
     // Register sub-agent tools
     registerSubAgentTools(subAgentManager);
@@ -340,11 +357,13 @@ async function startServer() {
 }
 
 // Handle graceful shutdown
-// branchStore reference for shutdown (set during startServer)
+// References for shutdown (set during startServer)
 let _branchStore: { close(): Promise<void> } | null = null;
+let _resourceCoordinator: { destroy(): void } | null = null;
 
 async function gracefulShutdown(signal: string) {
   console.log(`${signal} received. Shutting down gracefully...`);
+  _resourceCoordinator?.destroy();
   await _branchStore?.close();
   await db.close();
   process.exit(0);

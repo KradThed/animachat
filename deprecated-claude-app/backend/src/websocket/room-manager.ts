@@ -208,7 +208,7 @@ class RoomManager {
    */
   hasActiveAiRequest(conversationId: string): boolean {
     const room = this.rooms.get(conversationId);
-    return room?.activeAiRequest !== null;
+    return !!room?.activeAiRequest;
   }
   
   /**

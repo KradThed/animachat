@@ -122,6 +122,15 @@ export class McplSessionManager {
   }
 
   /**
+   * Validate that a serverId belongs to a delegate's registered featureSets.
+   */
+  validateServerOwnership(userId: string, delegateId: string, serverId: string): boolean {
+    const session = this.getSessionForDelegate(userId, delegateId);
+    if (!session) return false;
+    return Object.prototype.hasOwnProperty.call(session.featureSets, serverId);
+  }
+
+  /**
    * Remove a session (e.g., on intentional disconnect).
    */
   removeSession(sessionId: string): void {

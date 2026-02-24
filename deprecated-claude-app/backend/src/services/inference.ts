@@ -155,7 +155,9 @@ export class InferenceService {
       onToolCall?: (call: any) => void;
       onToolResult?: (result: any) => void;
       executeToolCall?: (call: any) => Promise<any>;
-    }
+    },
+    abortSignal?: AbortSignal,
+    maxToolDepth?: number,
   ): Promise<{
     usage?: {
       inputTokens: number;

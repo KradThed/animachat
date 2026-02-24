@@ -127,7 +127,9 @@ export class MembraneInferenceService extends InferenceService {
       onToolCall?: (call: ToolCall) => void;
       onToolResult?: (result: ToolResult) => void;
       executeToolCall?: (call: ToolCall) => Promise<ToolResult>;
-    }
+    },
+    abortSignal?: AbortSignal,
+    maxToolDepth?: number,
   ): Promise<{
     usage?: {
       inputTokens: number;
@@ -289,7 +291,10 @@ export class MembraneInferenceService extends InferenceService {
     ];
 
     const streamOptions: StreamOptions = {
+      signal: abortSignal,
+      ...(maxToolDepth != null && { maxToolDepth }),
       onChunk: (chunk: string) => {
+        // TODO: coalescing queue for strict ordering
         void onChunk(chunk, false, getCurrentBlocks());
       },
       onContentBlockUpdate: (index: number, block: any) => {
@@ -305,7 +310,9 @@ export class MembraneInferenceService extends InferenceService {
       onUsage: (usage: any) => {
         finalUsage = {
           inputTokens: usage.inputTokens,
-          outputTokens: usage.outputTokens
+          outputTokens: usage.outputTokens,
+          cacheCreationInputTokens: usage.cacheCreationInputTokens,
+          cacheReadInputTokens: usage.cacheReadInputTokens,
         };
       },
       // Tool calling support: Membrane calls this when the model emits tool_use blocks.
@@ -325,7 +332,7 @@ export class MembraneInferenceService extends InferenceService {
               name: call.name,
               input: call.input,
             } as any);
-            void onChunk('', false, getCurrentBlocks());
+            await onChunk('', false, getCurrentBlocks());
 
             // Notify about tool call start
             toolOptions.onToolCall?.(call as ToolCall);
@@ -343,7 +350,7 @@ export class MembraneInferenceService extends InferenceService {
                 content: result.content,
                 is_error: result.isError || false,
               } as any);
-              void onChunk('', false, getCurrentBlocks());
+              await onChunk('', false, getCurrentBlocks());
 
               // Notify about tool result
               toolOptions.onToolResult?.(result);
@@ -362,7 +369,7 @@ export class MembraneInferenceService extends InferenceService {
                 content: `Tool error: ${errorMsg}`,
                 is_error: true,
               } as any);
-              void onChunk('', false, getCurrentBlocks());
+              await onChunk('', false, getCurrentBlocks());
 
               toolOptions.onToolResult?.(errorResult);
               results.push(errorResult);
@@ -685,8 +692,11 @@ export class MembraneInferenceService extends InferenceService {
       : new Date();
 
     const syntheticMessages: Message[] = prefixHistory.map((entry, index) => {
-      const messageId = crypto.randomUUID();
-      const branchId = crypto.randomUUID();
+      // INF-11: Deterministic IDs so cache keys remain stable across calls
+      const seed = `${firstMessage.conversationId}:prefix:${index}:${entry.role}:${entry.content}`;
+      const hash = crypto.createHash('sha256').update(seed).digest('hex');
+      const messageId = `pfx-${hash.slice(0, 32)}`;
+      const branchId = `pfx-${hash.slice(32, 64)}`;
 
       return {
         id: messageId,

@@ -329,16 +329,31 @@ export class ContextManager {
     if (conversationId) {
       const stateKey = participantId ? `${conversationId}:${participantId}` : conversationId;
       this.states.delete(stateKey);
+      // INF-4: Also clear the matching strategy entry (keyed `${configJson}:${stateKey}`)
+      const stateSuffix = `:${stateKey}`;
+      for (const key of Array.from(this.strategies.keys())) {
+        if (key.endsWith(stateSuffix)) this.strategies.delete(key);
+      }
 
       // Also clear any participant-specific states if clearing conversation state
       if (!participantId) {
         const prefix = `${conversationId}:`;
-        Array.from(this.states.keys())
-          .filter(key => key.startsWith(prefix))
-          .forEach(key => this.states.delete(key));
+        // Two-phase delete for states
+        const stateKeys = Array.from(this.states.keys()).filter(key => key.startsWith(prefix));
+        for (const key of stateKeys) this.states.delete(key);
+        // INF-4: Also clear strategies (keyed by `${configJson}:${stateKey}`) to prevent memory leak.
+        // Strategy keys end with `:${conversationId}` or `:${conversationId}:${participantId}`.
+        // Strategies are recreated on-demand by getOrCreateStrategy().
+        const convSuffix = `:${conversationId}`;
+        const convPrefixSuffix = `:${prefix}`;
+        const strategyKeys = Array.from(this.strategies.keys()).filter(
+          key => key.endsWith(convSuffix) || key.includes(convPrefixSuffix)
+        );
+        for (const key of strategyKeys) this.strategies.delete(key);
       }
     } else {
       this.states.clear();
+      this.strategies.clear();
     }
   }
 

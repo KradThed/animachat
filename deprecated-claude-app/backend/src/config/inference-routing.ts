@@ -147,7 +147,7 @@ export class InferenceRouter {
       } catch {
         // File missing or inaccessible — keep current config
       }
-    }, intervalMs);
+    }, intervalMs).unref();
 
     console.log(`[InferenceRouter] Periodic reload started (${intervalMs}ms interval)`);
   }

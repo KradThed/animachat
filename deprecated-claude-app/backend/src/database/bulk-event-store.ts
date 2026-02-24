@@ -31,10 +31,10 @@ export class BulkEventStore {
         // shard into subdirectories so we don't fill a single directory
         // (because typical file systems can get slowdowns when a single directory contains hundreds of thousands of files)
         if (id.length >= 2) {
-            idDir = path.posix.join(idDir, id.substring(0,2));
+            idDir = path.join(idDir, id.substring(0,2));
         }
         if (id.length >= 4) {
-            idDir = path.posix.join(idDir, id.substring(2,4));
+            idDir = path.join(idDir, id.substring(2,4));
         }
         // create directory containing if not exists
         await fs.mkdir(idDir, { recursive: true});

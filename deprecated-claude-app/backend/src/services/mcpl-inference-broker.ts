@@ -51,8 +51,8 @@ export class McplInferenceBroker {
   private config: McplInferenceBrokerConfig;
   private db: Database | null = null;
 
-  /** Rate limiting: timestamps of completed inferences */
-  private completedTimestamps: number[] = [];
+  /** Rate limiting: timestamps of completed inferences, per user */
+  private completedTimestamps: Map<string, number[]> = new Map();
 
   /** Active requests for tracking */
   private activeRequests: Map<string, PendingInferenceRequest> = new Map();
@@ -135,10 +135,11 @@ export class McplInferenceBroker {
       frameId = chainResult.frameId;
     }
 
-    // 1. Check rate limit
-    this.pruneOldTimestamps();
-    if (this.completedTimestamps.length >= this.config.maxInferencesPerHour) {
-      console.warn(`[McplInferenceBroker] Rate limited: ${serverId} (${this.completedTimestamps.length}/${this.config.maxInferencesPerHour} per hour)`);
+    // 1. Check rate limit (per-user)
+    this.pruneOldTimestamps(userId);
+    const userTimestamps = this.completedTimestamps.get(userId) || [];
+    if (userTimestamps.length >= this.config.maxInferencesPerHour) {
+      console.warn(`[McplInferenceBroker] Rate limited: ${serverId} (${userTimestamps.length}/${this.config.maxInferencesPerHour} per hour for user ${userId})`);
       this.sendResponse(transport, {
         type: 'mcpl/inference_response',
         requestId,
@@ -199,11 +200,14 @@ export class McplInferenceBroker {
         delegateId: params.delegateId,
         onChunk,
       });
-      this.completedTimestamps.push(Date.now());
+      const completedTs = this.completedTimestamps.get(userId) || [];
+      completedTs.push(Date.now());
+      this.completedTimestamps.set(userId, completedTs);
 
       // Persist budget event (audit + replay on restart)
       if (this.db) {
         this.db.appendMcplUserEvent(userId, 'inference_request_completed', {
+          _userId: userId,  // replayEvent doesn't receive partition key
           requestId, serverId, timestamp: new Date().toISOString(),
         }).catch(err => console.warn('[McplInferenceBroker] Failed to persist:', err));
       }
@@ -335,16 +339,26 @@ export class McplInferenceBroker {
     }
   }
 
-  private pruneOldTimestamps(): void {
+  private pruneOldTimestamps(userId: string): void {
     const oneHourAgo = Date.now() - 60 * 60 * 1000;
-    this.completedTimestamps = this.completedTimestamps.filter(t => t > oneHourAgo);
+    const timestamps = this.completedTimestamps.get(userId);
+    if (timestamps) {
+      const pruned = timestamps.filter(t => t > oneHourAgo);
+      if (pruned.length > 0) {
+        this.completedTimestamps.set(userId, pruned);
+      } else {
+        this.completedTimestamps.delete(userId);
+      }
+    }
   }
 
   /**
-   * Add a completed timestamp (used during event replay to rebuild budget).
+   * Add a completed timestamp for a user (used during event replay to rebuild budget).
    */
-  addCompletedTimestamp(ts: number): void {
-    this.completedTimestamps.push(ts);
+  addCompletedTimestamp(userId: string, ts: number): void {
+    const arr = this.completedTimestamps.get(userId) || [];
+    arr.push(ts);
+    this.completedTimestamps.set(userId, arr);
   }
 
   /**
@@ -360,10 +374,9 @@ export class McplInferenceBroker {
     completedThisHour: number;
     maxPerHour: number;
   } {
-    this.pruneOldTimestamps();
     return {
       activeRequests: this.activeRequests.size,
-      completedThisHour: this.completedTimestamps.length,
+      completedThisHour: [...this.completedTimestamps.values()].reduce((sum, ts) => sum + ts.length, 0),
       maxPerHour: this.config.maxInferencesPerHour,
     };
   }

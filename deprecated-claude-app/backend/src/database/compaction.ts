@@ -94,7 +94,10 @@ export async function compactConversation(
       crlfDelay: Infinity
     });
 
-    const pendingWrites: Promise<void>[] = [];
+    // DB-8: Serialize all writes through a single promise chain to preserve event order.
+    // Blob extraction is async, so without serialization, non-blob events could be written
+    // out of order relative to preceding blob events.
+    let writeChain: Promise<void> = Promise.resolve();
 
     rl.on('line', (line) => {
       if (!line.trim()) return;
@@ -102,13 +105,13 @@ export async function compactConversation(
 
       try {
         const event = JSON.parse(line);
-        
+
         // Check if this event should be removed
         if (removeActiveBranchChanged && event.type === 'active_branch_changed') {
           result.removedEvents.active_branch_changed++;
           return;
         }
-        
+
         if (removeMessageOrderChanged && event.type === 'message_order_changed') {
           result.removedEvents.message_order_changed++;
           return;
@@ -117,45 +120,40 @@ export async function compactConversation(
         // Process message_branch_updated events
         if (stripDebugData && event.type === 'message_branch_updated' && event.data?.updates) {
           const updates = event.data.updates;
-          
+
           if (updates.debugRequest || updates.debugResponse) {
             if (moveDebugToBlobs) {
-              // Move to blobs asynchronously
-              const blobStore = getBlobStore();
-              const blobPromises: Promise<void>[] = [];
-              
-              if (updates.debugRequest) {
-                const promise = blobStore.saveJsonBlob(updates.debugRequest).then(blobId => {
-                  updates.debugRequestBlobId = blobId;
+              // Move to blobs asynchronously — chain write to preserve order
+              writeChain = writeChain.then(async () => {
+                const blobStore = getBlobStore();
+
+                if (updates.debugRequest) {
+                  try {
+                    const blobId = await blobStore.saveJsonBlob(updates.debugRequest);
+                    updates.debugRequestBlobId = blobId;
+                    result.movedToBlobs++;
+                  } catch (err) {
+                    console.warn(`[Compaction] Failed to save debugRequest to blob:`, err);
+                  }
                   delete updates.debugRequest;
-                  result.movedToBlobs++;
-                }).catch(err => {
-                  console.warn(`[Compaction] Failed to save debugRequest to blob:`, err);
-                  delete updates.debugRequest; // Still strip it
-                });
-                blobPromises.push(promise);
-              }
-              
-              if (updates.debugResponse) {
-                const promise = blobStore.saveJsonBlob(updates.debugResponse).then(blobId => {
-                  updates.debugResponseBlobId = blobId;
+                }
+
+                if (updates.debugResponse) {
+                  try {
+                    const blobId = await blobStore.saveJsonBlob(updates.debugResponse);
+                    updates.debugResponseBlobId = blobId;
+                    result.movedToBlobs++;
+                  } catch (err) {
+                    console.warn(`[Compaction] Failed to save debugResponse to blob:`, err);
+                  }
                   delete updates.debugResponse;
-                  result.movedToBlobs++;
-                }).catch(err => {
-                  console.warn(`[Compaction] Failed to save debugResponse to blob:`, err);
-                  delete updates.debugResponse; // Still strip it
-                });
-                blobPromises.push(promise);
-              }
-              
-              // Wait for blobs to be saved before writing
-              const writePromise = Promise.all(blobPromises).then(() => {
+                }
+
                 const compactedLine = JSON.stringify(event) + '\n';
                 result.compactedSize += Buffer.byteLength(compactedLine, 'utf-8');
                 result.compactedEventCount++;
                 outputStream.write(compactedLine);
               });
-              pendingWrites.push(writePromise);
               return;
             } else {
               // Just strip the debug data entirely
@@ -171,25 +169,29 @@ export async function compactConversation(
           }
         }
 
-        // Write the (possibly modified) event
-        const compactedLine = JSON.stringify(event) + '\n';
-        result.compactedSize += Buffer.byteLength(compactedLine, 'utf-8');
-        result.compactedEventCount++;
-        outputStream.write(compactedLine);
-        
+        // Write the (possibly modified) event — chain to preserve order
+        writeChain = writeChain.then(() => {
+          const compactedLine = JSON.stringify(event) + '\n';
+          result.compactedSize += Buffer.byteLength(compactedLine, 'utf-8');
+          result.compactedEventCount++;
+          outputStream.write(compactedLine);
+        });
+
       } catch (err) {
         console.warn(`[Compaction] Failed to parse line, keeping as-is:`, err);
-        // Keep unparseable lines as-is
-        const lineWithNewline = line + '\n';
-        result.compactedSize += Buffer.byteLength(lineWithNewline, 'utf-8');
-        result.compactedEventCount++;
-        outputStream.write(lineWithNewline);
+        // Keep unparseable lines as-is — chain to preserve order
+        writeChain = writeChain.then(() => {
+          const lineWithNewline = line + '\n';
+          result.compactedSize += Buffer.byteLength(lineWithNewline, 'utf-8');
+          result.compactedEventCount++;
+          outputStream.write(lineWithNewline);
+        });
       }
     });
 
     rl.on('close', async () => {
-      // Wait for any pending blob writes
-      await Promise.all(pendingWrites);
+      // Wait for all chained writes to complete
+      await writeChain;
       outputStream.end();
       resolve();
     });

@@ -19,6 +19,9 @@ import type { Event } from '../database/persistence.js';
 import { LLMClientAdapter } from './llm-client-adapter.js';
 import { SubAgentContextBuilder } from './context-builder.js';
 import { buildToolOptions } from '../websocket/handler.js';
+import type { ResourceCoordinator } from '../services/resource-coordinator.js';
+import { createGuardedExecuteTool } from '../services/write-tool-guard.js';
+import type { McplHookManager, InferenceHookContext } from '../services/mcpl-hook-manager.js';
 import type { SubAgentTask, TaskMetrics } from './types.js';
 import { MAX_ITERATIONS } from './types.js';
 
@@ -45,6 +48,8 @@ export class InferenceRunner {
     private contextBuilder: SubAgentContextBuilder,
     private branchStore: BranchEventStore,
     private db: Database,
+    private resourceCoordinator?: ResourceCoordinator,
+    private hookManager?: McplHookManager,
   ) {}
 
   /**
@@ -62,13 +67,12 @@ export class InferenceRunner {
     };
 
     try {
-      // Build initial context
+      // Build initial context (BUG 5: forkPoint/forkBranchId stored in task, not passed to builder)
       const context = await this.contextBuilder.buildContext({
         conversationId: this.task.conversationId,
         userId: this.task.userId,
         taskId: this.task.taskId,
         taskInstruction: this.task.instruction,
-        forkPoint: this.task.forkPoint,
       });
 
       // Build tool options — exclude sub-agent tools (depth=1 limit)
@@ -79,17 +83,24 @@ export class InferenceRunner {
         this.db,
       );
 
+      // BUG 7: Exact match for sub-agent tool filtering (not prefix match)
+      const SUB_AGENT_TOOL_NAMES = new Set([
+        'spawn_subtask', 'spawn_subtasks', 'poll_subtasks',
+        'get_subtask_results', 'cancel_subtasks', 'finalize_task_group',
+      ]);
+
       // Filter out sub-agent tools to prevent recursive spawning
+      // Wrap executeToolCall with write lock guard (ResourceCoordinator)
       const filteredToolOptions = toolOpts
         ? {
-            tools: toolOpts.tools.filter((t: any) =>
-              !t.name.startsWith('spawn_subtask') &&
-              !t.name.startsWith('poll_subtasks') &&
-              !t.name.startsWith('get_subtask_results') &&
-              !t.name.startsWith('cancel_subtasks') &&
-              !t.name.startsWith('finalize_task_group')
-            ),
-            executeToolCall: toolOpts.executeToolCall,
+            tools: toolOpts.tools.filter((t: any) => !SUB_AGENT_TOOL_NAMES.has(t.name)),
+            executeToolCall: this.resourceCoordinator
+              ? createGuardedExecuteTool(
+                  this.task.userId,
+                  this.resourceCoordinator,
+                  toolOpts.executeToolCall,
+                )
+              : toolOpts.executeToolCall,
           }
         : undefined;
 
@@ -115,20 +126,80 @@ export class InferenceRunner {
       // Single inference call — Membrane handles the tool loop internally
       metrics.iterations = 1;
 
+      // Debug: verify tools are being passed to the LLM
+      console.log(`[InferenceRunner] Task ${this.task.taskId}: tools=${filteredToolOptions?.tools?.length ?? 0}, hasExecute=${!!filteredToolOptions?.executeToolCall}`);
+      if (filteredToolOptions?.tools) {
+        console.log(`[InferenceRunner] Tool names: ${filteredToolOptions.tools.map((t: any) => t.name).join(', ')}`);
+      }
+
+      // BUG 4: MCPL beforeInference hooks for sub-agents
+      let { systemPrompt } = context;
+      let messages = context.messages;
+
+      const hookContext: InferenceHookContext = {
+        conversationId: this.task.conversationId,
+        userId: this.task.userId,
+        isSubAgent: true,
+        taskId: this.task.taskId,
+        groupId: this.task.groupId,
+        instruction: this.task.instruction,
+      };
+
+      if (this.hookManager) {
+        const injections = await this.hookManager.beforeInference(
+          this.task.userId,
+          this.task.conversationId,
+          undefined,
+          1,           // hookDepth=1 — sub-agent level
+          hookContext,
+        );
+        if (injections.length > 0) {
+          // system injections → systemPrompt
+          const systemInj = injections.filter(i => i.position === 'system').map(i => i.content);
+          if (systemInj.length > 0) {
+            systemPrompt = systemPrompt
+              ? `${systemPrompt}\n\n${systemInj.join('\n')}`
+              : systemInj.join('\n');
+          }
+          // beforeUser/afterUser → immutable message update (don't mutate shared reference)
+          const beforeUser = injections.filter(i => i.position === 'beforeUser').map(i => i.content);
+          const afterUser = injections.filter(i => i.position === 'afterUser').map(i => i.content);
+          if ((beforeUser.length > 0 || afterUser.length > 0) && messages.length > 0) {
+            const lastIdx = messages.length - 1;
+            messages = messages.map((m, i) => {
+              if (i !== lastIdx) return m;
+              const branch = m.branches.find(b => b.id === m.activeBranchId);
+              if (!branch) return m;
+              let content = branch.content;
+              if (beforeUser.length > 0) content = beforeUser.join('\n') + '\n\n' + content;
+              if (afterUser.length > 0) content = content + '\n\n' + afterUser.join('\n');
+              return {
+                ...m,
+                branches: m.branches.map(b =>
+                  b.id === m.activeBranchId ? { ...b, content } : b
+                ),
+              };
+            });
+          }
+        }
+      }
+
       if (this.cancelled) {
         throw new Error('Task cancelled before inference');
       }
 
       const result = await this.llmClient.run({
         modelConfig,
-        messages: context.messages,
-        systemPrompt: context.systemPrompt,
+        messages,
+        systemPrompt,
         settings,
         userId: this.task.userId,
         conversation: context.conversation,
         participants: context.participants,
         toolOptions: filteredToolOptions,
         abortSignal: this.abortController.signal,
+        maxToolDepth: 6,   // Sub-agents have narrow tasks: search→read→search→read→write→verify
+        maxToolCalls: 30,  // Hard safety cap — soft-stop in LLMClientAdapter.executeToolCall
       });
 
       // Track metrics
@@ -153,6 +224,16 @@ export class InferenceRunner {
         },
       };
       await this.branchStore.appendEvent(this.task.taskId, assistantEvent);
+
+      // BUG 4: MCPL afterInference hooks — fire-and-forget
+      if (this.hookManager) {
+        this.hookManager.afterInference(
+          this.task.userId,
+          this.task.conversationId,
+          result.content?.slice(0, 200),
+          hookContext,
+        ).catch(err => console.error('[InferenceRunner] afterInference error:', err));
+      }
 
       metrics.durationMs = Date.now() - startTime;
 

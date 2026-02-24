@@ -28,7 +28,7 @@ import { matchesPattern } from './mcpl-wildcard.js';
 export interface McplHookManagerConfig {
   beforeInferenceTimeoutMs: number;          // default 5000
   afterInferenceTimeoutMs: number;           // default 10000
-  maxCallsPerMinutePerServer: number;        // default 10 — global rate limit per server
+  maxCallsPerMinutePerDelegate: number;      // default 10 — rate limit per delegate
 }
 
 interface RegisteredHookServer {
@@ -43,6 +43,15 @@ interface PendingHookRequest {
   requestId: string;
   resolve: (injections: McplContextInjection[]) => void;
   timeout: ReturnType<typeof setTimeout>;
+}
+
+export interface InferenceHookContext {
+  conversationId: string;
+  userId: string;
+  isSubAgent: boolean;
+  taskId?: string;    // sub-agent only
+  groupId?: string;   // sub-agent only
+  instruction?: string; // sub-agent task instruction
 }
 
 // =============================================================================
@@ -61,17 +70,17 @@ export class McplHookManager {
   /** Max hook depth before stopping re-entrant hooks (sync loop prevention) */
   private static readonly MAX_HOOK_DEPTH = 3;
 
-  /** Per-server call timestamps for rate limiting (async loop prevention) */
-  private serverCallTimestamps: Map<string, number[]> = new Map();
+  /** Per-delegate call timestamps for rate limiting (async loop prevention) */
+  private delegateCallTimestamps: Map<string, number[]> = new Map();
 
-  /** Per-server custom rate limits (overrides config.maxCallsPerMinutePerServer) */
-  private serverRateLimits: Map<string, number> = new Map();
+  /** Per-delegate custom rate limits (overrides config.maxCallsPerMinutePerDelegate) */
+  private delegateRateLimits: Map<string, number> = new Map();
 
   constructor(config?: Partial<McplHookManagerConfig>) {
     this.config = {
       beforeInferenceTimeoutMs: 5000,
       afterInferenceTimeoutMs: 10000,
-      maxCallsPerMinutePerServer: 10,
+      maxCallsPerMinutePerDelegate: 10,
       ...config,
     };
   }
@@ -139,11 +148,11 @@ export class McplHookManager {
   // --------------------------------------------------------------------------
 
   /**
-   * Set a custom rate limit for a specific server (overrides global config).
+   * Set a custom rate limit for a specific delegate (overrides global config).
    */
-  setServerRateLimit(serverId: string, maxPerMinute: number): void {
-    this.serverRateLimits.set(serverId, maxPerMinute);
-    console.log(`[McplHookManager] Custom rate limit for ${serverId}: ${maxPerMinute}/min`);
+  setDelegateRateLimit(delegateId: string, maxPerMinute: number): void {
+    this.delegateRateLimits.set(delegateId, maxPerMinute);
+    console.log(`[McplHookManager] Custom rate limit for delegate ${delegateId}: ${maxPerMinute}/min`);
   }
 
   /**
@@ -161,7 +170,8 @@ export class McplHookManager {
     userId: string,
     conversationId: string,
     messagesSummary?: string,
-    hookDepth = 0
+    hookDepth = 0,
+    context?: InferenceHookContext,
   ): Promise<McplContextInjection[]> {
     // Sync loop prevention: stop at max depth
     if (hookDepth >= McplHookManager.MAX_HOOK_DEPTH) {
@@ -172,11 +182,12 @@ export class McplHookManager {
     const servers = this.getServersForUser(userId);
     if (servers.length === 0) return [];
 
+    const hookContext = context ?? { conversationId, userId, isSubAgent: false };
     const allInjections: McplContextInjection[] = [];
 
     // Parallel requests to all hook servers with timeout + per-server rate limit
     const results = await Promise.allSettled(
-      servers.map(server => this.requestBeforeInference(server, conversationId, messagesSummary))
+      servers.map(server => this.requestBeforeInference(server, conversationId, messagesSummary, hookContext))
     );
 
     for (let i = 0; i < results.length; i++) {
@@ -201,7 +212,8 @@ export class McplHookManager {
   private requestBeforeInference(
     server: RegisteredHookServer,
     conversationId: string,
-    messagesSummary?: string
+    messagesSummary?: string,
+    context?: InferenceHookContext,
   ): Promise<McplContextInjection[]> {
     if (!server.transport.isOpen) {
       return Promise.resolve([]);
@@ -209,7 +221,7 @@ export class McplHookManager {
 
     // Per-server rate limit check (async loop prevention)
     if (!this.checkRateLimit(server.delegateId)) {
-      console.warn(`[McplHookManager] Rate limited: ${server.delegateId} exceeded ${this.getServerRateLimit(server.delegateId)}/min`);
+      console.warn(`[McplHookManager] Rate limited: ${server.delegateId} exceeded ${this.getDelegateRateLimit(server.delegateId)}/min`);
       return Promise.resolve([]);
     }
 
@@ -230,6 +242,7 @@ export class McplHookManager {
           requestId,
           conversationId,
           messagesSummary,
+          context,
         });
       } catch (err) {
         clearTimeout(timeout);
@@ -263,22 +276,23 @@ export class McplHookManager {
   async afterInference(
     userId: string,
     conversationId: string,
-    responseSummary?: string
+    responseSummary?: string,
+    context?: InferenceHookContext,
   ): Promise<void> {
     const servers = this.getServersForUser(userId);
     if (servers.length === 0) return;
 
-    const requestId = randomUUID();
-
     for (const server of servers) {
       if (!server.transport.isOpen) continue;
 
+      const requestId = randomUUID();  // per-server requestId
       try {
         server.transport.send({
           type: 'mcpl/afterInference',
           requestId,
           conversationId,
           responseSummary,
+          context: context ?? { conversationId, userId, isSubAgent: false },
         });
       } catch (err) {
         console.warn(`[McplHookManager] Failed to send afterInference to ${server.delegateId}:`, err);
@@ -312,21 +326,21 @@ export class McplHookManager {
   // --------------------------------------------------------------------------
 
   /**
-   * Get the effective rate limit for a server (custom or global default).
+   * Get the effective rate limit for a delegate (custom or global default).
    */
-  private getServerRateLimit(serverId: string): number {
-    return this.serverRateLimits.get(serverId) ?? this.config.maxCallsPerMinutePerServer;
+  private getDelegateRateLimit(delegateId: string): number {
+    return this.delegateRateLimits.get(delegateId) ?? this.config.maxCallsPerMinutePerDelegate;
   }
 
   /**
-   * Check and record a call for rate limiting.
+   * Check and record a call for rate limiting (keyed by delegateId).
    * Returns true if the call is allowed, false if rate limited.
    */
-  private checkRateLimit(serverId: string): boolean {
-    const limit = this.getServerRateLimit(serverId);
+  private checkRateLimit(delegateId: string): boolean {
+    const limit = this.getDelegateRateLimit(delegateId);
     const now = Date.now();
 
-    const timestamps = this.serverCallTimestamps.get(serverId) || [];
+    const timestamps = this.delegateCallTimestamps.get(delegateId) || [];
     // Keep only timestamps within the last 60 seconds
     const recent = timestamps.filter(t => now - t < 60_000);
 
@@ -335,7 +349,7 @@ export class McplHookManager {
     }
 
     recent.push(now);
-    this.serverCallTimestamps.set(serverId, recent);
+    this.delegateCallTimestamps.set(delegateId, recent);
     return true;
   }
 }

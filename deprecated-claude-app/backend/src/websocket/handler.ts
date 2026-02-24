@@ -1,5 +1,6 @@
 import { WebSocket } from 'ws';
 import { IncomingMessage } from 'http';
+import { v4 as uuidv4 } from 'uuid';
 import { WsMessageSchema, WsMessage, Message, Participant, Conversation, ToolConfig } from '@deprecated-claude/shared';
 import { Database } from '../database/index.js';
 import { verifyToken } from '../middleware/auth.js';
@@ -17,6 +18,7 @@ import { toolRegistry } from '../tools/tool-registry.js';
 import type { ToolCall, ToolResult } from '../tools/tool-registry.js';
 import { delegateWebsocketHandler, resolveScopeChange, resolveScopeElevate } from '../delegate/delegate-handler.js';
 import { mcplHookManager } from '../services/mcpl-hook-manager.js';
+import type { InferenceHookContext } from '../services/mcpl-hook-manager.js';
 import { mcplEventQueue } from '../services/mcpl-event-queue.js';
 import { mcplStateManager } from '../services/mcpl-state-manager.js';
 import type { McplContextInjection } from '@deprecated-claude/shared';
@@ -26,11 +28,27 @@ interface AuthenticatedWebSocket extends WebSocket {
   isAlive?: boolean;
 }
 
-// Sub-agent frozen parent gate
+// Sub-agent manager interface (used for frozen parent gate + UI state)
 // Set via setSubAgentManager() from index.ts startup
-let _subAgentManager: { getBlockingGroupId(conversationId: string): string | null } | null = null;
+import type { QueuedUserMessage, SubAgentStateSnapshot } from '../sub-agents/types.js';
 
-export function setSubAgentManager(manager: { getBlockingGroupId(conversationId: string): string | null }): void {
+interface SubAgentManagerLike {
+  getBlockingGroupId(conversationId: string): string | null;
+  getQueuedMessage(conversationId: string, userId: string): QueuedUserMessage | null;
+  queueUserMessage(msg: QueuedUserMessage): void;
+  releaseQueuedMessage(conversationId: string, userId: string): QueuedUserMessage | null;
+  cancelQueuedMessage(conversationId: string, userId: string): void;
+  getStateSnapshot(conversationId: string, userId: string): SubAgentStateSnapshot;
+  getSubtaskResultsWithMeta(groupId: string): {
+    found: boolean;
+    results: import('../sub-agents/types.js').SubAgentResult[];
+    conversationId: string | null;
+  };
+}
+
+let _subAgentManager: SubAgentManagerLike | null = null;
+
+export function setSubAgentManager(manager: SubAgentManagerLike): void {
   _subAgentManager = manager;
 }
 
@@ -68,6 +86,16 @@ function abortGeneration(userId: string, conversationId: string): boolean {
     return true;
   }
   return false;
+}
+
+function safeSend(ws: AuthenticatedWebSocket, data: any): void {
+  try {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(data));
+    }
+  } catch {
+    // Connection closed mid-send
+  }
 }
 
 /**
@@ -289,7 +317,7 @@ function applyIdentityPromptIfNeeded(params: IdentityPromptParams): string {
  * @param includeMessage - Optional message to include/replace in the history
  * @returns Array of messages in chronological order (oldest first)
  */
-function buildConversationHistory(
+export function buildConversationHistory(
   allMessages: Message[],
   fromBranchId: string | undefined,
   includeMessage?: { messageId: string; message: Message }
@@ -651,12 +679,18 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
   }
 
   // Phase 4: MCPL beforeInference hooks — collect context injections
+  const parentContext: InferenceHookContext = {
+    conversationId,
+    userId: conversation.userId,
+    isSubAgent: false,
+  };
   try {
     const injections = await mcplHookManager.beforeInference(
       conversation.userId,
       conversationId,
       undefined,  // messagesSummary
       0,          // hookDepth: top-level inference (user message or push event)
+      parentContext,
     );
     if (injections.length > 0) {
       // Place injections by position (already sorted by serverId)
@@ -755,6 +789,7 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
   // Helper function to run inference for a single branch
   const runBranchInference = async (branchId: string, branchIndex: number) => {
     let branchContent = '';
+    let lastSavedLength = 0;
 
     await inferenceService.streamCompletion(
       modelConfig,
@@ -764,7 +799,14 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
       conversation.userId,
       async (chunk: string, isComplete: boolean, contentBlocks?: any[], usage?: any) => {
         // Update branch content
+        const prevLen = branchContent.length;
         branchContent += chunk;
+        // Debug: log chunk accumulation at key points (first chunk, every 500 chars, completion)
+        if (prevLen === 0 && chunk.length > 0) {
+          console.log(`[StreamChunk] branchId=${branchId.slice(0,8)} FIRST chunk: "${chunk.slice(0, 80)}"`);
+        } else if (Math.floor(branchContent.length / 500) > Math.floor(prevLen / 500)) {
+          console.log(`[StreamChunk] branchId=${branchId.slice(0,8)} accumulated ${branchContent.length} chars`);
+        }
         
         // Find the branch in our message
         const currentBranch = targetMessage.branches.find((b: any) => b.id === branchId);
@@ -776,8 +818,8 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
             currentBranch.contentBlocks = contentBlocks;
           }
           
-          // Save partial content every 500 characters to prevent data loss
-          if (branchContent.length % 500 === 0 || isComplete) {
+          // Save partial content every ~500 characters to prevent data loss
+          if (branchContent.length - lastSavedLength >= 500 || isComplete) {
             await db.updateMessageContent(
               targetMessage.id,
               targetMessage.conversationId,
@@ -786,32 +828,39 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
               branchContent,
               currentBranch.contentBlocks
             );
+            lastSavedLength = branchContent.length;
           }
         }
         
-        // Send stream update with branchIndex for client tracking
-        const streamData = {
-          type: 'stream',
-          messageId: targetMessage.id,
-          branchId: branchId,
-          content: chunk,
-          contentBlocks: contentBlocks,
-          isComplete,
-          branchIndex
-        };
-        safeSend(streamData);
-        
-        // Broadcast to other users in the room
-        roomManager.broadcastToRoom(conversationId, streamData, ws);
-        
-        // Handle completion
+        // Handle completion — process content recovery BEFORE sending stream event
+        // so the frontend receives the correct content in a single isComplete event.
         if (isComplete) {
+          console.log(`[StreamComplete] branchId=${branchId.slice(0,8)} branchContent.length=${branchContent.length} contentBlocksCount=${contentBlocks?.length ?? 0} contentBlockTypes=${contentBlocks?.map((b: any) => b.type).join(',') ?? 'none'}`);
+          if (branchContent.length > 0) {
+            console.log(`[StreamComplete] branchContent preview: "${branchContent.slice(0, 200)}"`);
+          }
           const finalBranch = targetMessage.branches.find((b: any) => b.id === branchId);
           if (finalBranch) {
             // Trim whitespace from final content
             finalBranch.content = branchContent.trim();
+
+            // When Membrane handles tool loops internally, onChunk may not fire for
+            // intermediate iterations' text — only index-based contentBlockUpdate fires.
+            // If branchContent is empty but contentBlocks has text blocks, extract text
+            // from contentBlocks so the message isn't blank in the chat UI.
+            if (!finalBranch.content && contentBlocks && contentBlocks.length > 0) {
+              const textFromBlocks = contentBlocks
+                .filter((b: any) => b.type === 'text' && b.text)
+                .map((b: any) => b.text)
+                .join('\n\n');
+              if (textFromBlocks) {
+                console.log(`[StreamComplete] Recovered ${textFromBlocks.length} chars from contentBlocks text blocks (onChunk did not stream text)`);
+                finalBranch.content = textFromBlocks.trim();
+              }
+            }
+
             branchContent = finalBranch.content;
-            
+
             // Content filter check for AI output with tiered moderation
             const outputFilterResult = await checkContent(finalBranch.content, userContext);
             if (outputFilterResult.blocked) {
@@ -819,22 +868,28 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
               finalBranch.content = '[Content filtered]';
               finalBranch.contentBlocks = undefined;
               branchContent = finalBranch.content;
-              
-              // Send filter event to replace streamed content
-              const filterEvent = {
-                type: 'stream',
-                conversationId: conversationId,
-                messageId: targetMessage.id,
-                branchId: branchId,
-                content: finalBranch.content,
-                contentBlocks: undefined,
-                isComplete: true,
-                filtered: true
-              };
-              safeSend(filterEvent);
-              roomManager.broadcastToRoom(conversationId, filterEvent, ws);
             }
-            
+
+            // Send the isComplete stream event with recovered content (if any).
+            // For content recovery: chunk was '' but finalBranch.content has text from contentBlocks.
+            // For filtered content: send '[Content filtered]' to replace any streamed content.
+            // For normal flow: chunk already has the text, this just sends isComplete.
+            const completeData = {
+              type: 'stream',
+              messageId: targetMessage.id,
+              branchId: branchId,
+              // Use branchContent (recovered or filtered) as fullContent for the frontend
+              // to replace any partial streaming content with the authoritative final version.
+              content: chunk,
+              fullContent: branchContent,
+              contentBlocks: outputFilterResult.blocked ? undefined : contentBlocks,
+              isComplete: true,
+              ...(outputFilterResult.blocked && { filtered: true }),
+              branchIndex
+            };
+            safeSend(completeData);
+            roomManager.broadcastToRoom(conversationId, completeData, ws);
+
             // Final save
             await db.updateMessageContent(
               targetMessage.id,
@@ -844,7 +899,33 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
               finalBranch.content,
               finalBranch.contentBlocks
             );
+          } else {
+            // No finalBranch found — still send stream event
+            const streamData = {
+              type: 'stream',
+              messageId: targetMessage.id,
+              branchId: branchId,
+              content: chunk,
+              contentBlocks: contentBlocks,
+              isComplete: true,
+              branchIndex
+            };
+            safeSend(streamData);
+            roomManager.broadcastToRoom(conversationId, streamData, ws);
           }
+        } else {
+          // Non-complete stream update
+          const streamData = {
+            type: 'stream',
+            messageId: targetMessage.id,
+            branchId: branchId,
+            content: chunk,
+            contentBlocks: contentBlocks,
+            isComplete: false,
+            branchIndex
+          };
+          safeSend(streamData);
+          roomManager.broadcastToRoom(conversationId, streamData, ws);
         }
       },
       conversation,
@@ -877,7 +958,7 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
   );
 
   // Phase 4: MCPL afterInference hooks — fire-and-forget notify
-  mcplHookManager.afterInference(conversation.userId, conversationId).catch(err => {
+  mcplHookManager.afterInference(conversation.userId, conversationId, undefined, parentContext).catch(err => {
     console.error('[ParallelInference] MCPL afterInference error:', err);
   });
 
@@ -944,10 +1025,16 @@ export function websocketHandler(ws: AuthenticatedWebSocket, req: IncomingMessag
       //   - No resource locking between parent and sub-agents
       //   - No abort propagation to delegate on sub-agent cancel
       if (raw.type === 'mcpl/pause_queue' && raw.conversationId && ws.userId) {
+        // WS-5: Verify user has access to this conversation
+        const conv = await db.getConversation(raw.conversationId as string, ws.userId);
+        if (!conv) return;
         mcplEventQueue.pause(raw.conversationId);
         return;
       }
       if (raw.type === 'mcpl/resume_queue' && raw.conversationId && ws.userId) {
+        // WS-5: Verify user has access to this conversation
+        const conv = await db.getConversation(raw.conversationId as string, ws.userId);
+        if (!conv) return;
         mcplEventQueue.resume(raw.conversationId);
         return;
       }
@@ -1151,28 +1238,236 @@ export function websocketHandler(ws: AuthenticatedWebSocket, req: IncomingMessag
           break;
         }
 
+        // Sub-agent UI handlers
+        case 'subtask_get_state': {
+          if (!ws.userId) { ws.close(1008, 'unauthorized'); break; }
+          const stateMsg = message as Extract<WsMessage, { type: 'subtask_get_state' }>;
+          if (_subAgentManager) {
+            const snapshot = _subAgentManager.getStateSnapshot(stateMsg.conversationId, ws.userId);
+            ws.send(JSON.stringify({
+              type: 'subtask_state_snapshot',
+              conversationId: stateMsg.conversationId,
+              ...snapshot,
+            }));
+          } else {
+            ws.send(JSON.stringify({
+              type: 'subtask_state_snapshot',
+              conversationId: stateMsg.conversationId,
+              active: false,
+              groupId: null,
+              tasks: [],
+              finalized: false,
+              hasResults: false,
+              queuedText: null,
+            }));
+          }
+          break;
+        }
+
+        case 'subtask_release_queued': {
+          if (!ws.userId) { ws.close(1008, 'unauthorized'); break; }
+          const releaseMsg = message as Extract<WsMessage, { type: 'subtask_release_queued' }>;
+          const convId = releaseMsg.conversationId;
+
+          if (!_subAgentManager) {
+            ws.send(JSON.stringify({
+              type: 'subtask_queue_action_result',
+              conversationId: convId,
+              action: 'release',
+              status: 'no_queued',
+              message: 'Sub-agent system not available',
+            }));
+            break;
+          }
+
+          // Check if still frozen
+          const blockingGroup = _subAgentManager.getBlockingGroupId(convId);
+          if (blockingGroup) {
+            ws.send(JSON.stringify({
+              type: 'subtask_queue_action_result',
+              conversationId: convId,
+              action: 'release',
+              status: 'still_running',
+              message: 'Sub-agents are still active. Wait for finalization.',
+            }));
+            break;
+          }
+
+          const released = _subAgentManager.releaseQueuedMessage(convId, ws.userId);
+          if (!released) {
+            ws.send(JSON.stringify({
+              type: 'subtask_queue_action_result',
+              conversationId: convId,
+              action: 'release',
+              status: 'no_queued',
+              message: 'No queued message found',
+            }));
+            break;
+          }
+
+          // Persist release event
+          db.appendSubAgentEvent(convId, 'queued_user_turn_released', {
+            conversationId: convId,
+            userId: ws.userId,
+            messageId: released.messageId,
+            timestamp: Date.now(),
+          }, ws.userId).catch(err =>
+            console.error(`[Handler] Failed to persist queued_user_turn_released: ${err.message}`)
+          );
+
+          // Send ack
+          ws.send(JSON.stringify({
+            type: 'subtask_queue_action_result',
+            conversationId: convId,
+            action: 'release',
+            status: 'ok',
+          }));
+
+          // Process the released message as a normal chat message
+          // Re-invoke handleChatMessage with the queued text
+          const syntheticMsg = {
+            type: 'chat' as const,
+            conversationId: convId,
+            content: released.text,
+          };
+          handleChatMessage(ws, syntheticMsg as any, db, inferenceService, baseInferenceService).catch(err =>
+            console.error(`[Handler] Failed to process released queued message: ${err.message}`)
+          );
+          break;
+        }
+
+        case 'subtask_discard_queued': {
+          if (!ws.userId) { ws.close(1008, 'unauthorized'); break; }
+          const discardMsg = message as Extract<WsMessage, { type: 'subtask_discard_queued' }>;
+          const discardConvId = discardMsg.conversationId;
+
+          if (!_subAgentManager) {
+            ws.send(JSON.stringify({
+              type: 'subtask_queue_action_result',
+              conversationId: discardConvId,
+              action: 'discard',
+              status: 'no_queued',
+              message: 'Sub-agent system not available',
+            }));
+            break;
+          }
+
+          const existing = _subAgentManager.getQueuedMessage(discardConvId, ws.userId);
+          if (!existing) {
+            ws.send(JSON.stringify({
+              type: 'subtask_queue_action_result',
+              conversationId: discardConvId,
+              action: 'discard',
+              status: 'no_queued',
+              message: 'No queued message found',
+            }));
+            break;
+          }
+
+          _subAgentManager.cancelQueuedMessage(discardConvId, ws.userId);
+
+          // Persist cancel event
+          db.appendSubAgentEvent(discardConvId, 'queued_user_turn_cancelled', {
+            conversationId: discardConvId,
+            userId: ws.userId,
+            messageId: existing.messageId,
+            timestamp: Date.now(),
+          }, ws.userId).catch(err =>
+            console.error(`[Handler] Failed to persist queued_user_turn_cancelled: ${err.message}`)
+          );
+
+          ws.send(JSON.stringify({
+            type: 'subtask_queue_action_result',
+            conversationId: discardConvId,
+            action: 'discard',
+            status: 'ok',
+          }));
+          break;
+        }
+
+        case 'subtask_get_results': {
+          if (!ws.userId) { ws.close(1008, 'unauthorized'); break; }
+          const resultsMsg = message as Extract<WsMessage, { type: 'subtask_get_results' }>;
+          if (!_subAgentManager) {
+            ws.send(JSON.stringify({
+              type: 'subtask_results_snapshot',
+              groupId: resultsMsg.groupId,
+              status: 'not_found',
+              results: [],
+            }));
+            break;
+          }
+
+          const { found, results: taskResults, conversationId: resultConvId } =
+            _subAgentManager.getSubtaskResultsWithMeta(resultsMsg.groupId);
+
+          // Access control: verify user has access to this conversation
+          if (resultConvId) {
+            const conv = await db.getConversation(resultConvId, ws.userId);
+            if (!conv) {
+              ws.send(JSON.stringify({
+                type: 'subtask_results_snapshot',
+                groupId: resultsMsg.groupId,
+                status: 'not_found',
+                results: [],
+              }));
+              break;
+            }
+          }
+
+          ws.send(JSON.stringify({
+            type: 'subtask_results_snapshot',
+            groupId: resultsMsg.groupId,
+            status: found ? 'ok' : 'not_found',
+            results: taskResults.map(r => ({
+              taskId: r.taskId,
+              instruction: r.instruction,
+              state: r.state,
+              result: r.result?.slice(0, 4000) ?? null,
+              resultTruncated: (r.result?.length ?? 0) > 4000,
+              error: r.error,
+              metrics: r.metrics,
+            })),
+          }));
+          break;
+        }
+
         default:
           ws.send(JSON.stringify({ type: 'error', error: 'Unknown message type' }));
       }
     } catch (error) {
       console.error('WebSocket message error:', error);
-      ws.send(JSON.stringify({ 
-        type: 'error', 
-        error: error instanceof Error ? error.message : 'Internal server error' 
-      }));
+      safeSend(ws, {
+        type: 'error',
+        error: error instanceof Error ? error.message : 'Internal server error'
+      });
     }
   });
 
   ws.on('close', async () => {
     Logger.websocket(`WebSocket closed for user ${ws.userId}`);
-    
+
     // Unregister from room manager (removes from all rooms)
     roomManager.unregisterConnection(ws);
-    
-    // Clean up any incomplete streaming messages
-    // This is handled by the streaming service, but we should log it
+
+    // Abort active generations for this user (two-phase delete to avoid iterator invalidation)
     if (ws.userId) {
-      Logger.websocket(`User ${ws.userId} disconnected - any in-progress streams will be saved`);
+      // Phase 1: collect matching keys
+      const keysToAbort: string[] = [];
+      for (const key of activeGenerations.keys()) {
+        if (key.startsWith(`${ws.userId}:`)) {
+          keysToAbort.push(key);
+        }
+      }
+      // Phase 2: abort + delete
+      for (const key of keysToAbort) {
+        const controller = activeGenerations.get(key);
+        if (controller) controller.abort();
+        activeGenerations.delete(key);
+      }
+      if (keysToAbort.length > 0) {
+        Logger.websocket(`Cleaned up ${keysToAbort.length} active generation(s) for ${ws.userId}`);
+      }
     }
   });
 
@@ -1280,10 +1575,42 @@ async function handleChatMessage(
   if (_subAgentManager) {
     const blockingGroupId = _subAgentManager.getBlockingGroupId(message.conversationId);
     if (blockingGroupId) {
+      // Check if user already has a queued message (idempotent — resend same event)
+      const existing = _subAgentManager.getQueuedMessage(message.conversationId, ws.userId);
+      if (existing) {
+        ws.send(JSON.stringify({
+          type: 'subtask_queue_blocked',
+          groupId: existing.groupId,
+          queuedText: existing.text,
+        }));
+        return;
+      }
+      // Queue user message (per-user, per-conversation)
+      // BUG 2: Single messageId for both in-memory and persisted event
+      const queuedMessageId = uuidv4();
+      _subAgentManager.queueUserMessage({
+        messageId: queuedMessageId,
+        conversationId: message.conversationId,
+        userId: ws.userId,
+        text: message.content,
+        createdAt: Date.now(),
+        groupId: blockingGroupId,
+      });
+      // Persist to JSONL
+      db.appendSubAgentEvent(message.conversationId, 'queued_user_turn', {
+        messageId: queuedMessageId,
+        conversationId: message.conversationId,
+        userId: ws.userId,
+        text: message.content,
+        createdAt: Date.now(),
+        groupId: blockingGroupId,
+      }, ws.userId).catch(err =>
+        console.error(`[Handler] Failed to persist queued_user_turn: ${err.message}`)
+      );
       ws.send(JSON.stringify({
         type: 'subtask_queue_blocked',
         groupId: blockingGroupId,
-        message: 'Sub-agents are currently active. Use finalize_task_group to complete them first.',
+        queuedText: message.content,
       }));
       return;
     }
@@ -1408,7 +1735,7 @@ async function handleChatMessage(
   }
   
   // Get sampling branches count (default 1)
-  const samplingBranchCount = (message as any).samplingBranches || conversation.settings?.samplingBranches || 1;
+  const samplingBranchCount = Math.min((message as any).samplingBranches || conversation.settings?.samplingBranches || 1, 10);
   if (samplingBranchCount > 1) {
     console.log(`[Chat] Sampling ${samplingBranchCount} response branches in parallel`);
   }
@@ -1535,7 +1862,9 @@ async function handleChatMessage(
   
   // Build history from the parent branch and add the new user message
   const visibleHistory = buildConversationHistory(allMessages, message.parentBranchId);
-  visibleHistory.push(userMessage);
+  if (!visibleHistory.some(m => m.id === userMessage.id)) {
+    visibleHistory.push(userMessage);
+  }
   console.log('Final visible history length:', visibleHistory.length);
   
   // Filter out messages marked as hidden from AI (keep them in history for UI, but don't send to AI)
@@ -1619,12 +1948,30 @@ async function handleChatMessage(
       cliModePrompt: conversation.cliModePrompt
     });
     
+    // Notify client if replacing an existing generation
+    const existingKey = getGenerationKey(conversation.userId, conversation.id);
+    if (activeGenerations.has(existingKey)) {
+      roomManager.broadcastToRoom(conversation.id, {
+        type: 'generation_aborted',
+        conversationId: conversation.id,
+        reason: 'replaced_by_new_request',
+      });
+    }
+
     // Create abort controller for this generation
     const abortController = startGeneration(conversation.userId, conversation.id);
-    
-    // Track AI request in room manager for multi-user sync
-    roomManager.startAiRequest(message.conversationId, ws.userId!, assistantMessage.id);
-    
+
+    // Track AI request in room manager for multi-user sync (atomic check-and-set)
+    if (!roomManager.startAiRequest(message.conversationId, ws.userId!, assistantMessage.id)) {
+      endGeneration(conversation.userId, conversation.id);
+      ws.send(JSON.stringify({
+        type: 'ai_request_queued',
+        conversationId: message.conversationId,
+        reason: 'AI is already generating a response',
+      }));
+      return;
+    }
+
     let generatedBranchIds: string[];
     try {
       // Run parallel inference using shared utility
@@ -1711,26 +2058,24 @@ async function handleChatMessage(
       roomManager.endAiRequest(message.conversationId);
     }
   } catch (error) {
-    // Clean up generation tracking on error
-    endGeneration(conversation.userId, conversation.id);
-    roomManager.endAiRequest(message.conversationId);
-    
+    // Note: endGeneration + endAiRequest already called in finally block above
+
     // Check if this was an abort
     if (error instanceof Error && error.message === 'Generation aborted') {
       console.log(`[Abort] Generation was aborted for conversation ${message.conversationId}`);
-      ws.send(JSON.stringify({
+      safeSend(ws, {
         type: 'stream',
         messageId: assistantMessage.id,
         branchId: assistantMessage.activeBranchId,
         content: '',
         isComplete: true,
         aborted: true
-      }));
+      });
       return;
     }
-    
+
     console.error('Inference streaming error:', error);
-    
+
     // Parse error for user-friendly messages (using centralized error messages)
     const errorMsg = error instanceof Error ? error.message : String(error);
     let friendlyError = USER_FACING_ERRORS.GENERIC_ERROR.message;
@@ -1783,11 +2128,11 @@ async function handleChatMessage(
       suggestion = USER_FACING_ERRORS.GENERIC_ERROR.suggestion;
     }
     
-    ws.send(JSON.stringify({
+    safeSend(ws, {
       type: 'error',
       error: friendlyError,
       suggestion: suggestion || undefined
-    }));
+    });
   }
 }
 
@@ -1815,7 +2160,7 @@ async function handleRegenerate(
   }
 
   // Get sampling branches count (default 1)
-  const samplingBranchCount = (message as any).samplingBranches || conversation.settings?.samplingBranches || 1;
+  const samplingBranchCount = Math.min((message as any).samplingBranches || conversation.settings?.samplingBranches || 1, 10);
   if (samplingBranchCount > 1) {
     console.log(`[Regenerate] Sampling ${samplingBranchCount} response branches in parallel`);
   }
@@ -1996,12 +2341,29 @@ async function handleRegenerate(
       cliModePrompt: conversation.cliModePrompt
     });
     
+    // Notify client if replacing an existing generation
+    const existingKey = getGenerationKey(conversation.userId, conversation.id);
+    if (activeGenerations.has(existingKey)) {
+      roomManager.broadcastToRoom(conversation.id, {
+        type: 'generation_aborted',
+        conversationId: conversation.id,
+        reason: 'replaced_by_new_request',
+      });
+    }
+
     // Create abort controller for this generation
     const abortController = startGeneration(conversation.userId, conversation.id);
-    
-    // Track AI request in room manager for multi-user sync
-    roomManager.startAiRequest(message.conversationId, ws.userId!, updatedMessage.id);
-    
+
+    // Track AI request in room manager for multi-user sync (atomic check-and-set)
+    if (!roomManager.startAiRequest(message.conversationId, ws.userId!, updatedMessage.id)) {
+      endGeneration(conversation.userId, conversation.id);
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: 'AI is already generating a response for this conversation',
+      }));
+      return;
+    }
+
     let generatedBranchIds: string[];
     try {
       // Run parallel inference using shared utility
@@ -2106,40 +2468,39 @@ async function handleRegenerate(
       // Don't fail the whole request if debug capture fails
     }
   } catch (error) {
-    endGeneration(conversation.userId, conversation.id);
-    roomManager.endAiRequest(message.conversationId);
+    // Note: endGeneration + endAiRequest already called in finally block above
 
     // Check if this was an abort
     if (error instanceof Error && error.message === 'Generation aborted') {
       console.log(`[Abort] Regeneration was aborted for conversation ${message.conversationId}`);
       // Send abort notification for all branches on the message
       for (const branch of updatedMessage.branches) {
-        ws.send(JSON.stringify({
+        safeSend(ws, {
           type: 'stream',
           messageId: updatedMessage.id,
           branchId: branch.id,
           content: '',
           isComplete: true,
           aborted: true
-        }));
+        });
       }
       return;
     }
-    
+
     console.error('Regeneration error:', error);
     let errorMsg = error instanceof Error ? error.message : String(error);
-    
+
     // Extract meaningful error from Anthropic/API errors
     // e.g., "400 {"type":"error","error":{"message":"You have reached..."}}"
     const jsonMatch = errorMsg.match(/\{.*"message"\s*:\s*"([^"]+)"/);
     if (jsonMatch && jsonMatch[1]) {
       errorMsg = jsonMatch[1];
     }
-    
-    ws.send(JSON.stringify({
+
+    safeSend(ws, {
       type: 'error',
       error: errorMsg.length < 300 ? errorMsg : errorMsg.substring(0, 297) + '...'
-    }));
+    });
   }
 }
 
@@ -2232,7 +2593,7 @@ async function handleEdit(
   // If this was a user message, automatically generate an assistant response (unless skipped)
   if (branch.role === 'user' && !message.skipRegeneration) {
     // Get sampling branches count (default 1)
-    const samplingBranchCount = (message as any).samplingBranches || conversation.settings?.samplingBranches || 1;
+    const samplingBranchCount = Math.min((message as any).samplingBranches || conversation.settings?.samplingBranches || 1, 10);
     if (samplingBranchCount > 1) {
       console.log(`[Edit] Sampling ${samplingBranchCount} response branches in parallel`);
     }
@@ -2244,11 +2605,11 @@ async function handleEdit(
     const userContext: UserContext = { isResearcher, isAgeVerified, isAdmin };
     
     // Get all messages to find the position of the edited message
-    const allMessages = await db.getConversationMessages(msg.conversationId, ws.userId);
+    const allMessages = await db.getConversationMessages(msg.conversationId, conversation.userId);
     const editedMessageIndex = allMessages.findIndex(m => m.id === msg.id);
-    
+
     // Get participants early to determine responderId
-    const participants = await db.getConversationParticipants(conversation.id, ws.userId);
+    const participants = await db.getConversationParticipants(conversation.id, conversation.userId);
     
     // Determine which assistant should respond
     let responderId: string | undefined;
@@ -2433,12 +2794,29 @@ async function handleEdit(
         cliModePrompt: conversation.cliModePrompt
       });
       
+      // Notify client if replacing an existing generation
+      const existingKey = getGenerationKey(conversation.userId, conversation.id);
+      if (activeGenerations.has(existingKey)) {
+        roomManager.broadcastToRoom(conversation.id, {
+          type: 'generation_aborted',
+          conversationId: conversation.id,
+          reason: 'replaced_by_new_request',
+        });
+      }
+
       // Create abort controller for this generation
       const abortController = startGeneration(conversation.userId, conversation.id);
-      
-      // Track AI request in room manager for multi-user sync
-      roomManager.startAiRequest(message.conversationId, ws.userId!, targetMessage.id);
-      
+
+      // Track AI request in room manager for multi-user sync (atomic check-and-set)
+      if (!roomManager.startAiRequest(message.conversationId, ws.userId!, targetMessage.id)) {
+        endGeneration(conversation.userId, conversation.id);
+        ws.send(JSON.stringify({
+          type: 'error',
+          message: 'AI is already generating a response for this conversation',
+        }));
+        return;
+      }
+
       let generatedBranchIds: string[];
       try {
         // Run parallel inference using shared utility
@@ -2523,17 +2901,17 @@ async function handleEdit(
     } catch (error) {
       console.error('Error generating response to edited message:', error);
       let errorMsg = error instanceof Error ? error.message : String(error);
-      
+
       // Extract meaningful error from Anthropic/API errors
       const jsonMatch = errorMsg.match(/\{.*"message"\s*:\s*"([^"]+)"/);
       if (jsonMatch && jsonMatch[1]) {
         errorMsg = jsonMatch[1];
       }
-      
-      ws.send(JSON.stringify({
+
+      safeSend(ws, {
         type: 'error',
         error: errorMsg.length < 300 ? errorMsg : errorMsg.substring(0, 297) + '...'
-      }));
+      });
     }
   }
 }
@@ -2581,7 +2959,7 @@ async function handleDelete(
     }
   } catch (error) {
     console.error('Delete message error:', error);
-    ws.send(JSON.stringify({ type: 'error', error: 'Failed to delete message' }));
+    safeSend(ws, { type: 'error', error: 'Failed to delete message' });
   }
 }
 
@@ -2595,12 +2973,7 @@ async function handleContinue(
   if (!ws.userId) return;
 
   const { conversationId, messageId, parentBranchId, responderId } = message;
-  const samplingBranchCount = (message as any).samplingBranches || conversation.settings?.samplingBranches || 1;
-  
-  if (samplingBranchCount > 1) {
-    console.log(`[Continue] Sampling ${samplingBranchCount} response branches in parallel`);
-  }
-  
+
   try {
     // Verify conversation access
     const conversation = await db.getConversation(conversationId, ws.userId);
@@ -2608,7 +2981,12 @@ async function handleContinue(
       ws.send(JSON.stringify({ type: 'error', error: 'Conversation not found or access denied' }));
       return;
     }
-    
+
+    const samplingBranchCount = Math.min((message as any).samplingBranches || conversation.settings?.samplingBranches || 1, 10);
+    if (samplingBranchCount > 1) {
+      console.log(`[Continue] Sampling ${samplingBranchCount} response branches in parallel`);
+    }
+
     // Check if user can chat (owner or collaborator/editor)
     const canChat = await db.canUserChatInConversation(conversationId, ws.userId);
     if (!canChat) {
@@ -2783,12 +3161,29 @@ async function handleContinue(
       return;
     }
     
+    // Notify client if replacing an existing generation
+    const existingKey = getGenerationKey(conversation.userId, conversationId);
+    if (activeGenerations.has(existingKey)) {
+      roomManager.broadcastToRoom(conversationId, {
+        type: 'generation_aborted',
+        conversationId,
+        reason: 'replaced_by_new_request',
+      });
+    }
+
     // Create abort controller for this generation
     const abortController = startGeneration(conversation.userId, conversationId);
-    
-    // Track AI request in room manager
-    roomManager.startAiRequest(conversationId, ws.userId!, assistantMessage.id);
-    
+
+    // Track AI request in room manager (atomic check-and-set)
+    if (!roomManager.startAiRequest(conversationId, ws.userId!, assistantMessage.id)) {
+      endGeneration(conversation.userId, conversationId);
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: 'AI is already generating a response for this conversation',
+      }));
+      return;
+    }
+
     // Inference settings
     const inferenceSettings = conversation.format === 'standard'
       ? conversation.settings || { temperature: 1.0, maxTokens: 4096 }
@@ -2797,11 +3192,11 @@ async function handleContinue(
             maxTokens: responder.settings?.maxTokens ?? conversation.settings?.maxTokens ?? 4096,
             topP: responder.settings?.topP ?? conversation.settings?.topP,
             topK: responder.settings?.topK ?? conversation.settings?.topK,
-            thinking: conversation.settings?.thinking,
+            thinking: responder.settings?.thinking ?? conversation.settings?.thinking,
             // Include model-specific settings (e.g., image resolution, response modalities)
             modelSpecific: responder.settings?.modelSpecific ?? conversation.settings?.modelSpecific
         };
-    
+
     // Determine system prompt with backroom logic for early group chats
     const continueSystemPrompt = applyBackroomPromptIfNeeded({
       conversationFormat: conversation.format,
@@ -2895,36 +3290,33 @@ async function handleContinue(
     }
 
   } catch (error) {
-    if (ws.userId) {
-      endGeneration(ws.userId, conversationId);
-    }
-    roomManager.endAiRequest(conversationId);
-    
+    // Note: endGeneration + endAiRequest already called in finally block above
+
     // Check if this was an abort
     if (error instanceof Error && error.message === 'Generation aborted') {
       console.log(`[Abort] Continue generation was aborted for conversation ${conversationId}`);
       // Note: assistantMessage/assistantBranch may not be defined if error happened early
-      ws.send(JSON.stringify({
+      safeSend(ws, {
         type: 'generation_aborted',
         conversationId: conversationId,
         aborted: true
-      }));
+      });
       return;
     }
-    
+
     console.error('Continue generation error:', error);
     let errorMsg = error instanceof Error ? error.message : String(error);
-    
+
     // Extract meaningful error from Anthropic/API errors
     const jsonMatch = errorMsg.match(/\{.*"message"\s*:\s*"([^"]+)"/);
     if (jsonMatch && jsonMatch[1]) {
       errorMsg = jsonMatch[1];
     }
-    
-    ws.send(JSON.stringify({ 
-      type: 'error', 
+
+    safeSend(ws, {
+      type: 'error',
       error: errorMsg.length < 300 ? errorMsg : errorMsg.substring(0, 297) + '...'
-    }));
+    });
   }
 }
 
@@ -2932,4 +3324,4 @@ async function handleContinue(
 // Runs every 30 seconds, terminates connections that don't respond to ping
 setInterval(() => {
   roomManager.performHeartbeat();
-}, 30000);
+}, 30000).unref();

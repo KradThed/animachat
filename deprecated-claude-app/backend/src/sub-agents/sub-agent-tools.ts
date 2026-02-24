@@ -175,7 +175,7 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
         required: ['groupId'],
       },
     },
-    async (input) => {
+    async (input, context) => {
       try {
         // H6: Input validation
         const groupId = input.groupId;
@@ -183,7 +183,8 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
           return { toolUseId: '', content: 'Error: groupId must be a non-empty string', isError: true };
         }
 
-        const result = manager.pollSubtasks(groupId as string);
+        // BUG 11: Pass conversationId for ownership validation
+        const result = manager.pollSubtasks(groupId as string, context.conversationId);
 
         // Poll returns status only — no results/metrics. Use get_subtask_results for content.
         return {
@@ -226,7 +227,7 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
         required: ['groupId'],
       },
     },
-    async (input) => {
+    async (input, context) => {
       try {
         // H6: Input validation
         const groupId = input.groupId;
@@ -234,7 +235,8 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
           return { toolUseId: '', content: 'Error: groupId must be a non-empty string', isError: true };
         }
 
-        const result = manager.getSubtaskResults(groupId as string);
+        // BUG 11: Pass conversationId for ownership validation
+        const result = manager.getSubtaskResults(groupId as string, context.conversationId);
 
         return {
           toolUseId: '',
@@ -280,7 +282,7 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
         required: ['groupId'],
       },
     },
-    async (input) => {
+    async (input, context) => {
       try {
         // H6: Input validation
         const groupId = input.groupId;
@@ -288,7 +290,8 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
           return { toolUseId: '', content: 'Error: groupId must be a non-empty string', isError: true };
         }
 
-        await manager.cancelSubtasks(groupId as string);
+        // BUG 11: Pass conversationId for ownership validation
+        await manager.cancelSubtasks(groupId as string, context.conversationId);
 
         return {
           toolUseId: '',
@@ -326,7 +329,7 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
         required: ['groupId'],
       },
     },
-    async (input) => {
+    async (input, context) => {
       try {
         // H6: Input validation
         const groupId = input.groupId;
@@ -334,7 +337,8 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
           return { toolUseId: '', content: 'Error: groupId must be a non-empty string', isError: true };
         }
 
-        const result = await manager.finalizeTaskGroup(groupId as string);
+        // SA-3: Pass conversationId for ownership validation (matches poll/cancel/get_results)
+        const result = await manager.finalizeTaskGroup(groupId as string, false, context.conversationId);
 
         // C3: Handle already_finalized gracefully (AI-friendly message)
         if (result.status === 'already_finalized') {

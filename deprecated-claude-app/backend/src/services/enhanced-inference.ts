@@ -324,7 +324,11 @@ export class EnhancedInferenceService {
       onToolCall?: (call: ToolCall) => void;
       onToolResult?: (result: ToolResult) => void;
       executeToolCall?: (call: ToolCall) => Promise<ToolResult>;
-    }
+    },
+    // NOTE: Enhanced signature order is (abortSignal, toolOptions, maxToolDepth)
+    // while Base/Membrane order is (toolOptions, abortSignal, maxToolDepth).
+    // This is intentional — Enhanced wraps Base/Membrane and reorders params.
+    maxToolDepth?: number,
   ): Promise<void> {
     // If no conversation provided, fall back to original behavior
     if (!conversation) {
@@ -340,7 +344,9 @@ export class EnhancedInferenceService {
         undefined,
         undefined,
         undefined,
-        toolOptions
+        toolOptions,
+        abortSignal,
+        maxToolDepth,
       );
       return;
     }
@@ -396,9 +402,13 @@ export class EnhancedInferenceService {
     
     // Create an enhanced callback to track token usage
     const enhancedCallback = async (chunk: string, isComplete: boolean, contentBlocks?: any[], actualUsage?: any) => {
-      // Check if generation was aborted
-      if (abortSignal?.aborted) {
-        throw new Error('Generation aborted');
+      // If aborted, silently ignore remaining chunks.
+      // The AbortSignal is also passed to the Anthropic SDK (signal option),
+      // which will cleanly terminate the HTTP stream. Throwing from inside
+      // a streaming callback crashes the process because Membrane's
+      // `for await (const event of stream)` loop doesn't catch callback errors.
+      if (abortSignal?.aborted && !isComplete) {
+        return;
       }
       
       // Track output tokens (simplified - in practice would use tokenizer)
@@ -429,7 +439,12 @@ export class EnhancedInferenceService {
         }
         
         // Log metrics
-        const estimatedSaved = await this.calculateCostSaved(model, cachedTokens);
+        let estimatedSaved = 0;
+        try {
+          estimatedSaved = await this.calculateCostSaved(model, cachedTokens);
+        } catch (e) {
+          console.warn('[Pricing] Cost calculation failed, using zeros:', e);
+        }
         const metric: CacheMetrics = {
           conversationId: conversation.id,
           participantId: participant?.id,
@@ -444,7 +459,10 @@ export class EnhancedInferenceService {
         };
         
         this.metricsLog.push(metric);
-        
+        if (this.metricsLog.length > 10_000) {
+          this.metricsLog = this.metricsLog.slice(-10_000);
+        }
+
         // Note: Cache hit/miss details are logged by the provider service (Anthropic/OpenRouter)
         // which has access to the actual API response metrics. We just track expected vs actual
         // in our context manager statistics below.
@@ -463,8 +481,14 @@ export class EnhancedInferenceService {
         // Call metrics callback if provided
         if (onMetrics) {
           const endTime = Date.now();
-          const breakdown = await this.calculateCostBreakdown(model, inputTokens, outputTokens);
-          const savings = await this.calculateCostSaved(model, cachedTokens);
+          let breakdown: CostBreakdown = { inputCost: 0, outputCost: 0, totalCost: 0, inputPrice: 0, outputPrice: 0 };
+          let savings = 0;
+          try {
+            breakdown = await this.calculateCostBreakdown(model, inputTokens, outputTokens);
+            savings = await this.calculateCostSaved(model, cachedTokens);
+          } catch (e) {
+            console.warn('[Pricing] Cost calculation failed, using zeros:', e);
+          }
           await onMetrics({
             inputTokens,
             outputTokens,
@@ -551,10 +575,12 @@ export class EnhancedInferenceService {
       participant?.id,
       conversation,
       cacheMarkerIndices,  // Pass cache marker indices for Chapter II prefill caching
-      toolOptions
+      toolOptions,
+      abortSignal,
+      maxToolDepth,
     );
   }
-  
+
   private addCacheControlToMessages(window: ContextWindow, model?: Model): Message[] {
     // Use multiple cache markers if available (Anthropic supports 4)
     const markers = window.cacheMarkers || (window.cacheMarker ? [window.cacheMarker] : []);
