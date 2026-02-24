@@ -299,7 +299,8 @@ export class AnthropicService {
             inputTokens: usage.input_tokens || 0,
             outputTokens: usage.output_tokens || 0,
             cacheCreationInputTokens: cacheMetrics.cacheCreationInputTokens,
-            cacheReadInputTokens: cacheMetrics.cacheReadInputTokens
+            cacheReadInputTokens: cacheMetrics.cacheReadInputTokens,
+            stopReason,
           };
           
           // If no API thinking blocks but response contains <think> tags (prefill mode),
@@ -380,6 +381,7 @@ export class AnthropicService {
           cacheCreationInputTokens: cacheMetrics.cacheCreationInputTokens,
           cacheReadInputTokens: cacheMetrics.cacheReadInputTokens
         },
+        stopReason,
         rawRequest: {
           model: requestParams.model,
           system: requestParams.system,

@@ -2107,6 +2107,7 @@ export class Database {
       case 'push_event_processed':
       case 'push_event_rate_limited':
       case 'scope_change_resolved':
+      case 'delegate_tool_manifest':
         // Audit trail only — no in-memory state to rebuild
         break;
 

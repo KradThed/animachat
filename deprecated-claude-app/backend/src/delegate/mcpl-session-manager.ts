@@ -131,6 +131,29 @@ export class McplSessionManager {
   }
 
   /**
+   * Gap 1: Validate that a specific capability is enabled for a serverId.
+   * Returns:
+   *   'ok'              — capability is enabled, proceed
+   *   'no_session'      — no MCPL session for this delegate
+   *   'unknown_server'  — serverId not in featureSets (spec: -32003)
+   *   'disabled'        — capability exists but is false (spec: -32001)
+   */
+  validateCapability(
+    userId: string,
+    delegateId: string,
+    serverId: string,
+    capability: keyof McplFeatureSet,
+  ): 'ok' | 'no_session' | 'unknown_server' | 'disabled' {
+    const session = this.getSessionForDelegate(userId, delegateId);
+    if (!session) return 'no_session';
+
+    const fs = session.featureSets[serverId];
+    if (!fs) return 'unknown_server';
+
+    return fs[capability] ? 'ok' : 'disabled';
+  }
+
+  /**
    * Remove a session (e.g., on intentional disconnect).
    */
   removeSession(sessionId: string): void {

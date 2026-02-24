@@ -64,9 +64,21 @@ function extractConversationId(msg: Record<string, unknown>): string {
  * Send mcpl/error to delegate via transport.
  * conversationId is never included in the error message (masked).
  */
+/**
+ * MCPL error codes per JSON-RPC spec.
+ * Custom codes in -32000..-32099 range (JSON-RPC implementation-defined).
+ */
+const MCPL_ERROR_CODES = {
+  CAPABILITY_DISABLED: -32001,  // feature set capability is false
+  RATE_LIMITED:        -32002,  // rate limit exceeded
+  UNKNOWN_SERVER:      -32003,  // serverId not in featureSets
+  ACCESS_DENIED:       -32004,  // conversation access denied
+  NO_SESSION:          -32005,  // no MCPL session for this delegate
+} as const;
+
 function sendMcplError(
   transport: McplTransport,
-  code: string,
+  code: number,
   message: string,
   inReplyTo: { type: string; requestId?: string; seq?: number },
   retryAfterMs?: number,
@@ -563,7 +575,7 @@ async function handleDelegateMessage(
         const activeTransport = ws.mcplTransport || transport;
         sendMcplError(
           activeTransport,
-          'conversation_access_denied',
+          MCPL_ERROR_CODES.ACCESS_DENIED,
           'Conversation not found or access denied',  // never reveal existence
           {
             type,
@@ -590,7 +602,7 @@ async function handleDelegateMessage(
       const activeTransport = ws.mcplTransport || transport;
       sendMcplError(
         activeTransport,
-        'rate_limited',
+        MCPL_ERROR_CODES.RATE_LIMITED,
         'Rate limited',  // don't leak timing in human message
         {
           type,
@@ -606,7 +618,7 @@ async function handleDelegateMessage(
   switch (type) {
     // Legacy messages
     case 'tool_manifest':
-      handleToolManifest(ws, msg as unknown as ToolManifestMessage, userId, delegateId, sessionId);
+      handleToolManifest(ws, msg as unknown as ToolManifestMessage, userId, delegateId, sessionId, db);
       break;
 
     case 'tool_call_response':
@@ -633,21 +645,40 @@ async function handleDelegateMessage(
     case 'mcpl/beforeInference_response':
       mcplHookManager.handleBeforeInferenceResponse(
         (msg as any).requestId,
-        (msg as any).injections
+        (msg as any).injections,
+        (msg as any).abort,
+        (msg as any).abortReason,
       );
       break;
 
     case 'mcpl/afterInference_ack':
-      // Acknowledged — no action needed for MVP
+    case 'mcpl/afterInference_response':
+      // Gap 4: Blocking afterInference — delegate responds with optional modifiedResponse
+      mcplHookManager.handleAfterInferenceResponse(
+        (msg as any).requestId,
+        (msg as any).modifiedResponse
+      );
       break;
 
     case 'mcpl/push_event': {
       const pushMsg = msg as any;
-      // Validate source serverId belongs to this delegate
-      if (!mcplSessionManager.validateServerOwnership(userId, delegateId, pushMsg.source)) {
-        sendMcplError(ws.mcplTransport || transport, 'invalid_server',
-          'Server not registered for this delegate',
-          { type, requestId: pushMsg.requestId });
+      // Gap 1: Feature set enforcement — check pushEvents capability
+      const pushCheck = mcplSessionManager.validateCapability(userId, delegateId, pushMsg.source, 'pushEvents');
+      if (pushCheck !== 'ok') {
+        const activeTransport = ws.mcplTransport || transport;
+        if (pushCheck === 'unknown_server') {
+          sendMcplError(activeTransport, MCPL_ERROR_CODES.UNKNOWN_SERVER,
+            `Server "${pushMsg.source}" not registered for this delegate`,
+            { type, requestId: pushMsg.requestId });
+        } else if (pushCheck === 'disabled') {
+          sendMcplError(activeTransport, MCPL_ERROR_CODES.CAPABILITY_DISABLED,
+            `Push events disabled for server "${pushMsg.source}"`,
+            { type, requestId: pushMsg.requestId });
+        } else {
+          sendMcplError(activeTransport, MCPL_ERROR_CODES.NO_SESSION,
+            'No MCPL session',
+            { type, requestId: pushMsg.requestId });
+        }
         return;
       }
       mcplEventQueue.push({
@@ -667,11 +698,23 @@ async function handleDelegateMessage(
 
     case 'mcpl/inference_request': {
       const infMsg = msg as any;
-      // Validate serverId belongs to this delegate
-      if (!mcplSessionManager.validateServerOwnership(userId, delegateId, infMsg.serverId)) {
-        sendMcplError(ws.mcplTransport || transport, 'invalid_server',
-          'Server not registered for this delegate',
-          { type, requestId: infMsg.requestId });
+      // Gap 1: Feature set enforcement — check inferenceRequests capability
+      const infCheck = mcplSessionManager.validateCapability(userId, delegateId, infMsg.serverId, 'inferenceRequests');
+      if (infCheck !== 'ok') {
+        const activeTransport = ws.mcplTransport || transport;
+        if (infCheck === 'unknown_server') {
+          sendMcplError(activeTransport, MCPL_ERROR_CODES.UNKNOWN_SERVER,
+            `Server "${infMsg.serverId}" not registered for this delegate`,
+            { type, requestId: infMsg.requestId });
+        } else if (infCheck === 'disabled') {
+          sendMcplError(activeTransport, MCPL_ERROR_CODES.CAPABILITY_DISABLED,
+            `Inference requests disabled for server "${infMsg.serverId}"`,
+            { type, requestId: infMsg.requestId });
+        } else {
+          sendMcplError(activeTransport, MCPL_ERROR_CODES.NO_SESSION,
+            'No MCPL session',
+            { type, requestId: infMsg.requestId });
+        }
         return;
       }
       mcplInferenceBroker.handleInferenceRequest({
@@ -894,7 +937,8 @@ function handleToolManifest(
   msg: ToolManifestMessage,
   userId: string,
   delegateId: string,
-  sessionId: string
+  sessionId: string,
+  db: Database
 ): void {
   // NOTE: msg.delegateId is IGNORED — handshake delegateId is canonical.
   // Prevents delegate from "renaming" itself inside a manifest message.
@@ -903,7 +947,17 @@ function handleToolManifest(
   console.log(`[DelegateHandler] Tool manifest from "${delegateId}" (namespace: ${delegateName}): ${msg.tools.length} tools`);
 
   // Update tools in delegate manager (uses original delegateId for WS routing)
-  delegateManager.updateTools(sessionId, msg.tools as any);
+  delegateManager.updateTools(sessionId, msg.tools as any, msg.timestamp);
+
+  // Persist tool manifest snapshot to DB (fire-and-forget — don't block ack)
+  db.appendMcplUserEvent(userId, 'delegate_tool_manifest', {
+    delegateId,
+    timestamp: msg.timestamp || new Date().toISOString(),
+    toolCount: msg.tools.length,
+    tools: msg.tools.map(t => ({ name: t.name, serverName: (t as any).serverName })),
+  }).catch(err => {
+    console.error(`[DelegateHandler] Failed to persist tool manifest for "${delegateId}":`, err);
+  });
 
   // Clean old tools before registering new ones (handles re-manifest with changed tool set)
   toolRegistry.unregisterDelegateTools(userId, delegateName);
@@ -921,12 +975,35 @@ function handleToolManifest(
   // Fix #3: Register unique (delegateId, serverName, serverId) tuples with ServerRegistry.
   // Dedup to prevent spam when manifest has many tools from same server.
   const registeredServers = new Set<string>();
+  const uniqueServerIds: string[] = [];
   for (const t of toolsWithServerId) {
     const serverName = (t as any).serverName || '_default';
     const key = `${delegateId}:${serverName}:${t.serverId}`;
     if (!registeredServers.has(key)) {
       registeredServers.add(key);
       serverRegistry.register(delegateId, serverName, t.serverId);
+      uniqueServerIds.push(t.serverId);
+    }
+  }
+
+  // Gap 7: Populate initial featureSets when MCPL session exists but featureSets is empty.
+  // Without this, validateServerOwnership() rejects all MCPL ops (push, inference) until
+  // delegate explicitly sends featureSets_changed — creating a dead window after manifest.
+  // Default: all capabilities enabled. Delegate can restrict later via featureSets_changed.
+  if (ws.mcplSessionId && uniqueServerIds.length > 0) {
+    const session = mcplSessionManager.getSession(ws.mcplSessionId);
+    if (session && Object.keys(session.featureSets).length === 0) {
+      const initialFeatureSets: Record<string, McplFeatureSet> = {};
+      for (const serverId of uniqueServerIds) {
+        initialFeatureSets[serverId] = {
+          contextHooks: true,
+          pushEvents: true,
+          inferenceRequests: true,
+          toolManagement: true,
+        };
+      }
+      mcplSessionManager.updateFeatureSets(ws.mcplSessionId, initialFeatureSets);
+      console.log(`[DelegateHandler] Initial featureSets populated for "${delegateId}": ${uniqueServerIds.length} server(s)`);
     }
   }
 

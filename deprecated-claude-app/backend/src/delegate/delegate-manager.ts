@@ -18,11 +18,18 @@ import { roomManager } from '../websocket/room-manager.js';
 // Types
 // =============================================================================
 
+export interface ToolManifestSnapshot {
+  timestamp: string;
+  toolCount: number;
+  tools: Array<{ name: string; serverName?: string }>;
+}
+
 export interface ConnectedDelegate {
   delegateId: string;
   userId: string;
   ws: WebSocket;
   tools: ToolDefinition[];
+  toolHistory: ToolManifestSnapshot[];
   capabilities: string[];
   connectedAt: Date;
   sessionId: string;
@@ -90,6 +97,7 @@ export class DelegateManager {
       userId,
       ws,
       tools: [],
+      toolHistory: [],
       capabilities,
       connectedAt: new Date(),
       sessionId,
@@ -153,7 +161,7 @@ export class DelegateManager {
   /**
    * Update the tool manifest for a delegate.
    */
-  updateTools(sessionId: string, tools: ToolDefinition[]): void {
+  updateTools(sessionId: string, tools: ToolDefinition[], timestamp?: string): void {
     const delegate = this.delegates.get(sessionId);
     if (!delegate) {
       console.warn(`[DelegateManager] Cannot update tools: session ${sessionId} not found`);
@@ -161,7 +169,16 @@ export class DelegateManager {
     }
 
     delegate.tools = tools;
-    console.log(`[DelegateManager] Delegate "${delegate.delegateId}" updated tools: ${tools.map(t => t.name).join(', ')}`);
+
+    // Append snapshot to in-memory history
+    const snapshot: ToolManifestSnapshot = {
+      timestamp: timestamp || new Date().toISOString(),
+      toolCount: tools.length,
+      tools: tools.map(t => ({ name: t.name, serverName: (t as any).serverName })),
+    };
+    delegate.toolHistory.push(snapshot);
+
+    console.log(`[DelegateManager] Delegate "${delegate.delegateId}" updated tools: ${tools.map(t => t.name).join(', ')} (snapshot #${delegate.toolHistory.length})`);
 
     // Notify user about tools update
     this.notifyDelegateStatusChange(delegate.userId, 'tools_updated', delegate);

@@ -41,6 +41,7 @@ export const ToolManifestMessageSchema = z.object({
   type: z.literal('tool_manifest'),
   delegateId: z.string(),
   tools: z.array(ToolDefinitionSchema),
+  timestamp: z.string().optional(),
 });
 
 export const ToolCallResponseMessageSchema = z.object({

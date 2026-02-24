@@ -39,9 +39,24 @@ interface RegisteredHookServer {
   serverIds: string[];         // which serverIds support context_hooks (may contain wildcards)
 }
 
+/** Per-server response from beforeInference (internal) */
+interface ServerBeforeInferenceResult {
+  injections: McplContextInjection[];
+  abort?: boolean;
+  abortReason?: string;
+}
+
+/** Aggregated result from beforeInference (public) */
+export interface BeforeInferenceResult {
+  injections: McplContextInjection[];
+  abort: boolean;
+  abortReason?: string;
+  abortServerId?: string;  // which server requested abort (for logging/UI)
+}
+
 interface PendingHookRequest {
   requestId: string;
-  resolve: (injections: McplContextInjection[]) => void;
+  resolve: (result: ServerBeforeInferenceResult) => void;
   timeout: ReturnType<typeof setTimeout>;
 }
 
@@ -52,6 +67,10 @@ export interface InferenceHookContext {
   taskId?: string;    // sub-agent only
   groupId?: string;   // sub-agent only
   instruction?: string; // sub-agent task instruction
+  // Gap 6: additional context per MCPL spec
+  inferenceId?: string;   // unique ID for this inference run
+  turnIndex?: number;     // conversation turn number
+  model?: string;         // model ID being used
 }
 
 // =============================================================================
@@ -172,37 +191,62 @@ export class McplHookManager {
     messagesSummary?: string,
     hookDepth = 0,
     context?: InferenceHookContext,
-  ): Promise<McplContextInjection[]> {
+  ): Promise<BeforeInferenceResult> {
+    const noAbort: BeforeInferenceResult = { injections: [], abort: false };
+
     // Sync loop prevention: stop at max depth
     if (hookDepth >= McplHookManager.MAX_HOOK_DEPTH) {
       console.warn(`[McplHookManager] Max hook depth (${McplHookManager.MAX_HOOK_DEPTH}) reached for ${conversationId}, skipping hooks`);
-      return [];
+      return noAbort;
     }
 
     const servers = this.getServersForUser(userId);
-    if (servers.length === 0) return [];
+    if (servers.length === 0) return noAbort;
 
     const hookContext = context ?? { conversationId, userId, isSubAgent: false };
     const allInjections: McplContextInjection[] = [];
 
+    // Sort servers by delegateId for deterministic abort priority (first abort wins)
+    const sortedServers = [...servers].sort((a, b) => a.delegateId.localeCompare(b.delegateId));
+
     // Parallel requests to all hook servers with timeout + per-server rate limit
     const results = await Promise.allSettled(
-      servers.map(server => this.requestBeforeInference(server, conversationId, messagesSummary, hookContext))
+      sortedServers.map(server => this.requestBeforeInference(server, conversationId, messagesSummary, hookContext))
     );
+
+    // Gap 3: track first abort (deterministic — sorted by delegateId)
+    let abortResult: { abortReason?: string; abortServerId: string } | undefined;
 
     for (let i = 0; i < results.length; i++) {
       const result = results[i];
       if (result.status === 'fulfilled') {
-        allInjections.push(...result.value);
+        allInjections.push(...result.value.injections);
+        // First abort wins (servers sorted by delegateId)
+        if (!abortResult && result.value.abort) {
+          abortResult = {
+            abortReason: result.value.abortReason,
+            abortServerId: sortedServers[i].delegateId,
+          };
+        }
       } else {
-        console.warn(`[McplHookManager] beforeInference failed for ${servers[i].delegateId}:`, result.reason);
+        // Timeout/error → no abort (never block inference on failure)
+        console.warn(`[McplHookManager] beforeInference failed for ${sortedServers[i].delegateId}:`, result.reason);
       }
     }
 
     // CRITICAL: sort by serverId for deterministic ordering
     allInjections.sort((a, b) => a.serverId.localeCompare(b.serverId));
 
-    return allInjections;
+    if (abortResult) {
+      console.warn(`[McplHookManager] Inference abort requested by ${abortResult.abortServerId}: ${abortResult.abortReason ?? '(no reason)'}`);
+    }
+
+    return {
+      injections: allInjections,
+      abort: !!abortResult,
+      abortReason: abortResult?.abortReason,
+      abortServerId: abortResult?.abortServerId,
+    };
   }
 
   /**
@@ -214,24 +258,26 @@ export class McplHookManager {
     conversationId: string,
     messagesSummary?: string,
     context?: InferenceHookContext,
-  ): Promise<McplContextInjection[]> {
+  ): Promise<ServerBeforeInferenceResult> {
+    const empty: ServerBeforeInferenceResult = { injections: [] };
+
     if (!server.transport.isOpen) {
-      return Promise.resolve([]);
+      return Promise.resolve(empty);
     }
 
     // Per-server rate limit check (async loop prevention)
     if (!this.checkRateLimit(server.delegateId)) {
       console.warn(`[McplHookManager] Rate limited: ${server.delegateId} exceeded ${this.getDelegateRateLimit(server.delegateId)}/min`);
-      return Promise.resolve([]);
+      return Promise.resolve(empty);
     }
 
     const requestId = randomUUID();
 
-    return new Promise<McplContextInjection[]>((resolve) => {
+    return new Promise<ServerBeforeInferenceResult>((resolve) => {
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(requestId);
         console.warn(`[McplHookManager] beforeInference timed out for ${server.delegateId} (${this.config.beforeInferenceTimeoutMs}ms)`);
-        resolve([]); // Skip on timeout — never block inference
+        resolve(empty); // Skip on timeout — never block inference
       }, this.config.beforeInferenceTimeoutMs);
 
       this.pendingRequests.set(requestId, { requestId, resolve, timeout });
@@ -248,7 +294,7 @@ export class McplHookManager {
         clearTimeout(timeout);
         this.pendingRequests.delete(requestId);
         console.warn(`[McplHookManager] Failed to send beforeInference to ${server.delegateId}:`, err);
-        resolve([]);
+        resolve(empty);
       }
     });
   }
@@ -256,48 +302,114 @@ export class McplHookManager {
   /**
    * Handle a beforeInference response from a delegate.
    */
-  handleBeforeInferenceResponse(requestId: string, injections: McplContextInjection[]): void {
+  handleBeforeInferenceResponse(
+    requestId: string,
+    injections: McplContextInjection[],
+    abort?: boolean,
+    abortReason?: string,
+  ): void {
     const pending = this.pendingRequests.get(requestId);
     if (!pending) return;
 
     clearTimeout(pending.timeout);
     this.pendingRequests.delete(requestId);
-    pending.resolve(injections);
+    pending.resolve({ injections, abort, abortReason });
   }
 
   // --------------------------------------------------------------------------
   // After Inference
   // --------------------------------------------------------------------------
 
+  /** Pending afterInference requests keyed by requestId */
+  private pendingAfterRequests: Map<string, {
+    resolve: (modifiedResponse?: string) => void;
+    timeout: ReturnType<typeof setTimeout>;
+  }> = new Map();
+
   /**
    * Notify all registered hook servers after inference completes.
-   * Fire-and-forget for MVP — we don't wait for responses.
+   * Blocking with timeout — waits for responses that may contain modifiedResponse.
+   * If any server returns modifiedResponse, the FIRST one wins (sorted by serverId for determinism).
+   * Timeout → skip that server (never block response delivery).
    */
   async afterInference(
     userId: string,
     conversationId: string,
     responseSummary?: string,
     context?: InferenceHookContext,
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     const servers = this.getServersForUser(userId);
-    if (servers.length === 0) return;
+    if (servers.length === 0) return undefined;
 
-    for (const server of servers) {
-      if (!server.transport.isOpen) continue;
+    // Sort by delegateId for deterministic ordering (first modifiedResponse wins)
+    const sorted = [...servers].sort((a, b) => a.delegateId.localeCompare(b.delegateId));
 
-      const requestId = randomUUID();  // per-server requestId
+    const results = await Promise.allSettled(
+      sorted.map(server => this.requestAfterInference(server, conversationId, responseSummary, context))
+    );
+
+    // Return first modifiedResponse found (deterministic order due to sort)
+    for (const result of results) {
+      if (result.status === 'fulfilled' && result.value !== undefined) {
+        return result.value;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Request afterInference from a single server with timeout.
+   * Returns modifiedResponse if server provides one, undefined otherwise.
+   */
+  private requestAfterInference(
+    server: RegisteredHookServer,
+    conversationId: string,
+    responseSummary?: string,
+    context?: InferenceHookContext,
+  ): Promise<string | undefined> {
+    if (!server.transport.isOpen) {
+      return Promise.resolve(undefined);
+    }
+
+    const requestId = randomUUID();
+
+    return new Promise<string | undefined>((resolve) => {
+      const timeout = setTimeout(() => {
+        this.pendingAfterRequests.delete(requestId);
+        console.warn(`[McplHookManager] afterInference timed out for ${server.delegateId} (${this.config.afterInferenceTimeoutMs}ms)`);
+        resolve(undefined); // Skip on timeout — never block response delivery
+      }, this.config.afterInferenceTimeoutMs);
+
+      this.pendingAfterRequests.set(requestId, { resolve, timeout });
+
       try {
         server.transport.send({
           type: 'mcpl/afterInference',
           requestId,
           conversationId,
           responseSummary,
-          context: context ?? { conversationId, userId, isSubAgent: false },
+          context: context ?? { conversationId, userId: server.userId, isSubAgent: false },
         });
       } catch (err) {
+        clearTimeout(timeout);
+        this.pendingAfterRequests.delete(requestId);
         console.warn(`[McplHookManager] Failed to send afterInference to ${server.delegateId}:`, err);
+        resolve(undefined);
       }
-    }
+    });
+  }
+
+  /**
+   * Handle an afterInference response from a delegate.
+   * Replaces the old mcpl/afterInference_ack handler — now supports modifiedResponse.
+   */
+  handleAfterInferenceResponse(requestId: string, modifiedResponse?: string): void {
+    const pending = this.pendingAfterRequests.get(requestId);
+    if (!pending) return;
+
+    clearTimeout(pending.timeout);
+    this.pendingAfterRequests.delete(requestId);
+    pending.resolve(modifiedResponse);
   }
 
   // --------------------------------------------------------------------------
@@ -314,10 +426,11 @@ export class McplHookManager {
     return result;
   }
 
-  getStats(): { registeredServers: number; pendingRequests: number } {
+  getStats(): { registeredServers: number; pendingRequests: number; pendingAfterRequests: number } {
     return {
       registeredServers: this.servers.size,
       pendingRequests: this.pendingRequests.size,
+      pendingAfterRequests: this.pendingAfterRequests.size,
     };
   }
 

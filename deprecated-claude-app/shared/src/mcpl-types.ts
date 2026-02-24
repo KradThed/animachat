@@ -60,6 +60,14 @@ export interface McplBeforeInferenceRequest {
   requestId: string;
   conversationId: string;
   messagesSummary?: string;      // optional summary for context-aware injections
+  context?: {                    // Gap 6: additional context per MCPL spec
+    conversationId: string;
+    userId: string;
+    isSubAgent: boolean;
+    inferenceId?: string;        // unique ID for this inference run
+    turnIndex?: number;          // conversation turn number
+    model?: string;              // model ID being used for inference
+  };
 }
 
 /** Delegate → Server: injections from a server */
@@ -67,13 +75,23 @@ export interface McplBeforeInferenceResponse {
   type: 'mcpl/beforeInference_response';
   requestId: string;
   injections: McplContextInjection[];
+  abort?: boolean;        // Gap 3: if true, host should NOT run inference
+  abortReason?: string;   // Gap 3: human-readable reason for abort
+}
+
+/** Content block for multimodal injections (Gap 5) */
+export interface McplContentBlock {
+  type: 'text' | 'image';
+  text?: string;               // for type: 'text'
+  data?: string;               // base64 for type: 'image'
+  mimeType?: string;           // e.g. 'image/png' for type: 'image'
 }
 
 /** A single context injection from an MCPL server */
 export interface McplContextInjection {
   serverId: string;
   position: 'system' | 'beforeUser' | 'afterUser';
-  content: string;
+  content: string | McplContentBlock[];  // Gap 5: string (text-only) or array of content blocks (multimodal)
 }
 
 /** Server → Delegate: notify after inference completes */
@@ -84,10 +102,17 @@ export interface McplAfterInferenceNotify {
   responseSummary?: string;      // optional summary of the response
 }
 
-/** Delegate → Server: acknowledgement */
+/** Delegate → Server: acknowledgement (legacy, kept for backward compat) */
 export interface McplAfterInferenceAck {
   type: 'mcpl/afterInference_ack';
   requestId: string;
+}
+
+/** Delegate → Server: afterInference response (Gap 4: blocking with optional modification) */
+export interface McplAfterInferenceResponse {
+  type: 'mcpl/afterInference_response';
+  requestId: string;
+  modifiedResponse?: string;  // if set, host should use this instead of original response
 }
 
 // =============================================================================
@@ -162,6 +187,13 @@ export interface McplInferenceResponse {
   success: boolean;
   content?: string;            // full text (for non-streaming, or verification for streaming)
   error?: string;
+  // Gap 2: MCPL spec requires model metadata in inference responses
+  model?: string;              // model ID used for inference (e.g. "claude-sonnet-4-20250514")
+  finishReason?: 'end_turn' | 'max_tokens' | 'error';  // why inference stopped
+  usage?: {                    // token usage counters
+    inputTokens: number;
+    outputTokens: number;
+  };
 }
 
 /** Server → Delegate: streaming inference chunk (Phase 7 — Batch 5).

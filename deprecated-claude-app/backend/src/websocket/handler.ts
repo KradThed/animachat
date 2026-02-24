@@ -556,49 +556,77 @@ function applyUserMessageInjections(
   // Determine injection path: contentBlocks wins if both exist
   const hasContentBlocks = Array.isArray(activeBranch.contentBlocks) && activeBranch.contentBlocks.length > 0;
 
-  if (hasContentBlocks) {
-    // Block-aware path: inject as new { type: 'text', text: ... } blocks
-    // Schema invariant: verify text block shape is valid
-    const makeTextBlock = (inj: McplContextInjection): { type: 'text'; text: string } | null => {
-      const block = { type: 'text' as const, text: `[Context from ${inj.serverId}]\n${inj.content}` };
-      // Runtime type guard — text block must have type 'text' and text: string
-      if (typeof block.type !== 'string' || typeof block.text !== 'string') {
-        console.error('[ParallelInference] injection_block_schema_mismatch: invalid text block shape');
-        return null;
+  // Gap 5: Helper to convert injection content to content blocks.
+  // Handles both string (text-only) and McplContentBlock[] (multimodal) content.
+  const injectionToBlocks = (inj: McplContextInjection): Array<{ type: string; text?: string; source?: any }> => {
+    if (typeof inj.content === 'string') {
+      return [{ type: 'text', text: `[Context from ${inj.serverId}]\n${inj.content}` }];
+    }
+    // Multimodal: array of content blocks
+    const blocks: Array<{ type: string; text?: string; source?: any }> = [];
+    // Prepend server label as text block
+    blocks.push({ type: 'text', text: `[Context from ${inj.serverId}]` });
+    for (const cb of inj.content) {
+      if (cb.type === 'text' && cb.text) {
+        blocks.push({ type: 'text', text: cb.text });
+      } else if (cb.type === 'image' && cb.data && cb.mimeType) {
+        blocks.push({
+          type: 'image',
+          source: { type: 'base64', media_type: cb.mimeType, data: cb.data },
+        });
       }
-      return block;
-    };
+    }
+    return blocks;
+  };
+
+  // Helper: extract text representation for string-only path
+  const injectionToString = (inj: McplContextInjection): string => {
+    if (typeof inj.content === 'string') {
+      return `[Context from ${inj.serverId}]\n${inj.content}`;
+    }
+    // Multimodal: extract text blocks only (images can't be injected into plain string)
+    const texts = inj.content
+      .filter(cb => cb.type === 'text' && cb.text)
+      .map(cb => cb.text!);
+    return `[Context from ${inj.serverId}]\n${texts.join('\n')}`;
+  };
+
+  if (hasContentBlocks) {
+    // Block-aware path: inject as content blocks (supports multimodal)
 
     // beforeUser: unshift (trailing \n\n separator prevents "sticking" to user content)
     for (let i = budgetedBefore.length - 1; i >= 0; i--) {
-      const block = makeTextBlock(budgetedBefore[i]);
-      if (block) {
-        block.text = block.text + '\n\n';
-        activeBranch.contentBlocks.unshift(block);
+      const blocks = injectionToBlocks(budgetedBefore[i]);
+      // Add trailing separator to last block
+      const lastBlock = blocks[blocks.length - 1];
+      if (lastBlock?.type === 'text' && lastBlock.text) {
+        lastBlock.text = lastBlock.text + '\n\n';
       }
+      activeBranch.contentBlocks.unshift(...blocks);
     }
 
     // afterUser: push (leading \n\n separator)
     for (const inj of budgetedAfter) {
-      const block = makeTextBlock(inj);
-      if (block) {
-        block.text = '\n\n' + block.text;
-        activeBranch.contentBlocks.push(block);
+      const blocks = injectionToBlocks(inj);
+      // Add leading separator to first block
+      const firstBlock = blocks[0];
+      if (firstBlock?.type === 'text' && firstBlock.text) {
+        firstBlock.text = '\n\n' + firstBlock.text;
       }
+      activeBranch.contentBlocks.push(...blocks);
     }
   } else {
-    // String-only path: modify content directly
+    // String-only path: modify content directly (images downgraded to text)
     let content = activeBranch.content || '';
 
     // beforeUser: prepend
     for (let i = budgetedBefore.length - 1; i >= 0; i--) {
-      const inj = budgetedBefore[i];
-      content = `[Context from ${inj.serverId}]\n${inj.content}\n\n${content}`;
+      content = `${injectionToString(budgetedBefore[i])}\n\n${content}`;
     }
 
     // afterUser: append
     for (const inj of budgetedAfter) {
-      content = `${content}\n\n[Context from ${inj.serverId}]\n${inj.content}`;
+      content = `${content}\n\n${injectionToString(inj)}`;
     }
 
     activeBranch.content = content;
@@ -705,15 +733,32 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
     conversationId,
     userId: conversation.userId,
     isSubAgent: false,
+    // Gap 6: additional context per MCPL spec
+    inferenceId: initialBranchId,  // unique per inference run (branch ID)
+    turnIndex: historyMessages.length,
+    model,
   };
   try {
-    const injections = await mcplHookManager.beforeInference(
+    const hookResult = await mcplHookManager.beforeInference(
       conversation.userId,
       conversationId,
       undefined,  // messagesSummary
       0,          // hookDepth: top-level inference (user message or push event)
       parentContext,
     );
+
+    // Gap 3: abort — MCP server can block inference (content moderation, compliance, etc.)
+    if (hookResult.abort) {
+      const reason = hookResult.abortReason || 'Inference blocked by MCP server';
+      console.warn(`[ParallelInference] Inference aborted by ${hookResult.abortServerId}: ${reason}`);
+      ws.send(JSON.stringify({
+        type: 'error',
+        error: `Inference blocked: ${reason}`,
+      }));
+      return [];
+    }
+
+    const injections = hookResult.injections;
     if (injections.length > 0) {
       // Place injections by position (already sorted by serverId)
       const systemInjections = injections.filter(i => i.position === 'system').map(i => i.content);

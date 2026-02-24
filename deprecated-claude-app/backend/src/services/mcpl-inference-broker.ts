@@ -43,6 +43,14 @@ interface PendingInferenceRequest {
   timestamp: number;
 }
 
+/** Structured result from executeInference for Gap 2 compliance */
+interface InferenceResult {
+  content: string;
+  model: string;
+  finishReason: 'end_turn' | 'max_tokens' | 'error';
+  usage: { inputTokens: number; outputTokens: number };
+}
+
 // =============================================================================
 // McplInferenceBroker
 // =============================================================================
@@ -194,7 +202,7 @@ export class McplInferenceBroker {
           }
         : undefined;
 
-      const response = await this.executeInference({
+      const result = await this.executeInference({
         ...params,
         serverId: params.serverId,
         delegateId: params.delegateId,
@@ -212,15 +220,18 @@ export class McplInferenceBroker {
         }).catch(err => console.warn('[McplInferenceBroker] Failed to persist:', err));
       }
 
-      // inference_response serves as completion signal for both streaming and non-streaming
+      // Gap 2: inference_response with model, finishReason, usage per MCPL spec
       this.sendResponse(transport, {
         type: 'mcpl/inference_response',
         requestId,
         success: true,
-        content: response,
+        content: result.content,
+        model: result.model,
+        finishReason: result.finishReason,
+        usage: result.usage,
       });
 
-      console.log(`[McplInferenceBroker] Completed inference ${requestId} (${response.length} chars${params.stream ? `, ${chunkIndex} chunks` : ''})`);
+      console.log(`[McplInferenceBroker] Completed inference ${requestId} (${result.content.length} chars${params.stream ? `, ${chunkIndex} chunks` : ''}, model: ${result.model})`);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       console.error(`[McplInferenceBroker] Inference failed ${requestId}:`, errorMsg);
@@ -255,7 +266,7 @@ export class McplInferenceBroker {
     delegateId?: string;
     featureSet?: string;
     onChunk?: (delta: string) => void;
-  }): Promise<string> {
+  }): Promise<InferenceResult> {
     if (!this.db) throw new Error('Database not set');
 
     const { conversationId, systemMessage, userMessage, maxTokens, userId } = params;
@@ -299,6 +310,9 @@ export class McplInferenceBroker {
       maxTokens: maxTokens || this.config.defaultMaxTokens,
     };
 
+    // Gap 2: Capture metrics from onMetrics callback for inference_response
+    let capturedMetrics: { inputTokens: number; outputTokens: number; model: string; stopReason?: string } | null = null;
+
     // Get participants
     const participants = await this.db.getConversationParticipants(conversationId, userId);
     const responder = participants.find(p => p.type === 'assistant');
@@ -318,16 +332,43 @@ export class McplInferenceBroker {
       },
       conversation,
       responder,
-      undefined,  // onMetrics
+      async (metrics: any) => {
+        // Gap 2: Capture usage metrics + stopReason for inference_response
+        capturedMetrics = {
+          inputTokens: metrics.inputTokens ?? 0,
+          outputTokens: metrics.outputTokens ?? 0,
+          model: metrics.model ?? modelId,
+          stopReason: metrics.stopReason,
+        };
+      },
       participants
     );
 
-    return fullResponse;
+    return {
+      content: fullResponse,
+      model: capturedMetrics?.model ?? modelId,
+      finishReason: this.mapStopReason(capturedMetrics?.stopReason),
+      usage: {
+        inputTokens: capturedMetrics?.inputTokens ?? 0,
+        outputTokens: capturedMetrics?.outputTokens ?? 0,
+      },
+    };
   }
 
   // --------------------------------------------------------------------------
   // Helpers
   // --------------------------------------------------------------------------
+
+  /**
+   * Map provider stopReason to MCPL finishReason.
+   * Anthropic: 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use'
+   */
+  private mapStopReason(stopReason?: string): 'end_turn' | 'max_tokens' | 'error' {
+    if (stopReason === 'max_tokens') return 'max_tokens';
+    if (stopReason === 'end_turn' || stopReason === 'stop_sequence' || stopReason === 'tool_use') return 'end_turn';
+    // No stopReason or unknown → default to end_turn (success path)
+    return 'end_turn';
+  }
 
   private sendResponse(transport: McplTransport, message: Record<string, unknown>): void {
     if (transport.isOpen) {

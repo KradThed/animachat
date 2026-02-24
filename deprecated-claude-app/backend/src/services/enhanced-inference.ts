@@ -501,7 +501,9 @@ export class EnhancedInferenceService {
             details: this.buildUsageDetails(breakdown, inputTokens, outputTokens, cachedTokens),
             // Pass through failure info if present (for failed request tracking)
             ...(actualUsage?.failed && { failed: true }),
-            ...(actualUsage?.error && { error: actualUsage.error })
+            ...(actualUsage?.error && { error: actualUsage.error }),
+            // Pass through stopReason from provider (for MCPL finishReason)
+            ...(actualUsage?.stopReason && { stopReason: actualUsage.stopReason }),
           });
         }
       }
