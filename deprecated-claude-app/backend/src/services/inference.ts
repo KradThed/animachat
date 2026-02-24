@@ -32,7 +32,8 @@ export class InferenceService {
     this.modelLoader = ModelLoader.getInstance();
     this.bedrockService = new BedrockService(db);
     this.anthropicService = new AnthropicService(db);
-    this.contextManager = new ContextManager({}, db);
+    this.contextManager = ContextManager.getInstance();
+    this.contextManager.setDatabase(db);
   }
 
   /**

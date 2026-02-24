@@ -10,6 +10,7 @@ import { migrateDatabase } from './migration.js'
 import { EventStore, Event } from './persistence.js';
 import { BulkEventStore } from './bulk-event-store.js';
 import { ModelLoader } from '../config/model-loader.js';
+import { ContextManager } from '../services/context-manager.js';
 import { SharesStore, SharedConversation } from './shares.js';
 import { getBlobStore } from './blob-store.js';
 import { CollaborationStore } from './collaboration.js';
@@ -688,6 +689,28 @@ export class Database {
     }
 
     this.conversationsLastAccessedTimes.delete(conversationId);
+
+    // INF-4: Clear ContextManager state for this conversation (singleton holds states/strategies Maps)
+    ContextManager.getInstance().clearState(conversationId);
+  }
+
+  /**
+   * INF-4+5: Evict conversations not accessed within `maxAgeMs`.
+   * Caller provides `isActive` predicate to protect conversations with in-flight inference.
+   * Returns the number of evicted conversations.
+   */
+  evictStaleConversations(maxAgeMs: number, isActive: (conversationId: string) => boolean): number {
+    const now = Date.now();
+    const toEvict: string[] = [];
+    for (const [conversationId, lastAccess] of this.conversationsLastAccessedTimes) {
+      if (now - lastAccess.getTime() > maxAgeMs && !isActive(conversationId)) {
+        toEvict.push(conversationId);
+      }
+    }
+    for (const id of toEvict) {
+      this.unloadConversation(id);
+    }
+    return toEvict.length;
   }
 
   private unloadUser(userId: string) {

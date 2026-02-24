@@ -219,7 +219,7 @@ class TriggerHandler {
 
     // 9. Create inference service (same pattern as websocket handler)
     const baseInferenceService = new MembraneInferenceService(db);
-    const contextManager = new ContextManager();
+    const contextManager = ContextManager.getInstance();
     const inferenceService = new EnhancedInferenceService(baseInferenceService, contextManager);
 
     // 10. Build tool options (delegate tools available to this user)

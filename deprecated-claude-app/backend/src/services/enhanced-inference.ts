@@ -304,7 +304,7 @@ export class EnhancedInferenceService {
     contextManager?: ContextManager
   ) {
     this.inferenceService = inferenceService;
-    this.contextManager = contextManager || new ContextManager();
+    this.contextManager = contextManager || ContextManager.getInstance();
   }
   
   async streamCompletion(

@@ -34,10 +34,34 @@ export interface ContextManagerConfig {
 }
 
 export class ContextManager {
+  private static instance: ContextManager;
+
   private strategies: Map<string, ContextStrategy>;
   private states: Map<string, ContextState>; // key is conversationId or conversationId:participantId
   private config: ContextManagerConfig;
   private personaContextBuilder?: PersonaContextBuilder;
+
+  // INF-4: Singleton — all production code should use getInstance().
+  // Constructor stays public for tests.
+  static getInstance(): ContextManager {
+    if (!ContextManager.instance) {
+      ContextManager.instance = new ContextManager();
+    }
+    return ContextManager.instance;
+  }
+
+  /** Reset the singleton (for tests only). */
+  static resetInstance(): void {
+    ContextManager.instance = undefined as any;
+  }
+
+  // Deferred db injection (follows ModelLoader.setDatabase pattern).
+  // PersonaContextBuilder is initialized once on first call with a valid db.
+  setDatabase(db: Database): void {
+    if (!this.personaContextBuilder && db) {
+      this.personaContextBuilder = new PersonaContextBuilder(db);
+    }
+  }
 
   constructor(config: Partial<ContextManagerConfig> = {}, db?: Database) {
     this.config = {

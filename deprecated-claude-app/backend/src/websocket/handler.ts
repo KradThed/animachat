@@ -88,6 +88,28 @@ function abortGeneration(userId: string, conversationId: string): boolean {
   return false;
 }
 
+const EVICTION_INTERVAL_MS = 5 * 60 * 1000; // check every 5 minutes
+const EVICTION_MAX_AGE_MS = 30 * 60 * 1000; // evict after 30 min idle
+
+/**
+ * INF-4+5: Periodically evict conversations not accessed within EVICTION_MAX_AGE_MS.
+ * Conversations with active inference are protected.
+ */
+export function startEvictionTimer(db: Database): NodeJS.Timeout {
+  return setInterval(() => {
+    const evicted = db.evictStaleConversations(EVICTION_MAX_AGE_MS, (conversationId) => {
+      // Protect conversations with in-flight inference
+      for (const key of activeGenerations.keys()) {
+        if (key.endsWith(`:${conversationId}`)) return true;
+      }
+      return false;
+    });
+    if (evicted > 0) {
+      console.log(`[Eviction] Unloaded ${evicted} stale conversation(s)`);
+    }
+  }, EVICTION_INTERVAL_MS);
+}
+
 function safeSend(ws: AuthenticatedWebSocket, data: any): void {
   try {
     if (ws.readyState === WebSocket.OPEN) {
@@ -1006,7 +1028,7 @@ export function websocketHandler(ws: AuthenticatedWebSocket, req: IncomingMessag
 
   // Use MembraneInferenceService for native tool support
   const baseInferenceService = new MembraneInferenceService(db);
-  const contextManager = new ContextManager();
+  const contextManager = ContextManager.getInstance();
   const inferenceService = new EnhancedInferenceService(baseInferenceService, contextManager);
 
   ws.on('message', async (data) => {
@@ -2402,7 +2424,7 @@ async function handleRegenerate(
       const rawRequest = baseInferenceService.lastRawRequest;
       console.log(`[DEBUG CAPTURE] Raw request available: ${!!rawRequest}`);
 
-      if (rawRequest) {
+      if (rawRequest && generatedBranchIds.length > 0) {
         // Store debug data on the first regenerated branch
         const firstBranchId = generatedBranchIds[0];
         const currentBranch = updatedMessage.branches.find(b => b.id === firstBranchId);
@@ -2854,7 +2876,7 @@ async function handleEdit(
         const rawRequest = baseInferenceService.lastRawRequest;
         console.log(`[DEBUG CAPTURE] Raw request available for edit: ${!!rawRequest}`);
 
-        if (rawRequest && targetMessage) {
+        if (rawRequest && targetMessage && generatedBranchIds.length > 0) {
           const firstBranchId = generatedBranchIds[0];
           const currentBranch = targetMessage.branches.find(b => b.id === firstBranchId);
           if (currentBranch) {

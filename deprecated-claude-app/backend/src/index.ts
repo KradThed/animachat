@@ -32,7 +32,7 @@ import blobRouter from './routes/blobs.js';
 import siteConfigRouter from './routes/site-config.js';
 import { toolsRouter } from './routes/tools.js';
 import { delegatesRouter } from './routes/delegates.js';
-import { websocketHandler } from './websocket/handler.js';
+import { websocketHandler, startEvictionTimer } from './websocket/handler.js';
 // Import server tools for side-effect registration
 import './tools/server-tools.js';
 import { Database } from './database/index.js';
@@ -193,6 +193,9 @@ wss.on('connection', (ws, req) => {
   websocketHandler(ws, req, db);
 });
 
+// INF-4+5: Periodically evict idle conversations to prevent memory leaks
+startEvictionTimer(db);
+
 // Start server
 async function startServer() {
   try {
@@ -272,7 +275,8 @@ async function startServer() {
     const { MembraneInferenceService } = await import('./services/membrane-inference.js');
     const { ContextManager } = await import('./services/context-manager.js');
     const baseInference = new MembraneInferenceService(db);
-    const contextManager = new ContextManager();
+    const contextManager = ContextManager.getInstance();
+    contextManager.setDatabase(db);
     const enhancedInference = new EnhancedInferenceService(baseInference, contextManager);
     const llmClient = new LLMClientAdapter(enhancedInference);
 

@@ -283,7 +283,7 @@ export class McplInferenceBroker {
 
     // Create inference service
     const baseInferenceService = new MembraneInferenceService(this.db);
-    const contextManager = new ContextManager();
+    const contextManager = ContextManager.getInstance();
     const inferenceService = new EnhancedInferenceService(baseInferenceService, contextManager);
 
     // Get conversation messages for context
