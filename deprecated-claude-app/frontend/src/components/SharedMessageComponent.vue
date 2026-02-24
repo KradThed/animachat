@@ -105,7 +105,9 @@ const emit = defineEmits<{
 }>();
 
 const currentBranchIndex = computed(() => {
-  return props.message.branches.findIndex((b: any) => b.id === props.message.activeBranchId) || 0;
+  // F-3: findIndex returns -1 (truthy) when not found, so || 0 never triggers
+  const idx = props.message.branches.findIndex((b: any) => b.id === props.message.activeBranchId);
+  return idx >= 0 ? idx : 0;
 });
 
 const currentBranch = computed(() => {

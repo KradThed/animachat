@@ -2296,340 +2296,27 @@ onMounted(async () => {
   // Set up WebSocket listeners for streaming after a small delay
   nextTick(() => {
     if (store.state.wsService) {
-      store.state.wsService.on('message_created', (data: any) => {
-        // A new message was created, start tracking streaming
-        if (data.message && data.message.branches?.length > 0) {
-          const lastBranch = data.message.branches[data.message.branches.length - 1];
-          if (lastBranch.role === 'assistant') {
-            streamingMessageId.value = data.message.id;
-            streamingBranchId.value = lastBranch.id; // Track which branch is streaming
-            isStreaming.value = true;
-            autoScrollEnabled.value = true; // Re-enable auto-scroll for new messages
-            streamingError.value = null; // Clear any previous errors
-            startStuckDetection(); // Start tracking for stuck generation
-          }
-          
-          // Update the conversation's updatedAt timestamp to move it to the top
-          if (currentConversation.value) {
-            const conv = store.state.conversations.find(c => c.id === currentConversation.value!.id);
-            if (conv) {
-              conv.updatedAt = new Date();
-              console.log(`[WebSocket] Updated conversation ${conv.id} timestamp for sorting`);
-            }
-          }
-        }
-      });
-      
-      store.state.wsService.on('message_edited', (data: any) => {
-        // A message was edited (e.g., regenerate adds a new branch)
-        // Check if a new empty assistant branch was added - this means regeneration started
-        if (data.message && data.message.branches?.length > 0) {
-          const activeBranch = data.message.branches.find((b: any) => b.id === data.message.activeBranchId);
-          // If the active branch is an assistant with empty/minimal content, streaming is starting
-          // BUT: Don't re-enter streaming mode if:
-          // 1. We're already streaming for this exact message, OR
-          // 2. This branch ID was recently streamed (completed within last 30 seconds)
-          // This prevents race conditions with fast completions and DEBUG CAPTURE updates
-          const alreadyStreamingThisMessage = isStreaming.value && streamingMessageId.value === data.message.id;
-          const recentlyCompletedBranch = lastCompletedBranchId.value === data.message.activeBranchId && 
-            lastCompletedTime.value && (Date.now() - lastCompletedTime.value < 30000);
-          
-          if (!alreadyStreamingThisMessage && !recentlyCompletedBranch && 
-              activeBranch && activeBranch.role === 'assistant' && 
-              (!activeBranch.content || activeBranch.content.length < 10)) {
-            streamingMessageId.value = data.message.id;
-            streamingBranchId.value = data.message.activeBranchId;
-            isStreaming.value = true;
-            autoScrollEnabled.value = true;
-            streamingError.value = null;
-            startStuckDetection(); // Start tracking for stuck generation
-            console.log('[WebSocket] Regenerate detected - starting streaming for message:', data.message.id.slice(0, 8));
-          }
-        }
-      });
-      
-      store.state.wsService.on('stream', (data: any) => {
-        // Streaming content update - track which branch is being streamed
-        // This helps us know whether to auto-scroll (only if visible branch is streaming)
-        if (data.messageId && data.branchId) {
-          // Check if this is the active (visible) branch of the message
-          const message = store.state.allMessages.find(m => m.id === data.messageId);
-          const isActiveBranch = message && message.activeBranchId === data.branchId;
-          
-          // Track token arrival for stuck detection (only for tracked message)
-          if (data.messageId === streamingMessageId.value && (data.content || data.contentBlocks)) {
-            onTokenReceived();
-          }
-          
-          if (data.isComplete || data.aborted) {
-            // This branch finished streaming
-            // Track this completed branch to prevent re-triggering from DEBUG CAPTURE updates
-            if (data.branchId) {
-              lastCompletedBranchId.value = data.branchId;
-              lastCompletedTime.value = Date.now();
-            }
-            // Clear tracking if this was the tracked branch (whether active or not)
-            if (data.branchId === streamingBranchId.value) {
-              streamingBranchId.value = null;
-              isStreaming.value = false;
-              streamingMessageId.value = null;
-              clearStuckDetection();
-            }
-            if (data.aborted) {
-              console.log('Generation was aborted');
-            }
-          } else {
-            // Still streaming - only track if this is the active (visible) branch
-            if (isActiveBranch) {
-              streamingMessageId.value = data.messageId;
-              streamingBranchId.value = data.branchId;
-              isStreaming.value = true;
-            }
-          }
-        }
-      });
-      
-      // Handle generation_aborted event (for cases where messageId might not match)
-      store.state.wsService.on('generation_aborted', (data: any) => {
-        console.log('Generation aborted for conversation:', data.conversationId);
-        if (data.conversationId === currentConversation.value?.id) {
-          isStreaming.value = false;
-          streamingMessageId.value = null;
-          streamingBranchId.value = null;
-          clearStuckDetection();
-        }
-      });
-      
-      // Listen for conversation updates (e.g., title changes, settings)
-      store.state.wsService.on('conversation_updated', (data: any) => {
-        console.log('[WebSocket] Conversation updated:', data);
-        
-        const conv = store.state.conversations.find(c => c.id === data.id);
-        if (conv && data.updates) {
-          // Update the conversation with new data
-          Object.assign(conv, data.updates);
-          
-          // If updatedAt is included, ensure it's a Date object
-          if (data.updates.updatedAt) {
-            conv.updatedAt = new Date(data.updates.updatedAt);
-          }
-        }
-      });
-      
-      // Listen for participant updates
-      store.state.wsService.on('participant_created', (data: any) => {
-        console.log('[WebSocket] Participant created:', data);
-        
-        // Invalidate cache for the conversation
-        if (data.participant?.conversationId) {
-          participantCache.invalidate(data.participant.conversationId);
-          
-          // Update embedded summary in conversation list
-          const conv = conversations.value.find(c => c.id === data.participant.conversationId);
-          if (conv && data.participant.type === 'assistant' && data.participant.model) {
-            const models = (conv as any).participantModels || [];
-            if (!models.includes(data.participant.model)) {
-              models.push(data.participant.model);
-              (conv as any).participantModels = models;
-            }
-          }
-          
-          // Reload if it's the current conversation
-          if (currentConversation.value?.id === data.participant.conversationId) {
-            loadParticipants();
-          }
-        }
-      });
-      
-      store.state.wsService.on('participant_updated', (data: any) => {
-        console.log('[WebSocket] Participant updated:', data);
-        
-        // Invalidate cache for the conversation
-        const participantId = data.participantId;
-        const participant = participants.value.find(p => p.id === participantId);
-        if (participant) {
-          participantCache.invalidate(participant.conversationId);
-          
-          // Update embedded summary if model changed
-          if (data.updates?.model) {
-            const conv = conversations.value.find(c => c.id === participant.conversationId);
-            if (conv && conv.format === 'prefill') {
-              // Rebuild the model list
-              const updatedParticipants = participants.value.map(p => 
-                p.id === participantId ? { ...p, ...data.updates } : p
-              );
-              (conv as any).participantModels = updatedParticipants
-                .filter(p => p.type === 'assistant' && p.isActive)
-                .map(p => p.model)
-                .filter(Boolean);
-            }
-          }
-          
-          // Reload if it's the current conversation
-          if (currentConversation.value?.id === participant.conversationId) {
-            loadParticipants();
-          }
-        }
-      });
-      
-      store.state.wsService.on('participant_deleted', (data: any) => {
-        console.log('[WebSocket] Participant deleted:', data);
-        
-        // Find the conversation this participant belonged to
-        const participant = participants.value.find(p => p.id === data.participantId);
-        if (participant) {
-          participantCache.invalidate(participant.conversationId);
-          
-          // Update embedded summary
-          const conv = conversations.value.find(c => c.id === participant.conversationId);
-          if (conv && conv.format === 'prefill') {
-            const remainingParticipants = participants.value
-              .filter(p => p.id !== data.participantId && p.type === 'assistant' && p.isActive);
-            (conv as any).participantModels = remainingParticipants
-              .map(p => p.model)
-              .filter(Boolean);
-          }
-          
-          // Reload if it's the current conversation
-          if (currentConversation.value?.id === participant.conversationId) {
-            loadParticipants();
-          }
-        }
-      });
-      
-      store.state.wsService.on('error', (data: any) => {
-        // Handle streaming errors
-        console.error('WebSocket error:', data);
-        
-        // If we're currently streaming, mark it as failed on the message
-        if (isStreaming.value && streamingMessageId.value) {
-          streamingError.value = {
-            messageId: streamingMessageId.value,
-            error: data.error || 'Failed to generate response',
-            suggestion: data.suggestion
-          };
-          isStreaming.value = false;
-          // Don't clear streamingMessageId so we can show the error on the right message
-        } else {
-          // Not streaming - show error in snackbar (e.g., pricing validation failed)
-          errorSnackbarMessage.value = data.error || 'An error occurred';
-          errorSnackbarDetails.value = data.details || data.suggestion || '';
-          errorSnackbar.value = true;
-        }
-      });
-      
-      store.state.wsService.on('content_blocked', (data: any) => {
-        // Content was blocked by moderation - show informative dialog
-        console.warn('Content blocked by moderation:', data);
-        contentBlockedData.value = data;
-        contentBlockedDialog.value = true;
-      });
-      
-      // Multi-user room events
-      store.state.wsService.on('room_joined', (data: any) => {
-        console.log('[Room] Joined room:', data.conversationId);
-        roomUsers.value = data.activeUsers || [];
-        activeAiRequest.value = data.activeAiRequest || null;
-      });
-      
-      store.state.wsService.on('user_joined', (data: any) => {
-        console.log('[Room] User joined:', data.userId);
-        roomUsers.value = data.activeUsers || [];
-      });
-      
-      store.state.wsService.on('user_left', (data: any) => {
-        console.log('[Room] User left:', data.userId);
-        roomUsers.value = data.activeUsers || [];
-        typingUsers.value.delete(data.userId);
-      });
-      
-      store.state.wsService.on('user_typing', (data: any) => {
-        if (data.conversationId === currentConversation.value?.id) {
-          if (data.isTyping) {
-            typingUsers.value.set(data.userId, data.userName || 'Someone');
-          } else {
-            typingUsers.value.delete(data.userId);
-          }
-        }
-      });
-      
-      store.state.wsService.on('ai_generating', (data: any) => {
-        console.log('[Room] AI generating for:', data.conversationId, 'by user:', data.userId);
-        if (data.conversationId === currentConversation.value?.id) {
-          activeAiRequest.value = { userId: data.userId, messageId: data.messageId };
-          // If we're tracking streaming, update our state
-          if (data.userId !== store.state.user?.id) {
-            // Another user triggered the AI - we should see their message
-            streamingMessageId.value = data.messageId;
-            isStreaming.value = true;
-            autoScrollEnabled.value = true;
-          }
-        }
-      });
-      
-      store.state.wsService.on('ai_finished', (data: any) => {
-        console.log('[Room] AI finished for:', data.conversationId);
-        if (data.conversationId === currentConversation.value?.id) {
-          activeAiRequest.value = null;
-          isAiRequestQueued.value = false;
-          // Also clear streaming state - this is a backup in case stream complete event was missed
-          if (isStreaming.value) {
-            console.log('[Room] Clearing streaming state from ai_finished event');
-            isStreaming.value = false;
-            streamingMessageId.value = null;
-            streamingBranchId.value = null;
-          }
-        }
-      });
-      
-      store.state.wsService.on('ai_request_queued', (data: any) => {
-        console.log('[Room] AI request queued:', data.reason);
-        if (data.conversationId === currentConversation.value?.id) {
-          isAiRequestQueued.value = true;
-        }
-      });
-
-      // MCPL scope change approval requests
-      store.state.wsService.on('mcpl/scope_change_approval_needed', (data: any) => {
-        if (data.conversationId && data.conversationId !== currentConversation.value?.id) return;
-        pendingScopeChanges.value.push({
-          requestId: data.requestId,
-          conversationId: data.conversationId || '',
-          delegateId: data.delegateId,
-          delegateName: data.delegateName || data.delegateId,
-          servers: data.requestedCapabilities?.servers || [],
-          timeout: data.timeout || 300,
-          receivedAt: Date.now(),
-        });
-      });
-
-      // MCPL scope elevate approval requests
-      store.state.wsService.on('mcpl/scope_elevate_approval_needed', (data: any) => {
-        if (data.conversationId && data.conversationId !== currentConversation.value?.id) return;
-        pendingScopeElevates.value.push({
-          requestId: data.requestId,
-          conversationId: data.conversationId || '',
-          delegateId: data.delegateId,
-          delegateName: data.delegateName || data.delegateId,
-          featureSet: data.featureSet,
-          label: data.label,
-          requestedCapabilities: data.requestedCapabilities || [],
-          reason: data.reason || '',
-          timeout: data.timeout || 60,
-          receivedAt: Date.now(),
-        });
-      });
-
-      // MCPL queue updates
-      store.state.wsService.on('mcpl/queue_update', (data: any) => {
-        if (data.conversationId === currentConversation.value?.id) {
-          mcplQueueState.value = {
-            items: data.queue || [],
-            totalCount: data.totalCount || 0,
-            isPaused: data.isPaused || false,
-          };
-        }
-      });
+      // F-1: Use named handler references for proper .off() cleanup
+      store.state.wsService.on('message_created', handleWsMessageCreated);
+      store.state.wsService.on('message_edited', handleWsMessageEdited);
+      store.state.wsService.on('stream', handleWsStream);
+      store.state.wsService.on('generation_aborted', handleWsGenerationAborted);
+      store.state.wsService.on('conversation_updated', handleWsConversationUpdated);
+      store.state.wsService.on('participant_created', handleWsParticipantCreated);
+      store.state.wsService.on('participant_updated', handleWsParticipantUpdated);
+      store.state.wsService.on('participant_deleted', handleWsParticipantDeleted);
+      store.state.wsService.on('error', handleWsError);
+      store.state.wsService.on('content_blocked', handleWsContentBlocked);
+      store.state.wsService.on('room_joined', handleWsRoomJoined);
+      store.state.wsService.on('user_joined', handleWsUserJoined);
+      store.state.wsService.on('user_left', handleWsUserLeft);
+      store.state.wsService.on('user_typing', handleWsUserTyping);
+      store.state.wsService.on('ai_generating', handleWsAiGenerating);
+      store.state.wsService.on('ai_finished', handleWsAiFinished);
+      store.state.wsService.on('ai_request_queued', handleWsAiRequestQueued);
+      store.state.wsService.on('mcpl/scope_change_approval_needed', handleWsScopeChangeApproval);
+      store.state.wsService.on('mcpl/scope_elevate_approval_needed', handleWsScopeElevateApproval);
+      store.state.wsService.on('mcpl/queue_update', handleWsQueueUpdate);
 
       // Sub-agent WS listeners
       store.state.wsService.on('subtask_status_changed', handleSubtaskStatusChanged);
@@ -2764,6 +2451,285 @@ async function reloadMessages(conversationId: string) {
       pendingMessagesReload = false;
       void reloadMessages(conversationId);
     }
+  }
+}
+
+// F-1: Named WS handler functions for proper .off() cleanup in onBeforeUnmount
+function handleWsMessageCreated(data: any) {
+  if (data.message && data.message.branches?.length > 0) {
+    const lastBranch = data.message.branches[data.message.branches.length - 1];
+    if (lastBranch.role === 'assistant') {
+      streamingMessageId.value = data.message.id;
+      streamingBranchId.value = lastBranch.id;
+      isStreaming.value = true;
+      autoScrollEnabled.value = true;
+      streamingError.value = null;
+      startStuckDetection();
+    }
+    if (currentConversation.value) {
+      const conv = store.state.conversations.find(c => c.id === currentConversation.value!.id);
+      if (conv) {
+        conv.updatedAt = new Date();
+        console.log(`[WebSocket] Updated conversation ${conv.id} timestamp for sorting`);
+      }
+    }
+  }
+}
+
+function handleWsMessageEdited(data: any) {
+  if (data.message && data.message.branches?.length > 0) {
+    const activeBranch = data.message.branches.find((b: any) => b.id === data.message.activeBranchId);
+    const alreadyStreamingThisMessage = isStreaming.value && streamingMessageId.value === data.message.id;
+    const recentlyCompletedBranch = lastCompletedBranchId.value === data.message.activeBranchId &&
+      lastCompletedTime.value && (Date.now() - lastCompletedTime.value < 30000);
+
+    if (!alreadyStreamingThisMessage && !recentlyCompletedBranch &&
+        activeBranch && activeBranch.role === 'assistant' &&
+        (!activeBranch.content || activeBranch.content.length < 10)) {
+      streamingMessageId.value = data.message.id;
+      streamingBranchId.value = data.message.activeBranchId;
+      isStreaming.value = true;
+      autoScrollEnabled.value = true;
+      streamingError.value = null;
+      startStuckDetection();
+      console.log('[WebSocket] Regenerate detected - starting streaming for message:', data.message.id.slice(0, 8));
+    }
+  }
+}
+
+function handleWsStream(data: any) {
+  if (data.messageId && data.branchId) {
+    const message = store.state.allMessages.find(m => m.id === data.messageId);
+    const isActiveBranch = message && message.activeBranchId === data.branchId;
+
+    if (data.messageId === streamingMessageId.value && (data.content || data.contentBlocks)) {
+      onTokenReceived();
+    }
+
+    if (data.isComplete || data.aborted) {
+      if (data.branchId) {
+        lastCompletedBranchId.value = data.branchId;
+        lastCompletedTime.value = Date.now();
+      }
+      if (data.branchId === streamingBranchId.value) {
+        streamingBranchId.value = null;
+        isStreaming.value = false;
+        streamingMessageId.value = null;
+        clearStuckDetection();
+      }
+      if (data.aborted) {
+        console.log('Generation was aborted');
+      }
+    } else {
+      if (isActiveBranch) {
+        streamingMessageId.value = data.messageId;
+        streamingBranchId.value = data.branchId;
+        isStreaming.value = true;
+      }
+    }
+  }
+}
+
+function handleWsGenerationAborted(data: any) {
+  console.log('Generation aborted for conversation:', data.conversationId);
+  if (data.conversationId === currentConversation.value?.id) {
+    isStreaming.value = false;
+    streamingMessageId.value = null;
+    streamingBranchId.value = null;
+    clearStuckDetection();
+  }
+}
+
+function handleWsConversationUpdated(data: any) {
+  console.log('[WebSocket] Conversation updated:', data);
+  const conv = store.state.conversations.find(c => c.id === data.id);
+  if (conv && data.updates) {
+    Object.assign(conv, data.updates);
+    if (data.updates.updatedAt) {
+      conv.updatedAt = new Date(data.updates.updatedAt);
+    }
+  }
+}
+
+function handleWsParticipantCreated(data: any) {
+  console.log('[WebSocket] Participant created:', data);
+  if (data.participant?.conversationId) {
+    participantCache.invalidate(data.participant.conversationId);
+    const conv = conversations.value.find(c => c.id === data.participant.conversationId);
+    if (conv && data.participant.type === 'assistant' && data.participant.model) {
+      const models = (conv as any).participantModels || [];
+      if (!models.includes(data.participant.model)) {
+        models.push(data.participant.model);
+        (conv as any).participantModels = models;
+      }
+    }
+    if (currentConversation.value?.id === data.participant.conversationId) {
+      loadParticipants();
+    }
+  }
+}
+
+function handleWsParticipantUpdated(data: any) {
+  console.log('[WebSocket] Participant updated:', data);
+  const participantId = data.participantId;
+  const participant = participants.value.find(p => p.id === participantId);
+  if (participant) {
+    participantCache.invalidate(participant.conversationId);
+    if (data.updates?.model) {
+      const conv = conversations.value.find(c => c.id === participant.conversationId);
+      if (conv && conv.format === 'prefill') {
+        const updatedParticipants = participants.value.map(p =>
+          p.id === participantId ? { ...p, ...data.updates } : p
+        );
+        (conv as any).participantModels = updatedParticipants
+          .filter(p => p.type === 'assistant' && p.isActive)
+          .map(p => p.model)
+          .filter(Boolean);
+      }
+    }
+    if (currentConversation.value?.id === participant.conversationId) {
+      loadParticipants();
+    }
+  }
+}
+
+function handleWsParticipantDeleted(data: any) {
+  console.log('[WebSocket] Participant deleted:', data);
+  const participant = participants.value.find(p => p.id === data.participantId);
+  if (participant) {
+    participantCache.invalidate(participant.conversationId);
+    const conv = conversations.value.find(c => c.id === participant.conversationId);
+    if (conv && conv.format === 'prefill') {
+      const remainingParticipants = participants.value
+        .filter(p => p.id !== data.participantId && p.type === 'assistant' && p.isActive);
+      (conv as any).participantModels = remainingParticipants
+        .map(p => p.model)
+        .filter(Boolean);
+    }
+    if (currentConversation.value?.id === participant.conversationId) {
+      loadParticipants();
+    }
+  }
+}
+
+function handleWsError(data: any) {
+  console.error('WebSocket error:', data);
+  if (isStreaming.value && streamingMessageId.value) {
+    streamingError.value = {
+      messageId: streamingMessageId.value,
+      error: data.error || 'Failed to generate response',
+      suggestion: data.suggestion
+    };
+    isStreaming.value = false;
+  } else {
+    errorSnackbarMessage.value = data.error || 'An error occurred';
+    errorSnackbarDetails.value = data.details || data.suggestion || '';
+    errorSnackbar.value = true;
+  }
+}
+
+function handleWsContentBlocked(data: any) {
+  console.warn('Content blocked by moderation:', data);
+  contentBlockedData.value = data;
+  contentBlockedDialog.value = true;
+}
+
+function handleWsRoomJoined(data: any) {
+  console.log('[Room] Joined room:', data.conversationId);
+  roomUsers.value = data.activeUsers || [];
+  activeAiRequest.value = data.activeAiRequest || null;
+}
+
+function handleWsUserJoined(data: any) {
+  console.log('[Room] User joined:', data.userId);
+  roomUsers.value = data.activeUsers || [];
+}
+
+function handleWsUserLeft(data: any) {
+  console.log('[Room] User left:', data.userId);
+  roomUsers.value = data.activeUsers || [];
+  typingUsers.value.delete(data.userId);
+}
+
+function handleWsUserTyping(data: any) {
+  if (data.conversationId === currentConversation.value?.id) {
+    if (data.isTyping) {
+      typingUsers.value.set(data.userId, data.userName || 'Someone');
+    } else {
+      typingUsers.value.delete(data.userId);
+    }
+  }
+}
+
+function handleWsAiGenerating(data: any) {
+  console.log('[Room] AI generating for:', data.conversationId, 'by user:', data.userId);
+  if (data.conversationId === currentConversation.value?.id) {
+    activeAiRequest.value = { userId: data.userId, messageId: data.messageId };
+    if (data.userId !== store.state.user?.id) {
+      streamingMessageId.value = data.messageId;
+      isStreaming.value = true;
+      autoScrollEnabled.value = true;
+    }
+  }
+}
+
+function handleWsAiFinished(data: any) {
+  console.log('[Room] AI finished for:', data.conversationId);
+  if (data.conversationId === currentConversation.value?.id) {
+    activeAiRequest.value = null;
+    isAiRequestQueued.value = false;
+    if (isStreaming.value) {
+      console.log('[Room] Clearing streaming state from ai_finished event');
+      isStreaming.value = false;
+      streamingMessageId.value = null;
+      streamingBranchId.value = null;
+    }
+  }
+}
+
+function handleWsAiRequestQueued(data: any) {
+  console.log('[Room] AI request queued:', data.reason);
+  if (data.conversationId === currentConversation.value?.id) {
+    isAiRequestQueued.value = true;
+  }
+}
+
+function handleWsScopeChangeApproval(data: any) {
+  if (data.conversationId && data.conversationId !== currentConversation.value?.id) return;
+  pendingScopeChanges.value.push({
+    requestId: data.requestId,
+    conversationId: data.conversationId || '',
+    delegateId: data.delegateId,
+    delegateName: data.delegateName || data.delegateId,
+    servers: data.requestedCapabilities?.servers || [],
+    timeout: data.timeout || 300,
+    receivedAt: Date.now(),
+  });
+}
+
+function handleWsScopeElevateApproval(data: any) {
+  if (data.conversationId && data.conversationId !== currentConversation.value?.id) return;
+  pendingScopeElevates.value.push({
+    requestId: data.requestId,
+    conversationId: data.conversationId || '',
+    delegateId: data.delegateId,
+    delegateName: data.delegateName || data.delegateId,
+    featureSet: data.featureSet,
+    label: data.label,
+    requestedCapabilities: data.requestedCapabilities || [],
+    reason: data.reason || '',
+    timeout: data.timeout || 60,
+    receivedAt: Date.now(),
+  });
+}
+
+function handleWsQueueUpdate(data: any) {
+  if (data.conversationId === currentConversation.value?.id) {
+    mcplQueueState.value = {
+      items: data.queue || [],
+      totalCount: data.totalCount || 0,
+      isPaused: data.isPaused || false,
+    };
   }
 }
 
@@ -2946,8 +2912,28 @@ onBeforeUnmount(() => {
     store.state.wsService.leaveRoom(currentConversation.value.id);
   }
 
-  // Unregister checkpoint broadcast listener
+  // F-1: Unregister ALL WS listeners to prevent memory leaks
   if (store.state.wsService) {
+    store.state.wsService.off('message_created', handleWsMessageCreated);
+    store.state.wsService.off('message_edited', handleWsMessageEdited);
+    store.state.wsService.off('stream', handleWsStream);
+    store.state.wsService.off('generation_aborted', handleWsGenerationAborted);
+    store.state.wsService.off('conversation_updated', handleWsConversationUpdated);
+    store.state.wsService.off('participant_created', handleWsParticipantCreated);
+    store.state.wsService.off('participant_updated', handleWsParticipantUpdated);
+    store.state.wsService.off('participant_deleted', handleWsParticipantDeleted);
+    store.state.wsService.off('error', handleWsError);
+    store.state.wsService.off('content_blocked', handleWsContentBlocked);
+    store.state.wsService.off('room_joined', handleWsRoomJoined);
+    store.state.wsService.off('user_joined', handleWsUserJoined);
+    store.state.wsService.off('user_left', handleWsUserLeft);
+    store.state.wsService.off('user_typing', handleWsUserTyping);
+    store.state.wsService.off('ai_generating', handleWsAiGenerating);
+    store.state.wsService.off('ai_finished', handleWsAiFinished);
+    store.state.wsService.off('ai_request_queued', handleWsAiRequestQueued);
+    store.state.wsService.off('mcpl/scope_change_approval_needed', handleWsScopeChangeApproval);
+    store.state.wsService.off('mcpl/scope_elevate_approval_needed', handleWsScopeElevateApproval);
+    store.state.wsService.off('mcpl/queue_update', handleWsQueueUpdate);
     store.state.wsService.off('checkpoint_rolled_back', handleCheckpointBroadcast);
     // Sub-agent WS listener cleanup
     store.state.wsService.off('subtask_status_changed', handleSubtaskStatusChanged);
@@ -3121,40 +3107,31 @@ watch(messages, () => {
   }
 }, { deep: true });
 
-// Set up scroll sync for breadcrumb navigation and auto-scroll detection
+// F-2: Set up scroll sync with proper cleanup to prevent listener leaks
 let scrollTimeout: number;
 let userScrollCooldown: number;
-watch(messagesContainer, (container) => {
+watch(messagesContainer, (container, _old, onCleanup) => {
   if (container) {
-    // Vuetify components expose their DOM element via $el
     const element = (container as any).$el || container;
 
     if (element && element.addEventListener) {
       const handleScroll = () => {
-        // Ignore programmatic scrolls for user interaction tracking
-        // But still allow them to sync breadcrumbs
         if (!isProgrammaticScroll.value) {
-          // Mark that user scrolled recently - prevents auto-scroll from fighting
           userScrolledRecently.value = true;
           clearTimeout(userScrollCooldown);
           userScrollCooldown = window.setTimeout(() => {
             userScrolledRecently.value = false;
-          }, 300); // Wait 300ms after last scroll before allowing auto-scroll
-          
-          // Check scroll position and update autoScrollEnabled
-          // This allows user to scroll up to disable auto-scroll at any time
+          }, 300);
+
           const scrollBottom = element.scrollHeight - element.scrollTop - element.clientHeight;
-          // If user has scrolled up more than a small threshold, disable auto-scroll
           if (scrollBottom > 50) {
             autoScrollEnabled.value = false;
           }
-          // If user scrolls back near the bottom, re-enable (only for user scrolls)
           else if (scrollBottom <= 10) {
             autoScrollEnabled.value = true;
           }
         }
-        
-        // Debounce the sync to avoid too many calls
+
         clearTimeout(scrollTimeout);
         scrollTimeout = window.setTimeout(() => {
           syncBreadcrumbScroll();
@@ -3162,13 +3139,14 @@ watch(messagesContainer, (container) => {
       };
 
       element.addEventListener('scroll', handleScroll);
+      onCleanup(() => element.removeEventListener('scroll', handleScroll));
     }
   }
 });
 
-// Track when user is manually scrolling bookmarks to prevent sync
+// F-2: Track bookmark scrolling with proper cleanup
 let userScrollTimeout: number;
-watch(bookmarksScrollRef, (scrollEl) => {
+watch(bookmarksScrollRef, (scrollEl, _old, onCleanup) => {
   if (scrollEl) {
     const handleBookmarkScroll = () => {
       isUserScrollingBookmarks.value = true;
@@ -3179,6 +3157,7 @@ watch(bookmarksScrollRef, (scrollEl) => {
     };
 
     scrollEl.addEventListener('scroll', handleBookmarkScroll);
+    onCleanup(() => scrollEl.removeEventListener('scroll', handleBookmarkScroll));
   }
 });
 
