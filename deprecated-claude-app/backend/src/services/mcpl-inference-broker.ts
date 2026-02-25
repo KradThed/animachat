@@ -311,7 +311,9 @@ export class McplInferenceBroker {
     };
 
     // Gap 2: Capture metrics from onMetrics callback for inference_response
-    let capturedMetrics: { inputTokens: number; outputTokens: number; model: string; stopReason?: string } | null = null;
+    // NOTE: `as` type assertion needed because TS control flow can't track
+    // mutations via async callbacks (assigned inside onMetrics closure).
+    let capturedMetrics = null as { inputTokens: number; outputTokens: number; model: string; stopReason?: string } | null;
 
     // Get participants
     const participants = await this.db.getConversationParticipants(conversationId, userId);

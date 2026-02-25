@@ -176,24 +176,57 @@ class TriggerHandler {
     });
 
     // 7. Get conversation messages for context
-    const messages = await db.getConversationMessages(msg.conversationId, userId);
+    let messages = await db.getConversationMessages(msg.conversationId, userId);
 
     // 7.5. Phase 7: MCPL beforeInference hooks — depth 0 (push event = top-level chain)
-    let mcplInjectedPrompt = '';
+    let mcplSystemInjection = '';
     try {
-      const injections = await mcplHookManager.beforeInference(
+      const hookResult = await mcplHookManager.beforeInference(
         userId,
         msg.conversationId!,
         undefined,  // messagesSummary
         0,          // hookDepth: top-level inference
       );
+      if (hookResult.abort) {
+        console.warn(`[TriggerHandler] MCPL beforeInference aborted: ${hookResult.abortReason ?? 'no reason'}`);
+        return {
+          type: 'trigger_inference_result' as const,
+          triggerId: msg.triggerId,
+          success: false,
+          error: `MCPL beforeInference aborted: ${hookResult.abortReason ?? 'no reason'}`,
+        };
+      }
+      const injections = hookResult.injections;
       if (injections.length > 0) {
-        // system injections
+        // system injections → system prompt
         const systemParts = injections.filter(i => i.position === 'system').map(i => i.content);
-        // beforeUser/afterUser — append to system prompt (same as handler.ts MVP approach)
-        const beforeUserParts = injections.filter(i => i.position === 'beforeUser').map(i => i.content);
-        const afterUserParts = injections.filter(i => i.position === 'afterUser').map(i => i.content);
-        mcplInjectedPrompt = [...systemParts, ...beforeUserParts, ...afterUserParts].join('\n');
+        if (systemParts.length > 0) {
+          mcplSystemInjection = systemParts.join('\n');
+        }
+        // beforeUser/afterUser → inject into last user message content
+        // (same pattern as inference-runner.ts — don't flatten into system prompt)
+        const beforeUser = injections.filter(i => i.position === 'beforeUser').map(i => i.content);
+        const afterUser = injections.filter(i => i.position === 'afterUser').map(i => i.content);
+        if ((beforeUser.length > 0 || afterUser.length > 0) && messages.length > 0) {
+          const lastIdx = messages.length - 1;
+          const lastMsg = messages[lastIdx];
+          const branch = lastMsg.branches?.find((b: any) => b.id === lastMsg.activeBranchId);
+          if (branch) {
+            let content = branch.content || '';
+            if (beforeUser.length > 0) content = beforeUser.join('\n') + '\n\n' + content;
+            if (afterUser.length > 0) content = content + '\n\n' + afterUser.join('\n');
+            // Immutable update — don't mutate shared reference
+            messages = messages.map((m: any, i: number) => {
+              if (i !== lastIdx) return m;
+              return {
+                ...m,
+                branches: m.branches.map((b: any) =>
+                  b.id === m.activeBranchId ? { ...b, content } : b
+                ),
+              };
+            });
+          }
+        }
         console.log(`[TriggerHandler] MCPL injected ${injections.length} context block(s)`);
       }
     } catch (err) {
@@ -202,8 +235,8 @@ class TriggerHandler {
 
     // 8. Build system prompt and settings
     const baseSystemPrompt = responder.systemPrompt || msg.systemMessage || '';
-    const systemPrompt = mcplInjectedPrompt
-      ? `${baseSystemPrompt}\n${mcplInjectedPrompt}`
+    const systemPrompt = mcplSystemInjection
+      ? `${baseSystemPrompt}\n${mcplSystemInjection}`
       : baseSystemPrompt;
 
     // Merge settings: conversation settings with participant overrides (same pattern as handler.ts)

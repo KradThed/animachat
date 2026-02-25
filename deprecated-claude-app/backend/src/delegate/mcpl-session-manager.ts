@@ -11,6 +11,7 @@
 import { randomUUID } from 'crypto';
 import type { McplCapability, McplFeatureSet } from '@deprecated-claude/shared';
 import type { ReliableChannelState } from './mcpl-transport.js';
+import type { PendingRequestsState } from './mcpl-codec.js';
 import { expandWildcards } from '../services/mcpl-wildcard.js';
 
 // =============================================================================
@@ -27,6 +28,7 @@ export interface McplSession {
   createdAt: Date;
   lastSeenAt: Date;
   reliableState?: ReliableChannelState;
+  pendingRequestsState?: PendingRequestsState;
 }
 
 // =============================================================================
@@ -206,6 +208,23 @@ export class McplSessionManager {
    */
   getReliableState(sessionId: string): ReliableChannelState | undefined {
     return this.sessions.get(sessionId)?.reliableState;
+  }
+
+  /**
+   * Save McplCodec pending requests state on session (for resume across reconnects).
+   */
+  savePendingRequestsState(sessionId: string, state: PendingRequestsState): void {
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      session.pendingRequestsState = state;
+    }
+  }
+
+  /**
+   * Get saved pending requests state for resume.
+   */
+  getPendingRequestsState(sessionId: string): PendingRequestsState | undefined {
+    return this.sessions.get(sessionId)?.pendingRequestsState;
   }
 
   getStats(): { totalSessions: number } {

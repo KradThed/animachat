@@ -358,14 +358,42 @@ export const McplConnectServerResultMessageSchema = z.object({
 /** Server → Delegate: MCPL error (access denied, rate limited, etc.) */
 export const McplErrorMessageSchema = z.object({
   type: z.literal('mcpl/error'),
-  code: z.string(),                    // 'conversation_access_denied' | 'rate_limited' | ...
+  code: z.number(),                    // JSON-RPC numeric error codes (-32001..-32005, -32700..-32603)
   message: z.string(),                 // "Conversation not found or access denied" (never reveal existence)
-  retryAfterMs: z.number().optional(), // present when code === 'rate_limited' — delegate uses for backoff
+  retryAfterMs: z.number().optional(), // present when code === -32002 (rate limited) — delegate uses for backoff
   inReplyTo: z.object({                // correlation — otherwise error is orphaned in logs
     type: z.string(),                  // original message type
     requestId: z.string().optional(),
     seq: z.number().optional(),
   }),
+});
+
+// =============================================================================
+// JSON-RPC 2.0 Envelope Schemas (used by McplCodec for wire validation)
+// =============================================================================
+
+export const JsonRpcRequestSchema = z.object({
+  jsonrpc: z.literal('2.0'),
+  id: z.union([z.string(), z.number()]),
+  method: z.string(),
+  params: z.record(z.unknown()).optional(),
+});
+
+export const JsonRpcNotificationSchema = z.object({
+  jsonrpc: z.literal('2.0'),
+  method: z.string(),
+  params: z.record(z.unknown()).optional(),
+});
+
+export const JsonRpcResponseSchema = z.object({
+  jsonrpc: z.literal('2.0'),
+  id: z.union([z.string(), z.number(), z.null()]),
+  result: z.unknown().optional(),
+  error: z.object({
+    code: z.number(),
+    message: z.string(),
+    data: z.unknown().optional(),
+  }).optional(),
 });
 
 // =============================================================================

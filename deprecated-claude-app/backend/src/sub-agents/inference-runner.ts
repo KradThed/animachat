@@ -146,13 +146,17 @@ export class InferenceRunner {
       };
 
       if (this.hookManager) {
-        const injections = await this.hookManager.beforeInference(
+        const hookResult = await this.hookManager.beforeInference(
           this.task.userId,
           this.task.conversationId,
           undefined,
           1,           // hookDepth=1 — sub-agent level
           hookContext,
         );
+        if (hookResult.abort) {
+          throw new Error(`MCPL beforeInference aborted: ${hookResult.abortReason ?? 'no reason'}`);
+        }
+        const injections = hookResult.injections;
         if (injections.length > 0) {
           // system injections → systemPrompt
           const systemInj = injections.filter(i => i.position === 'system').map(i => i.content);

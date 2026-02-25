@@ -38,6 +38,7 @@ export class AnthropicService {
       cacheCreationInputTokens: number;
       cacheReadInputTokens: number;
     },
+    stopReason?: string;
     rawRequest?: {
       model: string;
       system?: string;

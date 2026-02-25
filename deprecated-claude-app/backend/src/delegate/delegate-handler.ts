@@ -38,6 +38,7 @@ import { mcplStateManager } from '../services/mcpl-state-manager.js';
 import { roomManager } from '../websocket/room-manager.js';
 import { WebSocketTransport, ReliableChannel } from './mcpl-transport.js';
 import type { McplTransport } from './mcpl-transport.js';
+import { McplCodec } from './mcpl-codec.js';
 import type { ScopeChangeStatus, McplFeatureSet, McplCapability, McplScopePolicy } from '@deprecated-claude/shared';
 import { expandWildcards, matchesPattern } from '../services/mcpl-wildcard.js';
 import { ConversationAccessCache } from '../mcpl/conversation-access.js';
@@ -383,7 +384,9 @@ interface DelegateWebSocket extends WebSocket {
   isAlive?: boolean;
   isMcpl?: boolean;              // true if delegate connected via mcpl/hello
   mcplSessionId?: string;        // MCPL session ID (survives reconnects)
-  mcplTransport?: McplTransport; // ReliableChannel after mcpl/hello
+  mcplTransport?: McplTransport; // McplCodec wrapping ReliableChannel after mcpl/hello
+  mcplReliable?: ReliableChannel; // Direct RC ref for getState() on disconnect
+  mcplCodecRef?: McplCodec;      // Direct codec ref for pendingRequests save/restore
 }
 
 export async function delegateWebsocketHandler(
@@ -512,10 +515,12 @@ export async function delegateWebsocketHandler(
   transport.onClose((code, reason) => {
     console.log(`[DelegateHandler] Delegate "${delegateId}" disconnected (code: ${code}, reason: ${reason})`);
 
-    // Save ReliableChannel state for session resume
-    if (ws.mcplTransport && ws.mcplSessionId) {
-      const rc = ws.mcplTransport as ReliableChannel;
-      mcplSessionManager.saveReliableState(ws.mcplSessionId, rc.getState());
+    // Save ReliableChannel state + codec pending requests for session resume
+    if (ws.mcplReliable && ws.mcplSessionId) {
+      mcplSessionManager.saveReliableState(ws.mcplSessionId, ws.mcplReliable.getState());
+    }
+    if (ws.mcplCodecRef && ws.mcplSessionId) {
+      mcplSessionManager.savePendingRequestsState(ws.mcplSessionId, ws.mcplCodecRef.getPendingRequests());
     }
 
     // Unregister MCPL services
@@ -1099,22 +1104,35 @@ function handleMcplHello(
     }
   }
 
-  ws.mcplTransport = reliable;
+  // Wrap ReliableChannel with McplCodec for JSON-RPC 2.0 wire format
+  const codec = new McplCodec(reliable);
+  ws.mcplTransport = codec;
+  ws.mcplReliable = reliable;   // direct RC ref for getState() on disconnect
+  ws.mcplCodecRef = codec;      // direct codec ref for pendingRequests save/restore
+
+  // Restore pending requests on resume (BUG 6+7 fix)
+  if (isResume) {
+    const savedPending = mcplSessionManager.getPendingRequestsState(session.sessionId);
+    if (savedPending) {
+      codec.restorePendingRequests(savedPending);
+    }
+  }
 
   // IMPORTANT: Set message handler BEFORE sending ack or resending buffered frames.
   // Otherwise responses to resent frames would be dropped (no handler).
   // CRITICAL: handleDelegateMessage is async — use void + .catch() (Fix #4)
-  reliable.onMessage((innerMsg) => {
-    void handleDelegateMessage(ws, reliable, innerMsg, userId, delegateId, _legacySessionId, db, accessCache)
+  codec.onMessage((innerMsg) => {
+    void handleDelegateMessage(ws, codec, innerMsg, userId, delegateId, _legacySessionId, db, accessCache)
       .catch((err) => {
         console.error(`[DelegateHandler] Unhandled error in RC message handler for "${delegateId}":`, err);
         ws.close(4500, 'internal_error');
       });
   });
 
-  // Send mcpl/ack (first framed message)
+  // Send mcpl/ack (first framed message — codec converts to JSON-RPC response)
   const ackMsg: Record<string, unknown> = {
     type: 'mcpl/ack',
+    requestId: (msg as any).requestId,  // correlate with hello request id
     sessionId: session.sessionId,
     negotiatedCapabilities: session.capabilities,
     featureSets: session.featureSets,
@@ -1122,7 +1140,7 @@ function handleMcplHello(
   if (isResume && typeof (msg as any).lastReceivedSeq === 'number') {
     ackMsg.resumedFromSeq = (msg as any).lastReceivedSeq;
   }
-  reliable.send(ackMsg);
+  codec.send(ackMsg);
 
   // Resend buffered frames on resume
   if (isResume && typeof (msg as any).lastReceivedSeq === 'number') {
@@ -1138,7 +1156,7 @@ function handleMcplHello(
 
     if (hookServerIds.length > 0) {
       mcplHookManager.registerServer(
-        _legacySessionId, delegateId, userId, reliable, hookServerIds
+        _legacySessionId, delegateId, userId, codec, hookServerIds
       );
     }
   }
