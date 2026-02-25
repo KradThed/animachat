@@ -9,7 +9,7 @@
  */
 
 import { WebSocket } from 'ws';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 import type { ToolCallRequestMessage, ToolCallResponseMessage } from './protocol.js';
 import type { ToolDefinition, ToolResult } from '../tools/tool-registry.js';
 import { roomManager } from '../websocket/room-manager.js';
@@ -55,23 +55,25 @@ export class DelegateManager {
   private pendingCalls: Map<string, PendingToolCall> = new Map();
 
   /**
-   * Stable serverId mapping: `{delegateId}:{serverName}` → UUID.
-   * Generated on first appearance, persists for the lifetime of the process.
-   * Survives delegate reconnects (same delegateId + serverName → same serverId).
+   * Stable serverId mapping: `{delegateId}:{serverName}` → deterministic hash.
+   * Deterministic: same (delegateId, serverName) always produces the same serverId,
+   * even across server restarts. This ensures event store references (disabledServers,
+   * server_enabled_changed) survive restarts without persistence layer.
    */
   private serverIdMap: Map<string, string> = new Map();
 
   /**
    * Get or create a stable serverId for a (delegateId, serverName) pair.
-   * The serverId is a UUID that stays stable across reconnects within the same process.
+   * Uses deterministic sha256 hash — same input always produces the same ID,
+   * even across server restarts (no persistence needed).
    */
   getOrCreateServerId(delegateId: string, serverName: string): string {
     const key = `${delegateId}:${serverName}`;
     let serverId = this.serverIdMap.get(key);
     if (!serverId) {
-      serverId = randomUUID();
+      serverId = createHash('sha256').update(key).digest('hex').slice(0, 32);
       this.serverIdMap.set(key, serverId);
-      console.log(`[DelegateManager] New serverId for ${key}: ${serverId}`);
+      console.log(`[DelegateManager] serverId for ${key}: ${serverId}`);
     }
     return serverId;
   }
