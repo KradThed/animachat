@@ -188,6 +188,8 @@ export const McplInferenceRequestMessageSchema = z.object({
   userMessage: z.string(),
   maxTokens: z.number().optional(),
   stream: z.boolean().optional(),
+  parentChainId: z.string().optional(),   // recursion prevention (Fix #5)
+  parentFrameId: z.string().optional(),   // recursion prevention (Fix #5)
 });
 
 /** Server → Delegate: streaming inference chunk (Phase 7 — Batch 5) */
@@ -210,7 +212,38 @@ export const McplScopeChangeRequestMessageSchema = z.object({
   serverName: z.string().optional(),
 });
 
-/** Server → Delegate: connect a new MCP server (type only — NOT in union yet) */
+/** Context passed with inference hook messages */
+export const McplInferenceHookContextSchema = z.object({
+  conversationId: z.string(),
+  userId: z.string(),
+  isSubAgent: z.boolean(),
+  taskId: z.string().optional(),
+  groupId: z.string().optional(),
+  instruction: z.string().optional(),
+  inferenceId: z.string().optional(),
+  turnIndex: z.number().optional(),
+  model: z.string().optional(),
+});
+
+/** Server → Delegate: before-inference hook (request) */
+export const McplBeforeInferenceMessageSchema = z.object({
+  type: z.literal('mcpl/beforeInference'),
+  requestId: z.string(),
+  conversationId: z.string(),
+  messagesSummary: z.string().optional(),
+  context: McplInferenceHookContextSchema.optional(),
+});
+
+/** Server → Delegate: after-inference hook (request) */
+export const McplAfterInferenceMessageSchema = z.object({
+  type: z.literal('mcpl/afterInference'),
+  requestId: z.string(),
+  conversationId: z.string(),
+  responseSummary: z.string().optional(),
+  context: McplInferenceHookContextSchema.optional(),
+});
+
+/** Server → Delegate: connect a new MCP server */
 export const McplConnectServerMessageSchema = z.object({
   type: z.literal('mcpl/connect_server'),
   url: z.string(),
@@ -443,6 +476,9 @@ export const ServerToDelegateMessageSchema = z.discriminatedUnion('type', [
   McplInferenceChunkMessageSchema,
   McplCheckpointListResponseMessageSchema,
   McplErrorMessageSchema,
+  McplBeforeInferenceMessageSchema,
+  McplAfterInferenceMessageSchema,
+  McplConnectServerMessageSchema,
 ]);
 
 // =============================================================================
@@ -485,6 +521,9 @@ export type McplInferenceChunkMessage = z.infer<typeof McplInferenceChunkMessage
 export type McplCheckpointListMessage = z.infer<typeof McplCheckpointListMessageSchema>;
 export type McplCheckpointListResponseMessage = z.infer<typeof McplCheckpointListResponseMessageSchema>;
 export type McplErrorMessage = z.infer<typeof McplErrorMessageSchema>;
+export type McplInferenceHookContext = z.infer<typeof McplInferenceHookContextSchema>;
+export type McplBeforeInferenceMessage = z.infer<typeof McplBeforeInferenceMessageSchema>;
+export type McplAfterInferenceMessage = z.infer<typeof McplAfterInferenceMessageSchema>;
 
 export type DelegateToServerMessage = z.infer<typeof DelegateToServerMessageSchema>;
 export type ServerToDelegateMessage = z.infer<typeof ServerToDelegateMessageSchema>;

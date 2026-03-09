@@ -738,6 +738,12 @@ export class Database {
       email: 'test@example.com',
       name: 'Test User',
       createdAt: new Date(),
+      emailVerified: false,
+      emailVerifiedAt: null,
+      ageVerified: false,
+      ageVerifiedAt: null,
+      tosAccepted: false,
+      tosAcceptedAt: null,
       apiKeys: []
     };
     
@@ -806,6 +812,12 @@ export class Database {
       email: 'demo@example.com',
       name: 'Demo User',
       createdAt: new Date(),
+      emailVerified: false,
+      emailVerifiedAt: null,
+      ageVerified: false,
+      ageVerifiedAt: null,
+      tosAccepted: false,
+      tosAcceptedAt: null,
       apiKeys: []
     };
 
@@ -853,6 +865,12 @@ export class Database {
         email: userData.email,
         name: userData.name,
         createdAt: new Date(),
+        emailVerified: false,
+        emailVerifiedAt: null,
+        ageVerified: false,
+        ageVerifiedAt: null,
+        tosAccepted: false,
+        tosAcceptedAt: null,
         apiKeys: []
       };
 
@@ -1213,7 +1231,7 @@ export class Database {
             ...user,
             createdAt: new Date(user.createdAt),
             emailVerified,
-            emailVerifiedAt: user.emailVerifiedAt ? new Date(user.emailVerifiedAt) : (emailVerified ? new Date(user.createdAt) : undefined)
+            emailVerifiedAt: user.emailVerifiedAt ? new Date(user.emailVerifiedAt) : (emailVerified ? new Date(user.createdAt) : null)
           };
           this.users.set(user.id, userWithDates);
           this.usersByEmail.set(user.email, user.id);
@@ -2181,11 +2199,11 @@ export class Database {
       name,
       createdAt: new Date(),
       emailVerified,
-      emailVerifiedAt: emailVerified ? new Date() : undefined,
+      emailVerifiedAt: emailVerified ? new Date() : null,
       ageVerified,
-      ageVerifiedAt: ageVerified ? new Date() : undefined,
+      ageVerifiedAt: ageVerified ? new Date() : null,
       tosAccepted,
-      tosAcceptedAt: tosAccepted ? new Date() : undefined,
+      tosAcceptedAt: tosAccepted ? new Date() : null,
       apiKeys: []
     };
 

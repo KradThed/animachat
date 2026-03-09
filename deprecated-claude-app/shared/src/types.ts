@@ -6,12 +6,12 @@ export const UserSchema = z.object({
   email: z.string().email(),
   name: z.string(),
   createdAt: z.date(),
-  emailVerified: z.boolean().optional(), // Whether email has been verified
-  emailVerifiedAt: z.date().optional(), // When email was verified
-  ageVerified: z.boolean().optional(), // Whether user has confirmed they are 18+
-  ageVerifiedAt: z.date().optional(), // When age was verified
-  tosAccepted: z.boolean().optional(), // Whether user has accepted Terms of Service
-  tosAcceptedAt: z.date().optional(), // When ToS was accepted
+  emailVerified: z.boolean().default(false), // Whether email has been verified
+  emailVerifiedAt: z.date().nullable().default(null), // When email was verified
+  ageVerified: z.boolean().default(false), // Whether user has confirmed they are 18+
+  ageVerifiedAt: z.date().nullable().default(null), // When age was verified
+  tosAccepted: z.boolean().default(false), // Whether user has accepted Terms of Service
+  tosAcceptedAt: z.date().nullable().default(null), // When ToS was accepted
   apiKeys: z.array(z.object({
     id: z.string().uuid(),
     name: z.string(),

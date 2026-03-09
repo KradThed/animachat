@@ -72,19 +72,24 @@ export class WebSocketTransport implements McplTransport {
 // ReliableChannel — seq/ack, reorder, backpressure, resume
 // =============================================================================
 
+export interface ReliableChannelBufferEntry {
+  frame: Record<string, unknown>;
+  ts: number;
+}
+
 export interface ReliableChannelState {
   outSeq: number;
   inSeq: number;
   lastAckedSeq: number;
-  buffer: Map<number, Record<string, unknown>>;
+  buffer: Map<number, ReliableChannelBufferEntry>;
 }
 
 export class ReliableChannel implements McplTransport {
   private outSeq = 0;
   private inSeq = 0;
   private lastAckedSeq = 0;
-  /** Outbound buffer: seq → frame (for resend on resume) */
-  private buffer = new Map<number, Record<string, unknown>>();
+  /** Outbound buffer: seq → { frame, ts } (for resend on resume + TTL cleanup) */
+  private buffer = new Map<number, ReliableChannelBufferEntry>();
   /** Out-of-order inbound payloads waiting for gaps to fill */
   private pending = new Map<number, Record<string, unknown>>();
   private messageHandler: ((msg: Record<string, unknown>) => void) | null = null;
@@ -93,6 +98,7 @@ export class ReliableChannel implements McplTransport {
 
   private static readonly MAX_UNACKED = 64;
   private static readonly BARE_ACK_DELAY_MS = 50;
+  private static readonly MAX_BUFFER_AGE_MS = 120_000; // 2 min max age for buffered frames
 
   constructor(private transport: McplTransport) {
     this.transport.onMessage((raw) => this.handleIncoming(raw));
@@ -112,7 +118,7 @@ export class ReliableChannel implements McplTransport {
 
     const seq = ++this.outSeq;
     const frame = { seq, ack: this.inSeq, payload: message };
-    this.buffer.set(seq, frame);
+    this.buffer.set(seq, { frame, ts: Date.now() });
     this.transport.send(frame as Record<string, unknown>);
 
     // Piggybacked ack — cancel pending bare ack
@@ -157,6 +163,14 @@ export class ReliableChannel implements McplTransport {
         this.buffer.delete(i);
       }
       this.lastAckedSeq = frame.ack;
+    }
+
+    // TTL sweep: drop stale buffered frames to prevent unbounded growth
+    const now = Date.now();
+    for (const [seq, entry] of this.buffer) {
+      if (now - entry.ts > ReliableChannel.MAX_BUFFER_AGE_MS) {
+        this.buffer.delete(seq);
+      }
     }
 
     // Bare ack (seq=0) or no payload → done
@@ -220,12 +234,20 @@ export class ReliableChannel implements McplTransport {
 
   /** Resend all buffered frames with seq > afterSeq (for resume). */
   resendBufferedAfter(afterSeq: number): void {
+    // Drop stale frames before resending
+    const now = Date.now();
+    for (const [seq, entry] of this.buffer) {
+      if (now - entry.ts > ReliableChannel.MAX_BUFFER_AGE_MS) {
+        this.buffer.delete(seq);
+      }
+    }
+
     const toResend = [...this.buffer.entries()]
       .filter(([seq]) => seq > afterSeq)
       .sort(([a], [b]) => a - b);
-    for (const [, frame] of toResend) {
+    for (const [, entry] of toResend) {
       try {
-        this.transport.send(frame);
+        this.transport.send(entry.frame);
       } catch {
         break; // Transport failed — stop resending
       }

@@ -465,6 +465,15 @@ export class McplHookManager {
     this.delegateCallTimestamps.set(delegateId, recent);
     return true;
   }
+
+  /**
+   * Clean up per-delegate rate-limiting state on disconnect.
+   * Prevents unbounded Map growth from disconnected delegates.
+   */
+  cleanupDelegate(delegateId: string): void {
+    this.delegateCallTimestamps.delete(delegateId);
+    this.delegateRateLimits.delete(delegateId);
+  }
 }
 
 export const mcplHookManager = new McplHookManager();

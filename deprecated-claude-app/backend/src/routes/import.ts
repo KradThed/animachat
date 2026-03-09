@@ -415,22 +415,33 @@ export function importRouter(db: Database): Router {
         return;
       }
       
-      console.log('Messages with branch info:', preview.messages.map((m: any) => ({
-        uuid: m.__uuid,
-        parent: m.__parentUuid,
-        isBranch: !!m.__branchInfo?.isAlternative,
-        role: m.role,
-        content: m.content.substring(0, 30) + '...'
-      })));
-      
+      // Extended message type for branch metadata added by import parser
+      interface ImportedMessageExt {
+        __branchInfo?: { isAlternative?: boolean };
+        __uuid?: string;
+        __parentUuid?: string;
+        __isActive?: boolean;
+      }
+
+      console.log('Messages with branch info:', preview.messages.map((m) => {
+        const ext = m as typeof m & ImportedMessageExt;
+        return {
+          uuid: ext.__uuid,
+          parent: ext.__parentUuid,
+          isBranch: !!ext.__branchInfo?.isAlternative,
+          role: m.role,
+          content: m.content.substring(0, 30) + '...',
+        };
+      }));
+
       for (const parsedMsg of preview.messages) {
         // Skip system messages for now
         if (parsedMsg.role === 'system') continue;
-        
+
         // Determine participant
         const sourceName = parsedMsg.participantName || (parsedMsg.role === 'user' ? 'User' : 'Assistant');
         let participantId = participantMap.get(sourceName);
-        
+
         // If no mapping found, try to find by role
         if (!participantId) {
           const participant = participants.find(p => p.type === parsedMsg.role);
@@ -438,12 +449,13 @@ export function importRouter(db: Database): Router {
             participantId = participant.id;
           }
         }
-        
+
         // Check if this is a branch (alternative response)
-        const branchInfo = (parsedMsg as any).__branchInfo;
-        const originalUuid = (parsedMsg as any).__uuid;
-        const parentUuid = (parsedMsg as any).__parentUuid;
-        const isActive = (parsedMsg as any).__isActive;
+        const ext = parsedMsg as typeof parsedMsg & ImportedMessageExt;
+        const branchInfo = ext.__branchInfo;
+        const originalUuid = ext.__uuid;
+        const parentUuid = ext.__parentUuid;
+        const isActive = ext.__isActive;
         
         // Key to identify messages that should be branches of each other
         const messageKey = `${parentUuid}:${parsedMsg.role}`;

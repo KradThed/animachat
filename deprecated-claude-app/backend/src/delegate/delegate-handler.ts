@@ -559,10 +559,11 @@ export async function delegateWebsocketHandler(
       mcplSessionManager.savePendingRequestsState(ws.mcplSessionId, ws.mcplCodecRef.getPendingRequests());
     }
 
-    // Unregister MCPL services
+    // Unregister MCPL services + clean up rate-limiting state
     if (ws.mcplSessionId) {
       mcplHookManager.unregisterServer(sessionId);
     }
+    mcplHookManager.cleanupDelegate(delegateId);
 
     // Clean up per-connection access cache (Fix #4)
     conversationAccessCaches.delete(sessionId);

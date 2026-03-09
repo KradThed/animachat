@@ -1710,8 +1710,9 @@ export class InferenceService {
           }
         }
         
-        // Check if buffer starts with "ParticipantName: "
-        const namePattern = new RegExp(`^${responderName}:\\s*`);
+        // Check if buffer starts with "ParticipantName: " (escape regex special chars)
+        const escaped = responderName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const namePattern = new RegExp(`^${escaped}:\\s*`);
         if (namePattern.test(buffer)) {
           // Strip the name prefix
           buffer = buffer.replace(namePattern, '');

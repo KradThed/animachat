@@ -69,17 +69,10 @@ export function toolsRouter(deps: ToolsRouterDeps = {}): Router {
         userId: d.userId,
         tools: d.tools,
         connectedAt: d.connectedAt.toISOString(),
-        // Adapter: convert string[] to object (future-proof for when capabilities becomes object)
         capabilities: {
-          managedInstall: Array.isArray(d.capabilities)
-            ? d.capabilities.includes('managedInstall')
-            : (d.capabilities as any)?.managedInstall ?? false,
-          canFileAccess: Array.isArray(d.capabilities)
-            ? d.capabilities.includes('canFileAccess')
-            : (d.capabilities as any)?.canFileAccess ?? false,
-          canShellAccess: Array.isArray(d.capabilities)
-            ? d.capabilities.includes('canShellAccess')
-            : (d.capabilities as any)?.canShellAccess ?? false,
+          managedInstall: d.capabilities.includes('managedInstall'),
+          canFileAccess: d.capabilities.includes('canFileAccess'),
+          canShellAccess: d.capabilities.includes('canShellAccess'),
         },
       }))
     });
