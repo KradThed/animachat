@@ -20,6 +20,24 @@ import type { SubAgentManager } from './sub-agent-manager.js';
 /** Max characters for result content in get_subtask_results + finalize_task_group. */
 const MAX_RESULT_FULL = 4000;
 
+/**
+ * BUG T-5: Single source of truth for sub-agent tool names.
+ * Used by inference-runner.ts to filter these from sub-agent tool lists (depth=1 limit).
+ */
+export const SUB_AGENT_TOOL_NAMES = new Set([
+  'spawn_subtask', 'spawn_subtasks', 'poll_subtasks',
+  'get_subtask_results', 'cancel_subtasks', 'finalize_task_group',
+]);
+
+/**
+ * BUG T-5: MCPL management tools that sub-agents should not access.
+ * Sub-agents are narrow workers — they should not enable/disable servers or manage policies.
+ */
+export const MCPL_MANAGEMENT_TOOL_NAMES = new Set([
+  'list_mcp_servers', 'get_server_status', 'enable_server',
+  'disable_server', 'manage_scope_policies',
+]);
+
 // =============================================================================
 // Registration
 // =============================================================================
@@ -133,10 +151,19 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
           maxConcurrent: input.maxConcurrent as number | undefined,
         });
 
+        // BUG T-7: Guard against empty result array (groupId would be undefined)
+        if (tasks.length === 0) {
+          return {
+            toolUseId: '',
+            content: JSON.stringify({ error: 'No tasks were spawned' }),
+            isError: true,
+          };
+        }
+
         return {
           toolUseId: '',
           content: JSON.stringify({
-            groupId: tasks[0]?.groupId,
+            groupId: tasks[0].groupId,
             tasks: tasks.map(t => ({
               taskId: t.taskId,
               instruction: t.instruction,

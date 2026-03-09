@@ -190,9 +190,11 @@ export function buildToolOptions(
   console.log('[buildToolOptions] All tools for user:', allTools.length);
 
   // Filter by toolConfig if present
+  // BUG T-11: pass isServerEnabled to getToolsForUserWithSource (was missing, causing
+  // disabled servers to be re-included when toolConfig filtering was active)
   const tools = toolConfig
     ? toolRegistry.getToolsForParticipant(
-        toolRegistry.getToolsForUserWithSource(userId),
+        toolRegistry.getToolsForUserWithSource(userId, isServerEnabled),
         toolConfig
       )
     : allTools;

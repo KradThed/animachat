@@ -24,6 +24,7 @@ import { createGuardedExecuteTool } from '../services/write-tool-guard.js';
 import type { McplHookManager, InferenceHookContext } from '../services/mcpl-hook-manager.js';
 import type { SubAgentTask, TaskMetrics } from './types.js';
 import { MAX_ITERATIONS } from './types.js';
+import { SUB_AGENT_TOOL_NAMES, MCPL_MANAGEMENT_TOOL_NAMES } from './sub-agent-tools.js';
 
 // =============================================================================
 // Types
@@ -83,17 +84,14 @@ export class InferenceRunner {
         this.db,
       );
 
-      // BUG 7: Exact match for sub-agent tool filtering (not prefix match)
-      const SUB_AGENT_TOOL_NAMES = new Set([
-        'spawn_subtask', 'spawn_subtasks', 'poll_subtasks',
-        'get_subtask_results', 'cancel_subtasks', 'finalize_task_group',
-      ]);
-
-      // Filter out sub-agent tools to prevent recursive spawning
+      // BUG T-5: Import SUB_AGENT_TOOL_NAMES + MCPL_MANAGEMENT_TOOL_NAMES from sub-agent-tools.ts
+      // Filter out sub-agent tools (depth=1 limit) AND MCPL management tools (privilege escalation)
       // Wrap executeToolCall with write lock guard (ResourceCoordinator)
       const filteredToolOptions = toolOpts
         ? {
-            tools: toolOpts.tools.filter((t: any) => !SUB_AGENT_TOOL_NAMES.has(t.name)),
+            tools: toolOpts.tools.filter((t: any) =>
+              !SUB_AGENT_TOOL_NAMES.has(t.name) && !MCPL_MANAGEMENT_TOOL_NAMES.has(t.name)
+            ),
             executeToolCall: this.resourceCoordinator
               ? createGuardedExecuteTool(
                   this.task.userId,

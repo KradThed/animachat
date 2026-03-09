@@ -34,6 +34,23 @@ import type { ToolConfig } from '@deprecated-claude/shared';
 const NS_SEP = '__';
 
 /**
+ * BUG T-9: Write tool detection for timeout warnings.
+ * Duplicated from write-tool-guard.ts to avoid circular import.
+ */
+const WRITE_TOOL_BASES = new Set([
+  'write_file', 'writeFile', 'append_file', 'appendFile',
+  'create_file', 'createFile', 'delete_file', 'deleteFile',
+  'rename_file', 'renameFile', 'move_file', 'moveFile',
+  'edit_file', 'editFile', 'patch_file', 'patchFile',
+]);
+
+function isWriteToolName(toolName: string): boolean {
+  const sep = toolName.indexOf('__');
+  const base = sep >= 0 ? toolName.slice(sep + 2) : toolName;
+  return WRITE_TOOL_BASES.has(base);
+}
+
+/**
  * JSON.stringify replacer that sorts object keys for deterministic output.
  * Avoids false-positive hash changes from key ordering differences.
  */
@@ -231,8 +248,14 @@ export class ToolRegistry {
   /**
    * Get all tool definitions available to a user WITH source info.
    * Use this for API/UI to show where each tool comes from.
+   *
+   * BUG T-11: Added isServerEnabled param — without it, disabled servers
+   * were re-included when toolConfig filtering was active.
    */
-  getToolsForUserWithSource(userId: string): ToolDefinitionWithSource[] {
+  getToolsForUserWithSource(
+    userId: string,
+    isServerEnabled?: (serverId: string) => boolean
+  ): ToolDefinitionWithSource[] {
     const tools: ToolDefinitionWithSource[] = [];
 
     // Server tools first
@@ -244,6 +267,10 @@ export class ToolRegistry {
     const userPrefix = `${userId}:`;
     for (const [key, tool] of this.delegateTools) {
       if (key.startsWith(userPrefix)) {
+        // BUG T-11: Filter by enabled state (same as getToolsForUser)
+        if (isServerEnabled && tool.serverId && !isServerEnabled(tool.serverId)) {
+          continue;
+        }
         tools.push({ ...tool.definition, source: 'delegate', delegateName: tool.delegateName, serverId: tool.serverId });
       }
     }
@@ -346,6 +373,13 @@ export class ToolRegistry {
       const resolved = this.tryUnprefixedLookup(name, userId, toolConfig);
       if (resolved) {
         console.log(`[ToolRegistry] COMPAT_SHIM resolved: "${name}" → "${resolved.definition.name}"`);
+        // BUG T-13: MCPL management tools need context, not the raw fallback executor
+        if (resolved.isMcplManagement && resolved.mcplExecute) {
+          return this.executeWithTimeout(
+            resolved.mcplExecute(input, { userId, conversationId: conversationId || '' }),
+            timeout, toolUseId, resolved.definition.name
+          );
+        }
         return this.executeWithTimeout(resolved.execute(input), timeout, toolUseId, resolved.definition.name);
       }
 
@@ -499,12 +533,21 @@ export class ToolRegistry {
       }, timeoutMs);
     });
 
+    let settled = false;
     const result = await Promise.race([
-      promise.then(r => ({ ...r, toolUseId })),
+      promise.then(r => { settled = true; return { ...r, toolUseId }; }),
       timeoutPromise,
-    ]);
+    ]).finally(() => clearTimeout(timer!));  // BUG T-2: cleanup timer even on rejection
 
-    clearTimeout(timer!);
+    // BUG T-9: Warn if a write tool timed out — underlying op may still complete
+    if (!settled && isWriteToolName(toolName)) {
+      Logger.error(
+        `[ToolRegistry] WRITE tool "${toolName}" timed out — ` +
+        `underlying operation may still complete. Risk of double-write on retry. ` +
+        `(correlation: ${correlationId})`
+      );
+    }
+
     return result;
   }
 

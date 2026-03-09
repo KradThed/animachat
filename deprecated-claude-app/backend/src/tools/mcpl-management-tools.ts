@@ -5,8 +5,8 @@
  * These are registered as server-side tools (available to all users, unprefixed).
  *
  * Tools:
- *   - list_mcp_servers: List connected delegates and their servers (regular tool)
- *   - get_server_status: Get health/capabilities for a specific server (regular tool)
+ *   - list_mcp_servers: List connected delegates and their servers (MCPL tool — user-scoped)
+ *   - get_server_status: Get health/capabilities for a specific server (MCPL tool — user-scoped)
  *   - enable_server: Enable a server's tools for the current conversation (MCPL tool)
  *   - disable_server: Disable a server's tools for the current conversation (MCPL tool)
  */
@@ -26,14 +26,14 @@ import type { Database } from '../database/index.js';
  */
 export function registerMcplManagementTools(db: Database): void {
   // -------------------------------------------------------------------------
-  // list_mcp_servers (regular tool — no context needed)
+  // list_mcp_servers (MCPL tool — BUG T-1: was registerServerTool, leaked cross-user data)
   // -------------------------------------------------------------------------
-  toolRegistry.registerServerTool(
+  toolRegistry.registerMcplManagementTool(
     'list_mcp_servers',
     {
       name: 'list_mcp_servers',
       description:
-        'List all connected delegate apps and their MCP servers. ' +
+        'List your connected delegate apps and their MCP servers. ' +
         'Shows delegate names, connected servers, tool counts, and capabilities.',
       inputSchema: {
         type: 'object',
@@ -41,36 +41,38 @@ export function registerMcplManagementTools(db: Database): void {
         required: [],
       },
     },
-    async () => {
+    async (_input, context) => {
+      const { userId } = context;
       const stats = delegateManager.getStats();
-      const delegates = stats.delegates.map(d => {
-        const full = delegateManager.findDelegate(d.userId, d.delegateId);
-        const serverNames = new Set<string>();
-        if (full) {
-          for (const tool of full.tools) {
-            if ((tool as any).serverName) {
-              serverNames.add((tool as any).serverName);
+      // BUG T-1: Filter to calling user's delegates only
+      const delegates = stats.delegates
+        .filter(d => d.userId === userId)
+        .map(d => {
+          const full = delegateManager.findDelegate(d.userId, d.delegateId);
+          const serverNames = new Set<string>();
+          if (full) {
+            for (const tool of full.tools) {
+              if ((tool as any).serverName) {
+                serverNames.add((tool as any).serverName);
+              }
             }
           }
-        }
 
-        return {
-          delegateId: d.delegateId,
-          toolCount: d.toolCount,
-          servers: Array.from(serverNames),
-          connectedAt: d.connectedAt.toISOString(),
-        };
-      });
+          return {
+            delegateId: d.delegateId,
+            toolCount: d.toolCount,
+            servers: Array.from(serverNames),
+            connectedAt: d.connectedAt.toISOString(),
+          };
+        });
 
-      const mcplStats = mcplSessionManager.getStats();
       const queueStats = mcplEventQueue.getStats();
       const hookStats = mcplHookManager.getStats();
       const brokerStats = mcplInferenceBroker.getStats();
 
       const result = {
         delegates,
-        totalDelegates: stats.totalDelegates,
-        mcplSessions: mcplStats.totalSessions,
+        totalDelegates: delegates.length,
         eventQueue: {
           totalQueued: queueStats.totalQueued,
           processedThisHour: queueStats.processedThisHour,
@@ -95,9 +97,9 @@ export function registerMcplManagementTools(db: Database): void {
   );
 
   // -------------------------------------------------------------------------
-  // get_server_status (regular tool — no context needed)
+  // get_server_status (MCPL tool — BUG T-1: was registerServerTool, leaked cross-user data)
   // -------------------------------------------------------------------------
-  toolRegistry.registerServerTool(
+  toolRegistry.registerMcplManagementTool(
     'get_server_status',
     {
       name: 'get_server_status',
@@ -115,19 +117,26 @@ export function registerMcplManagementTools(db: Database): void {
         required: ['delegateId'],
       },
     },
-    async (input) => {
+    async (input, context) => {
       const delegateId = input.delegateId as string;
+      const { userId } = context;
 
-      // Find all sessions for this delegate across all users
+      // BUG T-1: Filter to calling user's delegates only
       const stats = delegateManager.getStats();
-      const matches = stats.delegates.filter(d => d.delegateId === delegateId);
+      const matches = stats.delegates.filter(
+        d => d.delegateId === delegateId && d.userId === userId
+      );
 
       if (matches.length === 0) {
+        // BUG T-1: Only show user's own delegates in error hint (not all users')
+        const userDelegates = stats.delegates
+          .filter(d => d.userId === userId)
+          .map(d => d.delegateId);
         return {
           toolUseId: '',
           content: JSON.stringify({
             error: `Delegate "${delegateId}" not found`,
-            availableDelegates: stats.delegates.map(d => d.delegateId),
+            availableDelegates: userDelegates,
           }),
           isError: true,
         };
@@ -149,7 +158,6 @@ export function registerMcplManagementTools(db: Database): void {
 
         return {
           delegateId: match.delegateId,
-          userId: match.userId,
           connectedAt: match.connectedAt.toISOString(),
           toolCount: match.toolCount,
           capabilities: full?.capabilities || [],
@@ -402,5 +410,5 @@ export function registerMcplManagementTools(db: Database): void {
     }
   );
 
-  console.log('[McplManagementTools] Registered 5 management tools (2 regular, 3 MCPL)');
+  console.log('[McplManagementTools] Registered 5 MCPL management tools');
 }
