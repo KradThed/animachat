@@ -52,6 +52,8 @@ export interface SubAgentTask {
   result: string | null;       // Final summary from sub-agent
   error: string | null;        // Error message if state === 'ERROR'
   metrics: TaskMetrics;
+  /** BUG#14: Per-task lease timeout (ms). Falls back to group config if unset. */
+  leaseMs?: number;
   createdAt: number;           // epoch ms
   completedAt: number | null;  // epoch ms
 }
@@ -177,6 +179,8 @@ export interface QueuedUserMessage {
   conversationId: string;
   userId: string;
   text: string;
+  /** BUG#3: Preserve attachments (images, files) from queued messages. */
+  attachments?: Array<{ type: string; data: unknown }>;
   createdAt: number;
   groupId: string;
 }

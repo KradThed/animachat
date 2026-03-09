@@ -1365,6 +1365,16 @@ function setupAuthenticatedMessageHandler(ws: AuthenticatedWebSocket, db: Databa
         case 'subtask_get_state': {
           if (!ws.userId) { ws.close(1008, 'unauthorized'); break; }
           const stateMsg = message as Extract<WsMessage, { type: 'subtask_get_state' }>;
+          // BUG#4: Verify user has access to this conversation before returning state
+          const stateConv = await db.getConversation(stateMsg.conversationId, ws.userId);
+          if (!stateConv) {
+            ws.send(JSON.stringify({
+              type: 'subtask_state_snapshot',
+              conversationId: stateMsg.conversationId,
+              active: false, groupId: null, tasks: [], finalized: false, hasResults: false, queuedText: null,
+            }));
+            break;
+          }
           if (_subAgentManager) {
             const snapshot = _subAgentManager.getStateSnapshot(stateMsg.conversationId, ws.userId);
             ws.send(JSON.stringify({
@@ -1711,11 +1721,17 @@ async function handleChatMessage(
       // Queue user message (per-user, per-conversation)
       // BUG 2: Single messageId for both in-memory and persisted event
       const queuedMessageId = uuidv4();
+      // BUG#3: Preserve attachments so they aren't lost when message is queued
+      const queuedAttachments = message.attachments?.map((att: any) => ({
+        type: att.fileType ?? att.type ?? 'unknown',
+        data: { fileName: att.fileName, fileType: att.fileType, content: att.content },
+      }));
       _subAgentManager.queueUserMessage({
         messageId: queuedMessageId,
         conversationId: message.conversationId,
         userId: ws.userId,
         text: message.content,
+        ...(queuedAttachments?.length ? { attachments: queuedAttachments } : {}),
         createdAt: Date.now(),
         groupId: blockingGroupId,
       });
@@ -1725,6 +1741,7 @@ async function handleChatMessage(
         conversationId: message.conversationId,
         userId: ws.userId,
         text: message.content,
+        ...(queuedAttachments?.length ? { attachments: queuedAttachments } : {}),
         createdAt: Date.now(),
         groupId: blockingGroupId,
       }, ws.userId).catch(err =>

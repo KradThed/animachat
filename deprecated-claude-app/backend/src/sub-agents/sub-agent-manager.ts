@@ -63,6 +63,9 @@ interface FinalizeResultCacheEntry {
 /** TTL for finalize result cache (5 minutes). */
 const FINALIZE_CACHE_TTL_MS = 5 * 60 * 1000;
 
+/** BUG#9: Maximum tasks allowed per group. */
+const MAX_TASKS_PER_GROUP = 20;
+
 // =============================================================================
 // Manager
 // =============================================================================
@@ -136,8 +139,24 @@ export class SubAgentManager {
     let groupId = params.groupId;
     let group: TaskGroup;
 
+    // BUG#6: Prevent multiple active groups per conversation
+    if (!groupId) {
+      const existingGroupId = this.getBlockingGroupId(conversationId);
+      if (existingGroupId) {
+        throw new Error(
+          `Conversation ${conversationId} already has an active group ${existingGroupId}. ` +
+          `Finalize it before spawning a new group, or pass groupId to add tasks to the existing group.`
+        );
+      }
+    }
+
     if (groupId && this.groups.has(groupId)) {
       group = this.groups.get(groupId)!;
+
+      // BUG#9: Limit tasks per group
+      if (group.tasks.size >= MAX_TASKS_PER_GROUP) {
+        throw new Error(`Group ${groupId} already has ${group.tasks.size} tasks (max: ${MAX_TASKS_PER_GROUP})`);
+      }
 
       // M3: Warn on config mismatch when joining existing group
       if (maxConcurrent !== group.config.maxConcurrent) {
@@ -212,6 +231,8 @@ export class SubAgentManager {
       result: null,
       error: null,
       metrics: { iterations: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0, durationMs: 0 },
+      // BUG#14: Store per-task leaseMs (only if different from group default)
+      ...(leaseMs !== group.config.leaseMs ? { leaseMs } : {}),
       createdAt: Date.now(),
       completedAt: null,
     };
@@ -264,6 +285,20 @@ export class SubAgentManager {
       if (typeof inst !== 'string' || inst.trim() === '') {
         throw new Error('each instruction must be a non-empty string');
       }
+    }
+
+    // BUG#6: Prevent multiple active groups per conversation
+    const existingGroupId = this.getBlockingGroupId(conversationId);
+    if (existingGroupId) {
+      throw new Error(
+        `Conversation ${conversationId} already has an active group ${existingGroupId}. ` +
+        `Finalize it before spawning a new group.`
+      );
+    }
+
+    // BUG#9: Limit tasks per group
+    if (params.instructions.length > MAX_TASKS_PER_GROUP) {
+      throw new Error(`Cannot spawn more than ${MAX_TASKS_PER_GROUP} tasks per group`);
     }
 
     // Step 2: Compute forkPoint ONCE (same logic as spawnSubtask)
@@ -557,18 +592,30 @@ export class SubAgentManager {
       }
 
       // Transition non-terminal tasks to FINALIZING
+      let hasNonTerminal = false;
       for (const task of group.tasks.values()) {
         if (!TERMINAL_STATUSES.includes(task.state)) {
+          hasNonTerminal = true;
           this.transitionTask(task, 'FINALIZING');
           const runner = this.runners.get(task.taskId);
           runner?.cancel();
         }
       }
 
-      // Grace period for in-flight tasks
-      await new Promise(resolve => setTimeout(resolve, FINALIZE_GRACE_MS));
+      // BUG#2: Only wait grace period if there are actually non-terminal tasks.
+      // Poll every 500ms instead of blind 10s sleep — exit early when all terminal.
+      if (hasNonTerminal) {
+        const deadline = Date.now() + FINALIZE_GRACE_MS;
+        while (Date.now() < deadline) {
+          const stillRunning = [...group.tasks.values()].some(
+            t => !TERMINAL_STATUSES.includes(t.state),
+          );
+          if (!stillRunning) break;
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      }
 
-      // Force-cancel anything still running
+      // Force-cancel anything still running after grace period
       for (const task of group.tasks.values()) {
         if (!TERMINAL_STATUSES.includes(task.state)) {
           await this.cancelTask(task);
@@ -742,10 +789,11 @@ export class SubAgentManager {
 
   /**
    * Find the active (non-finalized) group for a conversation.
+   * BUG#7: Filter by finalizedAt === null to skip finalized groups still in memory.
    */
   private findGroupForConversation(conversationId: string): TaskGroup | null {
     for (const group of this.groups.values()) {
-      if (group.conversationId === conversationId) {
+      if (group.conversationId === conversationId && group.finalizedAt === null) {
         return group;
       }
     }
@@ -884,6 +932,8 @@ export class SubAgentManager {
       conversationId,
       userId,
       text: data.text,
+      // BUG#3: Restore attachments from JSONL
+      ...(data.attachments?.length ? { attachments: data.attachments } : {}),
       createdAt: data.createdAt,
       groupId: data.groupId,
     });
@@ -899,6 +949,10 @@ export class SubAgentManager {
         break;
       case 'subtask_spawned':
         this.replayTaskSpawned(event.data);
+        break;
+      // BUG#8: Handle subtask_started (QUEUED → RUNNING transition)
+      case 'subtask_started':
+        this.replayTaskStarted(event.data);
         break;
       case 'subtask_completed':
       case 'subtask_cancelled':
@@ -960,6 +1014,17 @@ export class SubAgentManager {
     });
   }
 
+  /** BUG#8: Replay subtask_started — transition QUEUED → RUNNING. */
+  private replayTaskStarted(data: any): void {
+    const group = this.groups.get(data.groupId);
+    if (!group) return;
+    const task = group.tasks.get(data.taskId);
+    if (!task) return;
+    if (task.state === 'QUEUED') {
+      task.state = 'RUNNING';
+    }
+  }
+
   private replayTaskTerminal(data: any, eventType: string): void {
     const group = this.groups.get(data.groupId);
     if (!group) return;
@@ -995,18 +1060,37 @@ export class SubAgentManager {
   // --------------------------------------------------------------------------
 
   /**
-   * Clean up timers on shutdown.
+   * Clean up timers and cancel all running tasks on shutdown.
+   * BUG#1: Must cancel InferenceRunners so in-flight LLM calls are aborted.
    */
-  shutdown(): void {
+  async shutdown(): Promise<void> {
     if (this.cacheCleanupTimer) {
       clearInterval(this.cacheCleanupTimer);
       this.cacheCleanupTimer = null;
     }
+
+    // Cancel all active runners (abort in-flight LLM calls)
+    for (const [taskId, runner] of this.runners) {
+      runner.cancel();
+      this.runners.delete(taskId);
+    }
+
     // Clear all lease timers
     for (const timer of this.leaseTimers.values()) {
       clearTimeout(timer);
     }
     this.leaseTimers.clear();
+
+    // Mark all non-terminal tasks as CANCELLED
+    for (const group of this.groups.values()) {
+      for (const task of group.tasks.values()) {
+        if (!TERMINAL_STATUSES.includes(task.state)) {
+          this.transitionTask(task, 'CANCELLED');
+          task.error = 'Server shutdown';
+          task.completedAt = Date.now();
+        }
+      }
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -1050,9 +1134,10 @@ export class SubAgentManager {
   }
 
   /**
-   * Start a single task (fire-and-forget async).
+   * Start a single task (async kick-off).
    * H1: Stores lease timer for cleanup.
    * H2: Checks transitionTask return before side-effects.
+   * BUG#5: DB writes are awaited for crash-consistent state.
    */
   private startTask(task: SubAgentTask, group: TaskGroup): void {
     // C1: Mark as starting
@@ -1068,16 +1153,6 @@ export class SubAgentManager {
     // C1: Clear starting guard now that we've committed to RUNNING
     this.startingTasks.delete(task.taskId);
 
-    // Log lifecycle event (fire-and-forget)
-    this.db.appendSubAgentEvent(task.conversationId, 'subtask_started', {
-      groupId: task.groupId,
-      taskId: task.taskId,
-      conversationId: task.conversationId,
-      timestamp: Date.now(),
-    }, task.userId).catch(err =>
-      console.error(`[SubAgentManager] Failed to log subtask_started: ${err.message}`)
-    );
-
     const runner = new InferenceRunner(
       task,
       this.llmClient,
@@ -1090,6 +1165,8 @@ export class SubAgentManager {
     this.runners.set(task.taskId, runner);
 
     // H1: Set lease timeout and store for cleanup
+    // BUG#14: Use per-task leaseMs if available, fall back to group config
+    const taskLeaseMs = task.leaseMs ?? group.config.leaseMs;
     const leaseTimer = setTimeout(() => {
       if (!TERMINAL_STATUSES.includes(task.state)) {
         console.warn(`[SubAgentManager] Task ${task.taskId} exceeded lease, cancelling`);
@@ -1097,14 +1174,25 @@ export class SubAgentManager {
           console.error(`[SubAgentManager] Cancel error: ${err.message}`)
         );
       }
-    }, group.config.leaseMs);
+    }, taskLeaseMs);
     this.leaseTimers.set(task.taskId, leaseTimer);
 
     // BUG 3: Track global concurrency
     this.globalRunning++;
 
-    // Run asynchronously
-    runner.run()
+    // Run asynchronously — BUG#5: await DB persist before inference
+    (async () => {
+      // Persist subtask_started event before running inference
+      await this.db.appendSubAgentEvent(task.conversationId, 'subtask_started', {
+        groupId: task.groupId,
+        taskId: task.taskId,
+        conversationId: task.conversationId,
+        timestamp: Date.now(),
+      }, task.userId).catch(err =>
+        console.error(`[SubAgentManager] Failed to log subtask_started: ${err.message}`)
+      );
+      return runner.run();
+    })()
       .then(async (result) => {
         // H1: Clear lease timer
         this.clearLeaseTimer(task.taskId);
@@ -1177,7 +1265,8 @@ export class SubAgentManager {
       })
       .finally(() => {
         // BUG 3: Guaranteed decrement + unblock tasks from ALL groups waiting for global slot
-        this.globalRunning--;
+        // BUG#13: Clamp to 0 to prevent negative drift from edge cases
+        this.globalRunning = Math.max(0, this.globalRunning - 1);
         // SA#3: Guard against stale group reference — group may have been deleted
         if (this.groups.has(group.groupId)) {
           this.maybeStartTasks(group);
