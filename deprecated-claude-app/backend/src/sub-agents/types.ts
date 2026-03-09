@@ -46,6 +46,7 @@ export interface SubAgentTask {
   conversationId: string;
   userId: string;
   instruction: string;
+  context?: SubAgentContext;      // Optional structured context for the task
   state: SubAgentState;
   forkPoint: number;           // messages.length in parent conversation at fork time
   forkBranchId: string | null; // activeBranchId of the last message at fork time (for branch-aware history)
@@ -64,6 +65,15 @@ export interface TaskMetrics {
   outputTokens: number;
   toolCalls: number;
   durationMs: number;
+}
+
+export interface SubAgentContext {
+  /** File paths or URIs relevant to the task. */
+  files?: string[];
+  /** Arbitrary key-value data pairs. */
+  data?: Record<string, string>;
+  /** Results from previously completed sub-agent tasks. */
+  previousResults?: string[];
 }
 
 export interface TaskGroupConfig {
@@ -112,6 +122,7 @@ export type SubAgentEventType =
   | 'subtask_completed'
   | 'subtask_failed'
   | 'subtask_cancelled'
+  | 'subtask_instruction_updated'
   | 'subtask_group_finalized'
   | 'subtask_group_auto_finalized'
   | 'queued_user_turn'
@@ -125,6 +136,7 @@ export interface SubAgentLifecycleEvent {
   conversationId: string;
   userId: string;
   instruction?: string;
+  context?: SubAgentContext;
   forkPoint?: number;
   forkBranchId?: string | null;
   state?: SubAgentState;
@@ -144,6 +156,7 @@ export interface SpawnSubtaskParams {
   conversationId: string;
   userId: string;
   instruction: string;
+  context?: SubAgentContext;    // Optional structured context
   groupId?: string;            // Omit to auto-create group
   maxConcurrent?: number;      // Default: 3
   leaseMs?: number;            // Default: LEASE_MS
@@ -153,6 +166,7 @@ export interface SpawnSubtasksParams {
   conversationId: string;
   userId: string;
   instructions: string[];
+  context?: SubAgentContext;    // Shared context for all tasks in the batch
   maxConcurrent?: number;
   leaseMs?: number;
 }

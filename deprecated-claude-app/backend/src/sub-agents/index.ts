@@ -5,6 +5,7 @@
 export type {
   SubAgentState,
   SubAgentTask,
+  SubAgentContext,
   TaskGroup,
   TaskGroupConfig,
   TaskMetrics,

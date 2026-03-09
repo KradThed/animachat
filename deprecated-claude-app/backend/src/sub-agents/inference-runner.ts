@@ -74,6 +74,7 @@ export class InferenceRunner {
         userId: this.task.userId,
         taskId: this.task.taskId,
         taskInstruction: this.task.instruction,
+        taskContext: this.task.context,
       });
 
       // Build tool options — exclude sub-agent tools (depth=1 limit)

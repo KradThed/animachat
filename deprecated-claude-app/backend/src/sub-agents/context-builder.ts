@@ -16,6 +16,7 @@ import type { Message, MessageBranch, Participant, Conversation } from '@depreca
 import type { Database } from '../database/index.js';
 import type { BranchEventStore } from '../database/branch-event-store.js';
 import type { Event } from '../database/persistence.js';
+import type { SubAgentContext } from './types.js';
 
 // =============================================================================
 // Types
@@ -26,6 +27,7 @@ export interface ContextBuildParams {
   userId: string;
   taskId: string;
   taskInstruction: string;
+  taskContext?: SubAgentContext;  // Optional structured context from spawn
   // forkPoint/forkBranchId: stored in SubAgentTask for potential future use, not used in MVP context builder
 }
 
@@ -50,7 +52,7 @@ export class SubAgentContextBuilder {
    * Build full context for a sub-agent inference call.
    */
   async buildContext(params: ContextBuildParams): Promise<BuiltContext> {
-    const { conversationId, userId, taskId, taskInstruction } = params;
+    const { conversationId, userId, taskId, taskInstruction, taskContext } = params;
 
     // 1. Get conversation metadata
     const conversation = await this.db.getConversation(conversationId, userId);
@@ -69,6 +71,11 @@ export class SubAgentContextBuilder {
     // 4. Synthetic user message as "task anchor" — models follow user turns better than system-only.
     //    Uses contentBlocks with text block (consistent with system message format).
     //    Deterministic IDs from taskId — stable across iterations, less noise in logs.
+    let taskContent = `Task: ${taskInstruction}`;
+    if (taskContext) {
+      taskContent += formatTaskContext(taskContext);
+    }
+
     const syntheticBranchId = `synthetic-branch:${taskId}`;
     const syntheticUser: Message = {
       id: `synthetic:${taskId}`,
@@ -76,8 +83,8 @@ export class SubAgentContextBuilder {
       branches: [{
         id: syntheticBranchId,
         role: 'user',
-        content: `Task: ${taskInstruction}`,
-        contentBlocks: [{ type: 'text', text: `Task: ${taskInstruction}` }],
+        content: taskContent,
+        contentBlocks: [{ type: 'text', text: taskContent }],
         createdAt: new Date(),
       }],
       activeBranchId: syntheticBranchId,
@@ -119,6 +126,34 @@ function buildSubAgentSystemPrompt(basePrompt: string, taskInstruction: string):
   ].join('\n');
 
   return basePrompt ? `${taskBlock}\n\n---\n\n${basePrompt}` : taskBlock;
+}
+
+/**
+ * Format SubAgentContext into a text block appended to the task instruction.
+ * Keeps structure readable for the LLM without being overly verbose.
+ */
+function formatTaskContext(ctx: SubAgentContext): string {
+  const parts: string[] = [];
+
+  if (ctx.files?.length) {
+    parts.push('\n\nRelevant files:\n' + ctx.files.map(f => `- ${f}`).join('\n'));
+  }
+
+  if (ctx.data && Object.keys(ctx.data).length > 0) {
+    parts.push('\n\nContext data:');
+    for (const [key, value] of Object.entries(ctx.data)) {
+      parts.push(`- ${key}: ${value}`);
+    }
+  }
+
+  if (ctx.previousResults?.length) {
+    parts.push('\n\nPrevious results:');
+    for (let i = 0; i < ctx.previousResults.length; i++) {
+      parts.push(`[Result ${i + 1}]: ${ctx.previousResults[i]}`);
+    }
+  }
+
+  return parts.join('\n');
 }
 
 /**

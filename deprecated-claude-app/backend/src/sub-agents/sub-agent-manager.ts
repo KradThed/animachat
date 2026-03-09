@@ -121,6 +121,7 @@ export class SubAgentManager {
       conversationId,
       userId,
       instruction,
+      context,
       maxConcurrent = 3,
       leaseMs = LEASE_MS,
     } = params;
@@ -225,6 +226,7 @@ export class SubAgentManager {
       conversationId,
       userId,
       instruction,
+      ...(context ? { context } : {}),
       state: 'QUEUED',
       forkPoint,
       forkBranchId,
@@ -246,6 +248,7 @@ export class SubAgentManager {
       conversationId,
       userId,
       instruction,
+      ...(context ? { context } : {}),
       forkPoint,
       forkBranchId,
       timestamp: Date.now(),
@@ -273,6 +276,7 @@ export class SubAgentManager {
     const {
       conversationId,
       userId,
+      context,
       maxConcurrent = 3,
       leaseMs = LEASE_MS,
     } = params;
@@ -337,6 +341,7 @@ export class SubAgentManager {
         conversationId,
         userId,
         instruction,
+        ...(context ? { context } : {}),
         state: 'QUEUED',
         forkPoint,
         forkBranchId,
@@ -370,6 +375,7 @@ export class SubAgentManager {
           conversationId,
           userId,
           instruction: task.instruction,
+          ...(context ? { context } : {}),
           forkPoint,
           forkBranchId,
           timestamp: Date.now(),
@@ -509,6 +515,248 @@ export class SubAgentManager {
     }
 
     return { found: false, results: [], conversationId: null };
+  }
+
+  // --------------------------------------------------------------------------
+  // Task-Level Operations
+  // --------------------------------------------------------------------------
+
+  /**
+   * Look up a single task by taskId across all active groups.
+   * Returns the task and its group, or null if not found.
+   */
+  getTask(taskId: string, conversationId?: string): { task: SubAgentTask; group: TaskGroup } | null {
+    for (const group of this.groups.values()) {
+      const task = group.tasks.get(taskId);
+      if (task) {
+        // BUG 11: Ownership validation
+        if (conversationId && group.conversationId !== conversationId) {
+          throw new Error('Task does not belong to this conversation');
+        }
+        return { task, group };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Update the instruction for a QUEUED task.
+   * Only works if the task has not started running yet.
+   */
+  async updateTaskInstruction(
+    taskId: string,
+    newInstruction: string,
+    conversationId: string,
+    userId: string,
+  ): Promise<SubAgentTask> {
+    const found = this.getTask(taskId, conversationId);
+    if (!found) {
+      throw new Error(`Task ${taskId} not found`);
+    }
+
+    const { task } = found;
+
+    if (task.state !== 'QUEUED') {
+      throw new Error(`Cannot update instruction: task ${taskId} is ${task.state} (must be QUEUED)`);
+    }
+
+    const previousInstruction = task.instruction;
+    task.instruction = newInstruction;
+
+    // Persist lifecycle event
+    await this.db.appendSubAgentEvent(conversationId, 'subtask_instruction_updated', {
+      groupId: task.groupId,
+      taskId,
+      conversationId,
+      userId,
+      instruction: newInstruction,
+      previousInstruction,
+      timestamp: Date.now(),
+    }, userId);
+
+    return task;
+  }
+
+  /**
+   * Get intermediate progress of a running task.
+   * Reads events from BranchEventStore to extract tool call info.
+   */
+  async getTaskProgress(
+    taskId: string,
+    conversationId: string,
+    maxEvents: number = 20,
+  ): Promise<{
+    taskId: string;
+    state: SubAgentState;
+    instruction: string;
+    toolsCalled: string[];
+    eventCount: number;
+    lastActivityAt: number | null;
+    metrics: TaskMetrics;
+  }> {
+    const found = this.getTask(taskId, conversationId);
+    if (!found) {
+      throw new Error(`Task ${taskId} not found`);
+    }
+
+    const { task } = found;
+
+    // Load branch events for this task
+    const events = await this.branchStore.loadEvents(taskId);
+
+    // Extract tool names from events
+    const toolsCalled: string[] = [];
+    let lastActivityAt: number | null = null;
+
+    for (const event of events) {
+      if (event.timestamp) {
+        const ts = event.timestamp instanceof Date ? event.timestamp.getTime() : Number(event.timestamp);
+        if (lastActivityAt === null || ts > lastActivityAt) {
+          lastActivityAt = ts;
+        }
+      }
+
+      // Tool calls are embedded in assistant_message contentBlocks
+      if (event.type === 'assistant_message' && event.data?.contentBlocks) {
+        for (const block of event.data.contentBlocks) {
+          if (block.type === 'tool_use' && block.name) {
+            toolsCalled.push(block.name);
+          }
+        }
+      }
+    }
+
+    return {
+      taskId,
+      state: task.state,
+      instruction: task.instruction,
+      toolsCalled: toolsCalled.slice(-maxEvents),
+      eventCount: events.length,
+      lastActivityAt,
+      metrics: task.metrics,
+    };
+  }
+
+  /**
+   * Dynamically update maxConcurrent for a group.
+   * If increased, immediately attempts to start queued tasks.
+   */
+  setGroupConcurrency(
+    groupId: string,
+    maxConcurrent: number,
+    conversationId: string,
+  ): TaskGroupConfig {
+    const group = this.groups.get(groupId);
+    if (!group) {
+      throw new Error(`Group ${groupId} not found`);
+    }
+
+    // BUG 11: Ownership validation
+    if (group.conversationId !== conversationId) {
+      throw new Error('Group does not belong to this conversation');
+    }
+
+    // Validate bounds
+    if (maxConcurrent < 1 || maxConcurrent > this.MAX_GLOBAL_CONCURRENT) {
+      throw new Error(`maxConcurrent must be between 1 and ${this.MAX_GLOBAL_CONCURRENT}`);
+    }
+
+    const oldConcurrency = group.config.maxConcurrent;
+    group.config.maxConcurrent = maxConcurrent;
+
+    // If concurrency increased, try to start queued tasks
+    if (maxConcurrent > oldConcurrency) {
+      this.maybeStartTasks(group);
+    }
+
+    return { ...group.config };
+  }
+
+  /**
+   * Get aggregated metrics across all tasks in a group.
+   * Works from in-memory groups or finalizeResultCache.
+   */
+  getGroupMetrics(
+    groupId: string,
+    conversationId: string,
+  ): {
+    groupId: string;
+    taskCount: number;
+    completedCount: number;
+    errorCount: number;
+    cancelledCount: number;
+    runningCount: number;
+    queuedCount: number;
+    totalInputTokens: number;
+    totalOutputTokens: number;
+    totalToolCalls: number;
+    totalDurationMs: number;
+  } {
+    // Try active group first
+    const group = this.groups.get(groupId);
+    if (group) {
+      if (group.conversationId !== conversationId) {
+        throw new Error('Group does not belong to this conversation');
+      }
+      return this.aggregateGroupMetrics(groupId, [...group.tasks.values()]);
+    }
+
+    // Fallback to cache
+    const cached = this.finalizeResultCache.get(groupId);
+    if (cached && cached.expiresAt > Date.now()) {
+      if (cached.conversationId !== conversationId) {
+        throw new Error('Group does not belong to this conversation');
+      }
+      return this.aggregateGroupMetrics(groupId, cached.results.map(r => ({
+        state: r.state,
+        metrics: r.metrics,
+      })));
+    }
+
+    throw new Error(`Group ${groupId} not found`);
+  }
+
+  private aggregateGroupMetrics(
+    groupId: string,
+    tasks: Array<{ state: SubAgentState | string; metrics: TaskMetrics }>,
+  ): {
+    groupId: string;
+    taskCount: number;
+    completedCount: number;
+    errorCount: number;
+    cancelledCount: number;
+    runningCount: number;
+    queuedCount: number;
+    totalInputTokens: number;
+    totalOutputTokens: number;
+    totalToolCalls: number;
+    totalDurationMs: number;
+  } {
+    let completedCount = 0, errorCount = 0, cancelledCount = 0;
+    let runningCount = 0, queuedCount = 0;
+    let totalInputTokens = 0, totalOutputTokens = 0;
+    let totalToolCalls = 0, totalDurationMs = 0;
+
+    for (const t of tasks) {
+      switch (t.state) {
+        case 'FINALIZED': completedCount++; break;
+        case 'ERROR': errorCount++; break;
+        case 'CANCELLED': cancelledCount++; break;
+        case 'RUNNING': case 'FINALIZING': runningCount++; break;
+        case 'QUEUED': queuedCount++; break;
+      }
+      totalInputTokens += t.metrics.inputTokens;
+      totalOutputTokens += t.metrics.outputTokens;
+      totalToolCalls += t.metrics.toolCalls;
+      totalDurationMs += t.metrics.durationMs;
+    }
+
+    return {
+      groupId,
+      taskCount: tasks.length,
+      completedCount, errorCount, cancelledCount, runningCount, queuedCount,
+      totalInputTokens, totalOutputTokens, totalToolCalls, totalDurationMs,
+    };
   }
 
   // --------------------------------------------------------------------------
@@ -1003,6 +1251,7 @@ export class SubAgentManager {
       conversationId: data.conversationId,
       userId: data.userId,
       instruction: data.instruction,
+      ...(data.context ? { context: data.context } : {}),
       state: 'QUEUED', // will be updated by terminal events
       forkPoint: data.forkPoint ?? 0,
       forkBranchId: data.forkBranchId ?? null,

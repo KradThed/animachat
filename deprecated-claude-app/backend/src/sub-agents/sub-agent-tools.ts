@@ -1,17 +1,22 @@
 /**
  * Sub-Agent Tools
  *
- * Registers 6 tools with the tool registry for LLM-driven sub-agent orchestration:
- *   1. spawn_subtask    — spawn a single sub-agent
- *   2. spawn_subtasks   — batch spawn multiple sub-agents
+ * Registers 10 tools with the tool registry for LLM-driven sub-agent orchestration:
+ *   1. spawn_subtask    — spawn a single sub-agent (with optional context)
+ *   2. spawn_subtasks   — batch spawn multiple sub-agents (with optional context)
  *   3. poll_subtasks    — check status of a task group
  *   4. get_subtask_results — get results of completed tasks
  *   5. cancel_subtasks  — cancel running tasks in a group
  *   6. finalize_task_group — finalize + unfreeze parent conversation
+ *   7. get_subtask_progress — intermediate progress of a running task
+ *   8. update_subtask_instruction — modify instruction for a QUEUED task
+ *   9. set_group_concurrency — dynamically change maxConcurrent for a group
+ *  10. get_group_metrics — aggregated metrics across all tasks in a group
  */
 
 import { toolRegistry } from '../tools/tool-registry.js';
 import type { SubAgentManager } from './sub-agent-manager.js';
+import type { SubAgentContext } from './types.js';
 
 // =============================================================================
 // Constants
@@ -27,6 +32,8 @@ const MAX_RESULT_FULL = 4000;
 export const SUB_AGENT_TOOL_NAMES = new Set([
   'spawn_subtask', 'spawn_subtasks', 'poll_subtasks',
   'get_subtask_results', 'cancel_subtasks', 'finalize_task_group',
+  'get_subtask_progress', 'update_subtask_instruction',
+  'set_group_concurrency', 'get_group_metrics',
 ]);
 
 /**
@@ -66,6 +73,27 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
             type: 'string',
             description: 'Optional group ID to add this task to an existing group',
           },
+          context: {
+            type: 'object',
+            description: 'Optional structured context for the sub-agent (files, data, previous results)',
+            properties: {
+              files: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'File paths or URIs relevant to the task',
+              },
+              data: {
+                type: 'object',
+                additionalProperties: { type: 'string' },
+                description: 'Arbitrary key-value data pairs',
+              },
+              previousResults: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Results from previously completed sub-agent tasks',
+              },
+            },
+          },
         },
         required: ['instruction'],
       },
@@ -83,6 +111,7 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
           userId: context.userId,
           instruction: instruction as string,
           groupId: input.groupId as string | undefined,
+          context: input.context as SubAgentContext | undefined,
         });
 
         return {
@@ -127,6 +156,27 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
             type: 'number',
             description: 'Maximum concurrent sub-agents (default: 3)',
           },
+          context: {
+            type: 'object',
+            description: 'Optional structured context shared by all sub-agents (files, data, previous results)',
+            properties: {
+              files: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'File paths or URIs relevant to the tasks',
+              },
+              data: {
+                type: 'object',
+                additionalProperties: { type: 'string' },
+                description: 'Arbitrary key-value data pairs',
+              },
+              previousResults: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Results from previously completed sub-agent tasks',
+              },
+            },
+          },
         },
         required: ['instructions'],
       },
@@ -149,6 +199,7 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
           userId: context.userId,
           instructions: instructions as string[],
           maxConcurrent: input.maxConcurrent as number | undefined,
+          context: input.context as SubAgentContext | undefined,
         });
 
         // BUG T-7: Guard against empty result array (groupId would be undefined)
@@ -413,7 +464,224 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
     },
   );
 
-  console.log('[SubAgentTools] Registered 6 sub-agent tools');
+  // -------------------------------------------------------------------------
+  // 7. get_subtask_progress
+  // -------------------------------------------------------------------------
+  toolRegistry.registerMcplManagementTool(
+    'get_subtask_progress',
+    {
+      name: 'get_subtask_progress',
+      description:
+        'Get intermediate progress of a sub-agent task. ' +
+        'Shows tools called, event count, and last activity. ' +
+        'Works for tasks in any state, most useful for RUNNING tasks.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          taskId: {
+            type: 'string',
+            description: 'The task ID to get progress for',
+          },
+        },
+        required: ['taskId'],
+      },
+    },
+    async (input, context) => {
+      try {
+        // H6: Input validation
+        const taskId = input.taskId;
+        if (typeof taskId !== 'string' || !taskId.trim()) {
+          return { toolUseId: '', content: 'Error: taskId must be a non-empty string', isError: true };
+        }
+
+        const progress = await manager.getTaskProgress(
+          taskId as string,
+          context.conversationId,
+        );
+
+        return {
+          toolUseId: '',
+          content: JSON.stringify(progress),
+        };
+      } catch (error) {
+        return {
+          toolUseId: '',
+          content: `Error getting subtask progress: ${error instanceof Error ? error.message : String(error)}`,
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // 8. update_subtask_instruction
+  // -------------------------------------------------------------------------
+  toolRegistry.registerMcplManagementTool(
+    'update_subtask_instruction',
+    {
+      name: 'update_subtask_instruction',
+      description:
+        'Update the instruction for a QUEUED sub-agent task. ' +
+        'Only works if the task has not started running yet.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          taskId: {
+            type: 'string',
+            description: 'The task ID to update',
+          },
+          instruction: {
+            type: 'string',
+            description: 'The new instruction for the sub-agent',
+          },
+        },
+        required: ['taskId', 'instruction'],
+      },
+    },
+    async (input, context) => {
+      try {
+        // H6: Input validation
+        const taskId = input.taskId;
+        if (typeof taskId !== 'string' || !taskId.trim()) {
+          return { toolUseId: '', content: 'Error: taskId must be a non-empty string', isError: true };
+        }
+        const instruction = input.instruction;
+        if (typeof instruction !== 'string' || !instruction.trim()) {
+          return { toolUseId: '', content: 'Error: instruction must be a non-empty string', isError: true };
+        }
+
+        const task = await manager.updateTaskInstruction(
+          taskId as string,
+          instruction as string,
+          context.conversationId,
+          context.userId,
+        );
+
+        return {
+          toolUseId: '',
+          content: JSON.stringify({
+            taskId: task.taskId,
+            groupId: task.groupId,
+            instruction: task.instruction,
+            state: task.state,
+          }),
+        };
+      } catch (error) {
+        return {
+          toolUseId: '',
+          content: `Error updating subtask instruction: ${error instanceof Error ? error.message : String(error)}`,
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // 9. set_group_concurrency
+  // -------------------------------------------------------------------------
+  toolRegistry.registerMcplManagementTool(
+    'set_group_concurrency',
+    {
+      name: 'set_group_concurrency',
+      description:
+        'Dynamically change the maximum concurrent sub-agents for a task group. ' +
+        'If increased, queued tasks may start immediately.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          groupId: {
+            type: 'string',
+            description: 'The task group ID',
+          },
+          maxConcurrent: {
+            type: 'number',
+            description: 'New maximum concurrent sub-agents (1-10)',
+          },
+        },
+        required: ['groupId', 'maxConcurrent'],
+      },
+    },
+    async (input, context) => {
+      try {
+        // H6: Input validation
+        const groupId = input.groupId;
+        if (typeof groupId !== 'string' || !groupId.trim()) {
+          return { toolUseId: '', content: 'Error: groupId must be a non-empty string', isError: true };
+        }
+        const maxConcurrent = input.maxConcurrent;
+        if (typeof maxConcurrent !== 'number' || !Number.isInteger(maxConcurrent)) {
+          return { toolUseId: '', content: 'Error: maxConcurrent must be an integer', isError: true };
+        }
+
+        const config = manager.setGroupConcurrency(
+          groupId as string,
+          maxConcurrent as number,
+          context.conversationId,
+        );
+
+        return {
+          toolUseId: '',
+          content: JSON.stringify({ groupId, config }),
+        };
+      } catch (error) {
+        return {
+          toolUseId: '',
+          content: `Error setting group concurrency: ${error instanceof Error ? error.message : String(error)}`,
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // 10. get_group_metrics
+  // -------------------------------------------------------------------------
+  toolRegistry.registerMcplManagementTool(
+    'get_group_metrics',
+    {
+      name: 'get_group_metrics',
+      description:
+        'Get aggregated metrics across all tasks in a group: token counts, tool calls, duration, ' +
+        'and per-state task counts.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          groupId: {
+            type: 'string',
+            description: 'The task group ID to get metrics for',
+          },
+        },
+        required: ['groupId'],
+      },
+    },
+    async (input, context) => {
+      try {
+        // H6: Input validation
+        const groupId = input.groupId;
+        if (typeof groupId !== 'string' || !groupId.trim()) {
+          return { toolUseId: '', content: 'Error: groupId must be a non-empty string', isError: true };
+        }
+
+        const metrics = manager.getGroupMetrics(
+          groupId as string,
+          context.conversationId,
+        );
+
+        return {
+          toolUseId: '',
+          content: JSON.stringify(metrics),
+        };
+      } catch (error) {
+        return {
+          toolUseId: '',
+          content: `Error getting group metrics: ${error instanceof Error ? error.message : String(error)}`,
+          isError: true,
+        };
+      }
+    },
+  );
+
+  console.log('[SubAgentTools] Registered 10 sub-agent tools');
 }
 
 // =============================================================================
