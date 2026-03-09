@@ -73,8 +73,8 @@ export class SharesStore {
   private generateToken(): string {
     let token: string;
     do {
-      // Generate 10 character alphanumeric token
-      token = crypto.randomBytes(5).toString('hex');
+      // Generate 40 character hex token (160 bits of entropy)
+      token = crypto.randomBytes(20).toString('hex');
     } while (this.sharesByToken.has(token));
     return token;
   }

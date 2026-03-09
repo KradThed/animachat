@@ -91,7 +91,7 @@ export const ToolCallRequestMessageSchema = z.object({
     name: z.string(),
     input: z.record(z.unknown()),
   }),
-  timeout: z.number().default(30000),
+  timeout: z.number().default(300_000),
   scopeContext: z.object({                    // Phase 7 Batch 4c — scope tagging
     featureSet: z.string(),
     activeCapabilities: z.array(z.string()),
@@ -205,6 +205,9 @@ export const McplScopeChangeRequestMessageSchema = z.object({
   serverId: z.string(),
   requestedCapabilities: z.array(z.string()),
   reason: z.string(),
+  conversationId: z.string().optional(),
+  url: z.string().optional(),
+  serverName: z.string().optional(),
 });
 
 /** Server → Delegate: connect a new MCP server (type only — NOT in union yet) */

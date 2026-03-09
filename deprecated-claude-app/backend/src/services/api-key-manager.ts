@@ -66,8 +66,8 @@ export class ApiKeyManager {
     // Try to find a suitable system API key profile
     const profile = await this.configLoader.getBestProfile(provider, modelId, userGroup);
     if (profile) {
-      const keyInfo = 'apiKey' in profile.credentials 
-        ? `API key ending in ...${profile.credentials.apiKey?.slice(-8)}`
+      const keyInfo = 'apiKey' in profile.credentials
+        ? `API key [REDACTED]`
         : `AWS credentials`;
       console.log(`[ApiKeyManager] Found config profile: ${profile.id} with ${keyInfo}`);
       return {

@@ -846,8 +846,9 @@ export class SubAgentManager {
       );
     }
 
+    // SA#8: await finalization — caller must handle the result before proceeding
     // finalizeTaskGroup sees all tasks terminal → skips cancel → writes group_finalized event
-    this.finalizeTaskGroup(groupId, true).catch(err =>
+    await this.finalizeTaskGroup(groupId, true).catch(err =>
       console.error(`[Recovery] Failed to finalize stale group ${groupId}:`, err)
     );
   }
@@ -1177,7 +1178,10 @@ export class SubAgentManager {
       .finally(() => {
         // BUG 3: Guaranteed decrement + unblock tasks from ALL groups waiting for global slot
         this.globalRunning--;
-        this.maybeStartTasks(group);
+        // SA#3: Guard against stale group reference — group may have been deleted
+        if (this.groups.has(group.groupId)) {
+          this.maybeStartTasks(group);
+        }
         for (const g of this.groups.values()) {
           if (g.groupId !== group.groupId && g.finalizedAt === null) {
             this.maybeStartTasks(g);

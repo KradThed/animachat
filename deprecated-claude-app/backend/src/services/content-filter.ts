@@ -90,7 +90,7 @@ function getOpenAIApiKey(): string | null {
   
   // Try environment variable first
   const envKey = process.env.OPENAI_API_KEY;
-  console.log(`[Content Filter] Checking for OPENAI_API_KEY: ${envKey ? 'found (' + envKey.slice(0, 10) + '...)' : 'not found'}`);
+  console.log(`[Content Filter] Checking for OPENAI_API_KEY: ${envKey ? 'found (set)' : 'not found'}`);
   if (envKey) {
     cachedApiKey = envKey;
     return envKey;
@@ -109,23 +109,24 @@ function getOpenAIApiKey(): string | null {
  */
 export async function checkContent(content: string, userContext?: UserContext): Promise<FilterResult> {
   console.log(`[Content Filter] checkContent called with ${content?.length || 0} chars, context: ${JSON.stringify(userContext || {})}`);
-  
-  // Admins bypass all content filtering
-  if (userContext?.isAdmin) {
-    console.log(`[Content Filter] Admin user - bypassing all moderation`);
-    return { blocked: false };
-  }
-  
+
   if (!content || typeof content !== 'string' || content.trim().length === 0) {
     return { blocked: false };
   }
 
-  // First, do a quick regex check for the absolute worst terms
-  // This catches cases the API might miss
+  // ALWAYS_BLOCKED categories are checked for ALL users, including admins.
+  // This ensures CSAM and self-harm/instructions are never bypassed.
   const syncResult = checkContentSync(content);
   if (syncResult.blocked) {
-    console.warn(`[Content Filter] Blocked by regex fallback`);
+    console.warn(`[Content Filter] Blocked by regex fallback (ALWAYS_BLOCKED)`);
     return syncResult;
+  }
+
+  // Admins bypass soft moderation (age-restricted, researcher-exempt)
+  // but NOT the ALWAYS_BLOCKED categories checked above
+  if (userContext?.isAdmin) {
+    console.log(`[Content Filter] Admin user - bypassing soft moderation`);
+    return { blocked: false };
   }
 
   const apiKey = getOpenAIApiKey();
@@ -255,11 +256,29 @@ export function checkContentSync(content: string): FilterResult {
     return { blocked: false };
   }
 
-  // Very basic patterns for absolute worst-case fallback
-  const CRITICAL_PATTERNS: RegExp[] = [
+  // ALWAYS_BLOCKED fallback patterns — catches critical content even when API is down.
+  // These correspond to ALWAYS_BLOCKED_CATEGORIES: sexual/minors, self-harm/instructions.
+  const ALWAYS_BLOCKED_PATTERNS: RegExp[] = [
+    // sexual/minors indicators
+    /\bchild\s+(?:porn|sex|nude|naked)/i,
+    /\bcp\b.*\b(?:link|download|share)/i,
+    /\bminor[s]?\s+(?:sex|nude|naked|porn)/i,
+    /\bunderage\s+(?:sex|nude|naked|porn)/i,
+    // self-harm/instructions indicators
+    /\bhow\s+to\s+(?:kill|hang|poison)\s+(?:yourself|myself|oneself)/i,
+    /\bsuicide\s+method/i,
+  ];
+
+  // Hate speech patterns
+  const HATE_PATTERNS: RegExp[] = [
     /\bn[i1!|]gg[e3a@]r/i,
     /\bkill\s+(?:all\s+)?(?:jews|muslims|blacks|whites|gays|trans)/i,
     /\bgas\s+the\s+jews/i,
+  ];
+
+  const CRITICAL_PATTERNS: RegExp[] = [
+    ...ALWAYS_BLOCKED_PATTERNS,
+    ...HATE_PATTERNS,
   ];
 
   const normalized = content.toLowerCase();

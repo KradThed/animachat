@@ -38,6 +38,7 @@ import './tools/server-tools.js';
 import { Database } from './database/index.js';
 import { initBlobStore } from './database/blob-store.js';
 import { authenticateToken } from './middleware/auth.js';
+import rateLimit from 'express-rate-limit';
 import { OpenRouterService } from './services/openrouter.js';
 import { updateOpenRouterModelsCache, setOpenRouterRefreshCallback } from './services/pricing-cache.js';
 
@@ -129,7 +130,26 @@ app.use(cors({
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
+// Rate limiting for auth endpoints (brute-force protection)
+const loginLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 10,             // 10 requests per minute per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts. Please try again later.' },
+});
+const registerLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 3,              // 3 requests per minute per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many registration attempts. Please try again later.' },
+});
+
 // Routes
+app.use('/api/auth/login', loginLimiter);
+app.use('/api/auth/register', registerLimiter);
+app.use('/api/auth/forgot-password', registerLimiter);
 app.use('/api/auth', authRouter(db));
 app.use('/api/public/models', publicModelRouter());
 app.use('/api/conversations', authenticateToken, conversationRouter(db));
@@ -138,12 +158,12 @@ app.use('/api/models/custom', authenticateToken, customModelsRouter(db));
 app.use('/api/models', authenticateToken, modelRouter(db));
 app.use('/api/participants', authenticateToken, participantRouter(db));
 app.use('/api/import', authenticateToken, importRouter(db));
-app.use('/api/prompt', createPromptRouter(db));
-app.use('/api/shares', createShareRouter(db));
-app.use('/api/bookmarks', createBookmarksRouter(db));
-app.use('/api/invites', createInvitesRouter(db));
-app.use('/api/admin', adminRouter(db));
-app.use('/api/collaboration', collaborationRouter(db));
+app.use('/api/prompt', authenticateToken, createPromptRouter(db));
+app.use('/api/shares', createShareRouter(db)); // Has public GET /:token + per-route auth
+app.use('/api/bookmarks', authenticateToken, createBookmarksRouter(db));
+app.use('/api/invites', createInvitesRouter(db)); // Has public /:code/check + per-route auth
+app.use('/api/admin', authenticateToken, adminRouter(db)); // Defense-in-depth (also has router.use(authenticateToken))
+app.use('/api/collaboration', collaborationRouter(db)); // Has public /invites/token/:token + router.use(authenticateToken)
 app.use('/api/personas', authenticateToken, personaRouter(db));
 app.use('/api/avatars', authenticateToken, avatarRouter);
 app.use('/api/blobs', blobRouter); // No auth - blobs are served by ID (content-addressed)
@@ -194,7 +214,7 @@ wss.on('connection', (ws, req) => {
 });
 
 // INF-4+5: Periodically evict idle conversations to prevent memory leaks
-startEvictionTimer(db);
+const evictionTimer = startEvictionTimer(db);
 
 // Start server
 async function startServer() {
@@ -367,9 +387,32 @@ let _resourceCoordinator: { destroy(): void } | null = null;
 
 async function gracefulShutdown(signal: string) {
   console.log(`${signal} received. Shutting down gracefully...`);
-  _resourceCoordinator?.destroy();
-  await _branchStore?.close();
-  await db.close();
+
+  // Force exit after 10s if graceful shutdown stalls
+  const forceTimer = setTimeout(() => {
+    console.error('Graceful shutdown timed out after 10s, forcing exit');
+    process.exit(1);
+  }, 10000);
+  forceTimer.unref();
+
+  try {
+    _resourceCoordinator?.destroy();
+    clearInterval(evictionTimer);
+
+    // Close WebSocket server (stops accepting new connections, closes existing)
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+
+    // Close HTTP(S) server
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+
+    await _branchStore?.close();
+    await db.close();
+  } catch (err) {
+    console.error('Error during graceful shutdown:', err);
+  }
+
   process.exit(0);
 }
 

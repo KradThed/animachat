@@ -361,7 +361,7 @@ export function createStore(): {
       state.user = null;
       state.conversations = [];
       state.currentConversation = null;
-      state.messages = [];
+      state.allMessages = [];
       this.disconnectWebSocket();
     },
     

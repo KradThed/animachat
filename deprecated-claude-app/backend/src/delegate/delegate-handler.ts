@@ -394,12 +394,10 @@ export async function delegateWebsocketHandler(
   req: IncomingMessage,
   db: Database
 ): Promise<void> {
-  // Parse query parameters
+  // Parse query parameters (only non-sensitive routing params in URL)
   const url = new URL(req.url || '', `http://${req.headers.host}`);
-  const token = url.searchParams.get('token');
-  const apiKey = url.searchParams.get('apiKey');
 
-  // Strict delegateId validation
+  // Strict delegateId validation (delegateId is in URL — non-sensitive identifier)
   const delegateIdResult = validateDelegateId(url.searchParams.get('delegateId'));
   if (!delegateIdResult.valid) {
     console.warn(`[DelegateHandler] Invalid delegateId: ${delegateIdResult.reason}`);
@@ -407,6 +405,44 @@ export async function delegateWebsocketHandler(
     return;
   }
   let delegateId = delegateIdResult.delegateId;  // trimmed, validated; may be overridden by DB namespace
+
+  // Support both first-message auth (new) and URL params (legacy backward compat)
+  let token = url.searchParams.get('token');
+  let apiKey = url.searchParams.get('apiKey');
+
+  if (!token && !apiKey) {
+    // New flow: wait for first message with auth credentials
+    try {
+      const authMsg = await new Promise<Record<string, unknown>>((resolve, reject) => {
+        const authTimeout = setTimeout(() => {
+          ws.close(1008, 'Authentication timeout');
+          reject(new Error('Authentication timeout'));
+        }, 5000);
+
+        ws.once('message', (data) => {
+          clearTimeout(authTimeout);
+          try {
+            const msg = JSON.parse(data.toString());
+            if (msg.type !== 'delegate_auth') {
+              ws.close(1008, 'First message must be delegate_auth');
+              reject(new Error('Invalid auth message'));
+              return;
+            }
+            resolve(msg);
+          } catch {
+            ws.close(1008, 'Invalid auth message');
+            reject(new Error('Invalid auth message'));
+          }
+        });
+      });
+
+      token = (authMsg.token as string) || null;
+      apiKey = (authMsg.apiKey as string) || null;
+    } catch {
+      // Connection already closed by timeout/error handler above
+      return;
+    }
+  }
 
   if (!token && !apiKey) {
     console.warn('[DelegateHandler] Missing token or apiKey');

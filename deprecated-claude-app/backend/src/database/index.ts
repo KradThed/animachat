@@ -2837,18 +2837,19 @@ export class Database {
     return Array.from(this.apiKeys.values()).filter(key => key.userId === userId);
   }
   
-  async deleteApiKey(keyId: string): Promise<boolean> {
+  async deleteApiKey(keyId: string, userId?: string): Promise<boolean> {
     const apiKey = this.apiKeys.get(keyId);
-    if (!apiKey) {
+    // Same response for "not found" and "not yours" to prevent enumeration
+    if (!apiKey || (userId && apiKey.userId !== userId)) {
       return false;
     }
-    
+
     // Log deletion event for persistence
-    await this.logEvent('api_key_deleted', { 
+    await this.logEvent('api_key_deleted', {
       apiKeyId: keyId,
-      userId: apiKey.userId 
+      userId: apiKey.userId
     });
-    
+
     return this.apiKeys.delete(keyId);
   }
 

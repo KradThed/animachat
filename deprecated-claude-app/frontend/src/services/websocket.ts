@@ -33,6 +33,11 @@ export class WebSocketService {
     this.token = token;
     this.setupVisibilityHandler();
   }
+
+  /** Update the auth token (e.g. after token refresh). Used on next reconnect. */
+  updateToken(newToken: string): void {
+    this.token = newToken;
+  }
   
   private setupVisibilityHandler(): void {
     // Handle tab visibility changes (Safari aggressively suspends background tabs)
@@ -115,7 +120,7 @@ export class WebSocketService {
     
     const wsUrl = new URL('/ws', window.location.href);
     wsUrl.protocol = wsUrl.protocol === 'https:' ? 'wss:' : 'ws:';
-    wsUrl.searchParams.set('token', this.token);
+    // Token sent as first message after open (not in URL to avoid proxy log leaks)
     
     // Add unique tab identifier to work around Safari + iCloud Private Relay bug
     // where multiple WebSocket connections to the same host:port are serialized.
@@ -175,20 +180,24 @@ export class WebSocketService {
     }, 20000);
     
     this.ws.onopen = () => {
-      console.log('[WS] Connected successfully');
+      console.log('[WS] Connected, sending auth...');
       // Clear connection timeout
       if (this.connectionTimeout) {
         clearTimeout(this.connectionTimeout);
         this.connectionTimeout = null;
       }
+
+      // Send auth token as first message (instead of URL param)
+      this.ws!.send(JSON.stringify({ type: 'auth', token: this.token }));
+
       this.reconnectAttempts = 0;
       this.lastPongTime = Date.now();
       this.emit('connection_state', { state: 'connected' });
-      
+
       // Start client-side keep-alive (Safari needs this more frequently)
       // Send a ping every 15 seconds to keep the connection alive
       this.startKeepAlive();
-      
+
       // Send queued messages
       while (this.messageQueue.length > 0) {
         const message = this.messageQueue.shift();

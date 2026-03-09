@@ -7,7 +7,12 @@ export interface AuthRequest extends Request {
   params: any;
 }
 
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+const _jwtSecret = process.env.JWT_SECRET;
+if (!_jwtSecret || _jwtSecret.length < 32) {
+  console.error('FATAL: JWT_SECRET environment variable must be set and at least 32 characters');
+  process.exit(1);
+}
+const JWT_SECRET: string = _jwtSecret;
 
 export function authenticateToken(req: AuthRequest, res: Response, next: NextFunction) {
   const authHeader = req.headers['authorization'];

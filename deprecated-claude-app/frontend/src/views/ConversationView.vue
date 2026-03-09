@@ -92,7 +92,12 @@
               </template>
               <template v-slot:subtitle>
                 <div>
-                  <div class="text-caption" v-html="getConversationModelsHtml(conversation)"></div>
+                  <div class="text-caption">
+                    <template v-for="(part, idx) in getConversationModelParts(conversation)" :key="idx">
+                      <span v-if="idx > 0"> &bull; </span>
+                      <span :style="{ color: part.color, fontWeight: 500 }">{{ part.name }}</span>
+                    </template>
+                  </div>
                   <div class="text-caption text-medium-emphasis">{{ formatDate(conversation.updatedAt) }}</div>
                 </div>
               </template>
@@ -1372,6 +1377,10 @@ const getStuckThresholdMs = () => {
 // (console.log -> push to ref -> reactivity -> re-render -> console.log -> ...)
 let consoleLogs: string[] = [];
 const MAX_CONSOLE_LOGS = 200;
+// #21: Store original console methods so we can restore them on unmount
+let _origConsoleLog: ((...args: any[]) => void) | null = null;
+let _origConsoleWarn: ((...args: any[]) => void) | null = null;
+let _origConsoleError: ((...args: any[]) => void) | null = null;
 
 // General error snackbar (for non-streaming errors like pricing validation)
 const errorSnackbar = ref(false);
@@ -2249,6 +2258,10 @@ onMounted(async () => {
     const originalLog = console.log;
     const originalWarn = console.warn;
     const originalError = console.error;
+    // #21: Save originals for restoration in onBeforeUnmount
+    _origConsoleLog = originalLog;
+    _origConsoleWarn = originalWarn;
+    _origConsoleError = originalError;
     
     const captureLog = (level: string, args: any[]) => {
       const timestamp = new Date().toISOString();
@@ -2903,6 +2916,11 @@ async function handleSummarizeResults() {
 }
 
 onBeforeUnmount(() => {
+  // #21: Restore original console methods to prevent O(N) wrapper accumulation
+  if (_origConsoleLog) { console.log = _origConsoleLog; _origConsoleLog = null; }
+  if (_origConsoleWarn) { console.warn = _origConsoleWarn; _origConsoleWarn = null; }
+  if (_origConsoleError) { console.error = _origConsoleError; _origConsoleError = null; }
+
   if (typeof window !== 'undefined') {
     window.removeEventListener('resize', updateMobileState);
   }
@@ -5112,8 +5130,8 @@ function getConversationUnreadCount(conversationId: string): number {
   return store.state.unreadCounts.get(conversationId) || 0;
 }
 
-function getConversationModelsHtml(conversation: any): string {
-  if (!conversation) return '';
+function getConversationModelParts(conversation: any): Array<{ name: string; color: string }> {
+  if (!conversation) return [];
 
   // For standard conversations, show the model name
   if (conversation.format === 'standard' || !conversation.format) {
@@ -5122,28 +5140,24 @@ function getConversationModelsHtml(conversation: any): string {
       .replace('Claude ', '')
       .replace(' (Bedrock)', ' B')
       .replace(' (OpenRouter)', ' OR') : conversation.model;
-    
-    const color = getModelColor(conversation.model);
-    return `<span style="color: ${color}; font-weight: 500;">${modelName}</span>`;
+
+    return [{ name: modelName, color: getModelColor(conversation.model) }];
   }
-  
-  // For multi-participant conversations, use embedded participant summaries!
+
+  // For multi-participant conversations, use embedded participant summaries
   if (conversation.participantModels && conversation.participantModels.length > 0) {
-    const modelSpans = conversation.participantModels.map((modelId: string) => {
+    return conversation.participantModels.map((modelId: string) => {
       const model = store.state.models.find(m => m.id === modelId);
       const modelName = model ? model.displayName
         .replace('Claude ', '')
         .replace(' (Bedrock)', ' B')
         .replace(' (OpenRouter)', ' OR') : modelId;
-      
-      const color = getModelColor(modelId);
-      return `<span style="color: ${color}; font-weight: 500;">${modelName}</span>`;
+
+      return { name: modelName, color: getModelColor(modelId) };
     });
-    
-    return modelSpans.join(' • ');
   }
-  
-  return '<span style="color: #757575; font-weight: 500;">Group Chat</span>';
+
+  return [{ name: 'Group Chat', color: '#757575' }];
 }
 
 function formatDate(date: Date | string): string {

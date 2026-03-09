@@ -53,8 +53,28 @@ export function setSubAgentManager(manager: SubAgentManagerLike): void {
 }
 
 // Track active generations for abort support
-// Key: `${userId}:${conversationId}`, Value: AbortController
-const activeGenerations = new Map<string, AbortController>();
+// Key: `${userId}:${conversationId}`
+interface ActiveGeneration {
+  controller: AbortController;
+  startedAt: number;
+}
+const activeGenerations = new Map<string, ActiveGeneration>();
+
+// Safety-net sweep: abort and remove entries older than 10 minutes.
+// Protects against leaks when a generation hangs or an outer catch fails.
+const GENERATION_TTL_MS = 10 * 60 * 1000;
+const GENERATION_SWEEP_INTERVAL_MS = 60 * 1000;
+const generationSweepTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [key, gen] of activeGenerations) {
+    if (now - gen.startedAt > GENERATION_TTL_MS) {
+      console.warn(`[WS] Sweeping stale generation: ${key} (age ${Math.round((now - gen.startedAt) / 1000)}s)`);
+      gen.controller.abort();
+      activeGenerations.delete(key);
+    }
+  }
+}, GENERATION_SWEEP_INTERVAL_MS);
+generationSweepTimer.unref(); // Don't prevent process exit
 
 function getGenerationKey(userId: string, conversationId: string): string {
   return `${userId}:${conversationId}`;
@@ -65,10 +85,10 @@ function startGeneration(userId: string, conversationId: string): AbortControlle
   // Abort any existing generation for this conversation
   const existing = activeGenerations.get(key);
   if (existing) {
-    existing.abort();
+    existing.controller.abort();
   }
   const controller = new AbortController();
-  activeGenerations.set(key, controller);
+  activeGenerations.set(key, { controller, startedAt: Date.now() });
   return controller;
 }
 
@@ -79,9 +99,9 @@ function endGeneration(userId: string, conversationId: string): void {
 
 function abortGeneration(userId: string, conversationId: string): boolean {
   const key = getGenerationKey(userId, conversationId);
-  const controller = activeGenerations.get(key);
-  if (controller) {
-    controller.abort();
+  const gen = activeGenerations.get(key);
+  if (gen) {
+    gen.controller.abort();
     activeGenerations.delete(key);
     return true;
   }
@@ -1034,12 +1054,10 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
 }
 
 export function websocketHandler(ws: AuthenticatedWebSocket, req: IncomingMessage, db: Database) {
-  // Extract token and params from query
   const url = new URL(req.url || '', `http://${req.headers.host}`);
-  const token = url.searchParams.get('token');
 
-  // Check if this is a delegate connection
-  if (url.searchParams.get('delegate') === 'true' || url.searchParams.get('delegateId')) {
+  // Check if this is a delegate connection (role param is non-sensitive, just routing)
+  if (url.searchParams.get('delegate') === 'true' || url.searchParams.get('delegateId') || url.searchParams.get('role') === 'delegate') {
     delegateWebsocketHandler(ws, req, db).catch(err => {
       console.error('[WebSocket] Delegate handler error:', err);
       ws.close(1011, 'Internal error');
@@ -1047,35 +1065,73 @@ export function websocketHandler(ws: AuthenticatedWebSocket, req: IncomingMessag
     return;
   }
 
-  if (!token) {
-    ws.send(JSON.stringify({ type: 'error', error: 'Authentication required' }));
-    ws.close(1008, 'Authentication required');
-    return;
-  }
+  // Frontend connection — wait for first-message auth (token not in URL)
+  const authTimeout = setTimeout(() => {
+    ws.send(JSON.stringify({ type: 'error', error: 'Authentication timeout' }));
+    ws.close(1008, 'Authentication timeout');
+  }, 5000);
 
-  const decoded = verifyToken(token);
-  if (!decoded) {
-    ws.send(JSON.stringify({ type: 'error', error: 'Invalid token' }));
-    ws.close(1008, 'Invalid token');
-    return;
-  }
+  // Also support legacy token-in-URL for backward compat during rollout
+  const legacyToken = url.searchParams.get('token');
 
-  ws.userId = decoded.userId;
-  ws.isAlive = true;
+  ws.once('message', (data) => {
+    clearTimeout(authTimeout);
+    try {
+      const msg = JSON.parse(data.toString());
 
-  // Register this connection with the room manager
-  roomManager.registerConnection(ws, decoded.userId);
+      let token: string | null = null;
+      if (msg.type === 'auth' && msg.token) {
+        // New first-message auth
+        token = msg.token;
+      } else if (legacyToken) {
+        // Legacy token-in-URL — process this message as a regular message after auth
+        token = legacyToken;
+      }
 
-  // Setup heartbeat
-  ws.on('pong', () => {
-    ws.isAlive = true;
+      if (!token) {
+        ws.send(JSON.stringify({ type: 'error', error: 'Authentication required' }));
+        ws.close(1008, 'Authentication required');
+        return;
+      }
+
+      const decoded = verifyToken(token);
+      if (!decoded) {
+        ws.send(JSON.stringify({ type: 'error', error: 'Invalid token' }));
+        ws.close(1008, 'Invalid token');
+        return;
+      }
+
+      ws.userId = decoded.userId;
+      ws.isAlive = true;
+
+      // Register this connection with the room manager
+      roomManager.registerConnection(ws, decoded.userId);
+
+      // Setup heartbeat
+      ws.on('pong', () => {
+        ws.isAlive = true;
+      });
+
+      // Use MembraneInferenceService for native tool support
+      const baseInferenceService = new MembraneInferenceService(db);
+      const contextManager = ContextManager.getInstance();
+      const inferenceService = new EnhancedInferenceService(baseInferenceService, contextManager);
+
+      // Setup authenticated message handler
+      setupAuthenticatedMessageHandler(ws, db, inferenceService, baseInferenceService);
+
+      // If legacy token was used, the first message wasn't auth — process it now
+      if (msg.type !== 'auth') {
+        ws.emit('message', data);
+      }
+    } catch (error) {
+      ws.send(JSON.stringify({ type: 'error', error: 'Authentication error' }));
+      ws.close(1008, 'Authentication error');
+    }
   });
+}
 
-  // Use MembraneInferenceService for native tool support
-  const baseInferenceService = new MembraneInferenceService(db);
-  const contextManager = ContextManager.getInstance();
-  const inferenceService = new EnhancedInferenceService(baseInferenceService, contextManager);
-
+function setupAuthenticatedMessageHandler(ws: AuthenticatedWebSocket, db: Database, inferenceService: EnhancedInferenceService, baseInferenceService: MembraneInferenceService) {
   ws.on('message', async (data) => {
     try {
       const raw = JSON.parse(data.toString());
@@ -1528,8 +1584,8 @@ export function websocketHandler(ws: AuthenticatedWebSocket, req: IncomingMessag
       }
       // Phase 2: abort + delete
       for (const key of keysToAbort) {
-        const controller = activeGenerations.get(key);
-        if (controller) controller.abort();
+        const gen = activeGenerations.get(key);
+        if (gen) gen.controller.abort();
         activeGenerations.delete(key);
       }
       if (keysToAbort.length > 0) {
