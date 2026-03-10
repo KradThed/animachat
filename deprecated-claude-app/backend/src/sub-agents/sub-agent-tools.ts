@@ -1,9 +1,9 @@
 /**
  * Sub-Agent Tools
  *
- * Registers 10 tools with the tool registry for LLM-driven sub-agent orchestration:
- *   1. spawn_subtask    — spawn a single sub-agent (with optional context)
- *   2. spawn_subtasks   — batch spawn multiple sub-agents (with optional context)
+ * Registers 11 tools with the tool registry for LLM-driven sub-agent orchestration:
+ *   1. spawn_subtask    — spawn a single sub-agent (with optional context, deps, retry, budget)
+ *   2. spawn_subtasks   — batch spawn multiple sub-agents (with DAG deps, retry, budget)
  *   3. poll_subtasks    — check status of a task group
  *   4. get_subtask_results — get results of completed tasks
  *   5. cancel_subtasks  — cancel running tasks in a group
@@ -12,6 +12,7 @@
  *   8. update_subtask_instruction — modify instruction for a QUEUED task
  *   9. set_group_concurrency — dynamically change maxConcurrent for a group
  *  10. get_group_metrics — aggregated metrics across all tasks in a group
+ *  11. resume_subtask   — re-queue a terminal task (ERROR/FINALIZED/CANCELLED)
  */
 
 import { toolRegistry } from '../tools/tool-registry.js';
@@ -34,6 +35,7 @@ export const SUB_AGENT_TOOL_NAMES = new Set([
   'get_subtask_results', 'cancel_subtasks', 'finalize_task_group',
   'get_subtask_progress', 'update_subtask_instruction',
   'set_group_concurrency', 'get_group_metrics',
+  'resume_subtask',
 ]);
 
 /**
@@ -94,6 +96,19 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
               },
             },
           },
+          dependsOn: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Task IDs this task depends on. Task stays QUEUED until all dependencies are FINALIZED. If any dependency fails (ERROR/CANCELLED), this task auto-errors.',
+          },
+          maxRetries: {
+            type: 'number',
+            description: 'Maximum auto-retries on transient errors (429, 500, 502, 503, network). Default: 0, max: 3.',
+          },
+          tokenBudget: {
+            type: 'number',
+            description: 'Maximum total tokens (input + output) for this task. Enforced post-hoc with best-effort maxToolCalls heuristic. Minimum: 1000.',
+          },
         },
         required: ['instruction'],
       },
@@ -106,12 +121,41 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
           return { toolUseId: '', content: 'Error: instruction must be a non-empty string', isError: true };
         }
 
+        // Feature C: Validate dependsOn format
+        if (input.dependsOn !== undefined) {
+          if (!Array.isArray(input.dependsOn)) {
+            return { toolUseId: '', content: 'Error: dependsOn must be an array of task ID strings', isError: true };
+          }
+          for (const dep of input.dependsOn) {
+            if (typeof dep !== 'string' || !dep.trim()) {
+              return { toolUseId: '', content: 'Error: each dependsOn entry must be a non-empty string', isError: true };
+            }
+          }
+        }
+
+        // Feature F: Validate maxRetries
+        if (input.maxRetries !== undefined) {
+          if (typeof input.maxRetries !== 'number' || !Number.isInteger(input.maxRetries) || input.maxRetries < 0) {
+            return { toolUseId: '', content: 'Error: maxRetries must be a non-negative integer', isError: true };
+          }
+        }
+
+        // Feature E: Validate tokenBudget
+        if (input.tokenBudget !== undefined) {
+          if (typeof input.tokenBudget !== 'number' || input.tokenBudget < 1000) {
+            return { toolUseId: '', content: 'Error: tokenBudget must be a number >= 1000', isError: true };
+          }
+        }
+
         const task = await manager.spawnSubtask({
           conversationId: context.conversationId,
           userId: context.userId,
           instruction: instruction as string,
           groupId: input.groupId as string | undefined,
           context: input.context as SubAgentContext | undefined,
+          dependsOn: input.dependsOn as string[] | undefined,
+          maxRetries: input.maxRetries as number | undefined,
+          tokenBudget: input.tokenBudget as number | undefined,
         });
 
         return {
@@ -121,6 +165,9 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
             groupId: task.groupId,
             state: task.state,
             instruction: task.instruction,
+            ...(task.dependsOn?.length ? { dependsOn: task.dependsOn } : {}),
+            ...(task.maxRetries ? { maxRetries: task.maxRetries } : {}),
+            ...(task.tokenBudget ? { tokenBudget: task.tokenBudget } : {}),
           }),
         };
       } catch (error) {
@@ -143,14 +190,42 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
       description:
         'Spawn multiple sub-agents as a batch. All tasks share the same group. ' +
         'Each sub-agent works independently on its assigned instruction. ' +
+        'Supports DAG dependencies: tasks can depend on sibling tasks within the same batch. ' +
         'Returns a groupId and list of taskIds.',
       inputSchema: {
         type: 'object',
         properties: {
           instructions: {
             type: 'array',
-            items: { type: 'string' },
-            description: 'Array of instructions, one per sub-agent',
+            description: 'Array of instructions. Each item can be a plain string or an object with {instruction, dependsOn?, context?}. ' +
+              'When using objects, dependsOn references taskIds of sibling tasks (returned in order). ' +
+              'Use poll_subtasks after spawning to get the actual taskIds for dependency references.',
+            items: {
+              oneOf: [
+                { type: 'string' },
+                {
+                  type: 'object',
+                  properties: {
+                    instruction: { type: 'string', description: 'Task instruction' },
+                    dependsOn: {
+                      type: 'array',
+                      items: { type: 'string' },
+                      description: 'Task IDs this task depends on (sibling taskIds from same batch or existing group tasks)',
+                    },
+                    context: {
+                      type: 'object',
+                      description: 'Per-task context override (merged with shared group context)',
+                      properties: {
+                        files: { type: 'array', items: { type: 'string' } },
+                        data: { type: 'object', additionalProperties: { type: 'string' } },
+                        previousResults: { type: 'array', items: { type: 'string' } },
+                      },
+                    },
+                  },
+                  required: ['instruction'],
+                },
+              ],
+            },
           },
           maxConcurrent: {
             type: 'number',
@@ -177,29 +252,74 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
               },
             },
           },
+          maxRetries: {
+            type: 'number',
+            description: 'Default max auto-retries for all tasks in batch (0-3). Individual tasks inherit this unless overridden.',
+          },
+          tokenBudget: {
+            type: 'number',
+            description: 'Default token budget for all tasks in batch. Minimum: 1000.',
+          },
         },
         required: ['instructions'],
       },
     },
     async (input, context) => {
       try {
-        // H6: Input validation
+        // H6: Input validation — supports both string[] and SpawnSubtaskInstruction[]
         const instructions = input.instructions;
         if (!Array.isArray(instructions) || instructions.length === 0) {
           return { toolUseId: '', content: 'Error: instructions must be a non-empty array', isError: true };
         }
+
+        // Validate each instruction item (string or structured object)
         for (let i = 0; i < instructions.length; i++) {
-          if (typeof instructions[i] !== 'string' || !(instructions[i] as string).trim()) {
-            return { toolUseId: '', content: `Error: instructions[${i}] must be a non-empty string`, isError: true };
+          const item = instructions[i];
+          if (typeof item === 'string') {
+            if (!item.trim()) {
+              return { toolUseId: '', content: `Error: instructions[${i}] must be a non-empty string`, isError: true };
+            }
+          } else if (typeof item === 'object' && item !== null) {
+            if (typeof item.instruction !== 'string' || !item.instruction.trim()) {
+              return { toolUseId: '', content: `Error: instructions[${i}].instruction must be a non-empty string`, isError: true };
+            }
+            if (item.dependsOn !== undefined) {
+              if (!Array.isArray(item.dependsOn)) {
+                return { toolUseId: '', content: `Error: instructions[${i}].dependsOn must be an array of task ID strings`, isError: true };
+              }
+              for (const dep of item.dependsOn) {
+                if (typeof dep !== 'string' || !dep.trim()) {
+                  return { toolUseId: '', content: `Error: instructions[${i}].dependsOn entries must be non-empty strings`, isError: true };
+                }
+              }
+            }
+          } else {
+            return { toolUseId: '', content: `Error: instructions[${i}] must be a string or {instruction, dependsOn?, context?} object`, isError: true };
+          }
+        }
+
+        // Feature F: Validate maxRetries
+        if (input.maxRetries !== undefined) {
+          if (typeof input.maxRetries !== 'number' || !Number.isInteger(input.maxRetries) || input.maxRetries < 0) {
+            return { toolUseId: '', content: 'Error: maxRetries must be a non-negative integer', isError: true };
+          }
+        }
+
+        // Feature E: Validate tokenBudget
+        if (input.tokenBudget !== undefined) {
+          if (typeof input.tokenBudget !== 'number' || input.tokenBudget < 1000) {
+            return { toolUseId: '', content: 'Error: tokenBudget must be a number >= 1000', isError: true };
           }
         }
 
         const tasks = await manager.spawnSubtasks({
           conversationId: context.conversationId,
           userId: context.userId,
-          instructions: instructions as string[],
+          instructions: instructions as any, // Union type: string[] | SpawnSubtaskInstruction[]
           maxConcurrent: input.maxConcurrent as number | undefined,
           context: input.context as SubAgentContext | undefined,
+          maxRetries: input.maxRetries as number | undefined,
+          tokenBudget: input.tokenBudget as number | undefined,
         });
 
         // BUG T-7: Guard against empty result array (groupId would be undefined)
@@ -219,6 +339,7 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
               taskId: t.taskId,
               instruction: t.instruction,
               state: t.state,
+              ...(t.dependsOn?.length ? { dependsOn: t.dependsOn } : {}),
             })),
           }),
         };
@@ -681,7 +802,75 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
     },
   );
 
-  console.log('[SubAgentTools] Registered 10 sub-agent tools');
+  // -------------------------------------------------------------------------
+  // 11. resume_subtask (Feature D: Agent Resumption)
+  // -------------------------------------------------------------------------
+  toolRegistry.registerMcplManagementTool(
+    'resume_subtask',
+    {
+      name: 'resume_subtask',
+      description:
+        'Re-queue a terminal sub-agent task (ERROR, FINALIZED, or CANCELLED) for another attempt. ' +
+        'The task returns to QUEUED state and re-runs with its existing branch context (previous tool work preserved). ' +
+        'Optionally provide a new instruction to refine the task. ' +
+        'Maximum 3 resumes per task. Cannot resume tasks in an already-finalized group.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          taskId: {
+            type: 'string',
+            description: 'The task ID to resume',
+          },
+          instruction: {
+            type: 'string',
+            description: 'Optional new instruction to replace the current one (e.g., to refine after seeing the error)',
+          },
+        },
+        required: ['taskId'],
+      },
+    },
+    async (input, context) => {
+      try {
+        // H6: Input validation
+        const taskId = input.taskId;
+        if (typeof taskId !== 'string' || !taskId.trim()) {
+          return { toolUseId: '', content: 'Error: taskId must be a non-empty string', isError: true };
+        }
+
+        if (input.instruction !== undefined) {
+          if (typeof input.instruction !== 'string' || !input.instruction.trim()) {
+            return { toolUseId: '', content: 'Error: instruction must be a non-empty string if provided', isError: true };
+          }
+        }
+
+        const task = await manager.resumeTask(
+          taskId as string,
+          context.conversationId,
+          context.userId,
+          input.instruction as string | undefined,
+        );
+
+        return {
+          toolUseId: '',
+          content: JSON.stringify({
+            taskId: task.taskId,
+            groupId: task.groupId,
+            state: task.state,
+            instruction: task.instruction,
+            resumeCount: task.resumeCount,
+          }),
+        };
+      } catch (error) {
+        return {
+          toolUseId: '',
+          content: `Error resuming subtask: ${error instanceof Error ? error.message : String(error)}`,
+          isError: true,
+        };
+      }
+    },
+  );
+
+  console.log('[SubAgentTools] Registered 11 sub-agent tools');
 }
 
 // =============================================================================

@@ -21,6 +21,15 @@ export const FINALIZE_GRACE_MS = 10_000; // 10 seconds
 /** Max inference loop iterations per sub-agent (prevents runaway). */
 export const MAX_ITERATIONS = 25;
 
+/** Maximum allowed auto-retries per task (safety cap). */
+export const MAX_RETRIES_CAP = 3;
+
+/** Base backoff delay for retries (ms). Exponential: delay * 2^retryCount. */
+export const RETRY_BASE_DELAY_MS = 2_000; // 2 seconds
+
+/** Maximum times a task can be manually resumed. */
+export const MAX_RESUME_COUNT = 3;
+
 /** Terminal states — tasks in these states will never change again. */
 export const TERMINAL_STATUSES: readonly SubAgentState[] = ['FINALIZED', 'CANCELLED', 'ERROR'] as const;
 
@@ -47,6 +56,8 @@ export interface SubAgentTask {
   userId: string;
   instruction: string;
   context?: SubAgentContext;      // Optional structured context for the task
+  /** Feature C: Task IDs this task depends on. Stays QUEUED until all deps FINALIZED. */
+  dependsOn?: string[];
   state: SubAgentState;
   forkPoint: number;           // messages.length in parent conversation at fork time
   forkBranchId: string | null; // activeBranchId of the last message at fork time (for branch-aware history)
@@ -55,6 +66,16 @@ export interface SubAgentTask {
   metrics: TaskMetrics;
   /** BUG#14: Per-task lease timeout (ms). Falls back to group config if unset. */
   leaseMs?: number;
+  /** Feature F: Maximum auto-retries for transient errors. 0 = no retry (default). */
+  maxRetries?: number;
+  /** Feature F: Current retry count. */
+  retryCount?: number;
+  /** Feature F: Timestamp when this task is eligible for retry (backoff). */
+  nextRetryAt?: number;
+  /** Feature D: Number of times this task has been manually resumed. */
+  resumeCount?: number;
+  /** Feature E: Max total tokens (input + output). Tracked post-hoc. */
+  tokenBudget?: number;
   createdAt: number;           // epoch ms
   completedAt: number | null;  // epoch ms
 }
@@ -65,6 +86,10 @@ export interface TaskMetrics {
   outputTokens: number;
   toolCalls: number;
   durationMs: number;
+  /** Feature E: True if total tokens exceeded the configured tokenBudget. */
+  budgetExceeded?: boolean;
+  /** Feature E: The configured token budget (for reference in results). */
+  tokenBudget?: number;
 }
 
 export interface SubAgentContext {
@@ -123,6 +148,9 @@ export type SubAgentEventType =
   | 'subtask_failed'
   | 'subtask_cancelled'
   | 'subtask_instruction_updated'
+  | 'subtask_dep_failed'              // Feature C: task auto-errored due to dependency failure
+  | 'subtask_retrying'                // Feature F: task re-queued for retry with backoff
+  | 'subtask_resumed'                 // Feature D: terminal task manually resumed
   | 'subtask_group_finalized'
   | 'subtask_group_auto_finalized'
   | 'queued_user_turn'
@@ -139,12 +167,20 @@ export interface SubAgentLifecycleEvent {
   context?: SubAgentContext;
   forkPoint?: number;
   forkBranchId?: string | null;
+  dependsOn?: string[];             // Feature C: dependency taskIds
   state?: SubAgentState;
   result?: string;
   error?: string;
   metrics?: TaskMetrics;
   config?: TaskGroupConfig;
   queuedMessage?: string;
+  failedDependencies?: string[];    // Feature C: which deps caused cascade failure
+  retryCount?: number;              // Feature F: retry attempt number
+  maxRetries?: number;              // Feature F: configured max retries
+  nextRetryAt?: number;             // Feature F: next retry eligible timestamp
+  resumeCount?: number;             // Feature D: resume count
+  previousState?: SubAgentState;    // Feature D: state before resume
+  tokenBudget?: number;             // Feature E: configured token budget
   timestamp: number;
 }
 
@@ -160,15 +196,27 @@ export interface SpawnSubtaskParams {
   groupId?: string;            // Omit to auto-create group
   maxConcurrent?: number;      // Default: 3
   leaseMs?: number;            // Default: LEASE_MS
+  dependsOn?: string[];        // Feature C: taskIds this task depends on
+  maxRetries?: number;         // Feature F: auto-retry on transient errors (default: 0)
+  tokenBudget?: number;        // Feature E: max total tokens (input + output)
+}
+
+/** Feature C: Per-instruction config for batch spawn with dependencies. */
+export interface SpawnSubtaskInstruction {
+  instruction: string;
+  dependsOn?: string[];        // TaskIds this task depends on (can reference sibling tasks in same batch)
+  context?: SubAgentContext;   // Per-task context override (merged with group context)
 }
 
 export interface SpawnSubtasksParams {
   conversationId: string;
   userId: string;
-  instructions: string[];
+  instructions: string[] | SpawnSubtaskInstruction[];
   context?: SubAgentContext;    // Shared context for all tasks in the batch
   maxConcurrent?: number;
   leaseMs?: number;
+  maxRetries?: number;         // Feature F: default for all tasks in batch
+  tokenBudget?: number;        // Feature E: default for all tasks in batch
 }
 
 // =============================================================================

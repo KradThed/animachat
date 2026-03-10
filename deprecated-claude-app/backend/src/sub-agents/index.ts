@@ -12,6 +12,7 @@ export type {
   SubAgentResult,
   FinalizeResult,
   SpawnSubtaskParams,
+  SpawnSubtaskInstruction,
   SpawnSubtasksParams,
   SubAgentEventType,
   SubAgentLifecycleEvent,
@@ -23,6 +24,9 @@ export {
   LEASE_MS,
   FINALIZE_GRACE_MS,
   MAX_ITERATIONS,
+  MAX_RETRIES_CAP,
+  MAX_RESUME_COUNT,
+  RETRY_BASE_DELAY_MS,
   TERMINAL_STATUSES,
 } from './types.js';
 

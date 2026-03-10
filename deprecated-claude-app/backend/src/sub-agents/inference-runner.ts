@@ -125,6 +125,16 @@ export class InferenceRunner {
       // Single inference call — Membrane handles the tool loop internally
       metrics.iterations = 1;
 
+      // Feature E: Token budget → derive maxToolCalls heuristic
+      // ~1500 tokens/tool-call is a rough average. Tools returning large file contents
+      // may use far more. The post-hoc budgetExceeded flag is the real signal;
+      // this heuristic provides best-effort indirect capping.
+      let effectiveMaxToolCalls = 30; // Default hard safety cap
+      if (this.task.tokenBudget) {
+        effectiveMaxToolCalls = Math.min(30, Math.max(1, Math.floor(this.task.tokenBudget / 1500)));
+        console.log(`[InferenceRunner] Task ${this.task.taskId}: tokenBudget=${this.task.tokenBudget}, effectiveMaxToolCalls=${effectiveMaxToolCalls}`);
+      }
+
       // Debug: verify tools are being passed to the LLM
       console.log(`[InferenceRunner] Task ${this.task.taskId}: tools=${filteredToolOptions?.tools?.length ?? 0}, hasExecute=${!!filteredToolOptions?.executeToolCall}`);
       if (filteredToolOptions?.tools) {
@@ -202,7 +212,7 @@ export class InferenceRunner {
         toolOptions: filteredToolOptions,
         abortSignal: this.abortController.signal,
         maxToolDepth: 6,   // Sub-agents have narrow tasks: search→read→search→read→write→verify
-        maxToolCalls: 30,  // Hard safety cap — soft-stop in LLMClientAdapter.executeToolCall
+        maxToolCalls: effectiveMaxToolCalls,  // Feature E: derived from tokenBudget or default 30
       });
 
       // Track metrics
@@ -210,6 +220,19 @@ export class InferenceRunner {
       if (result.usage) {
         metrics.inputTokens = result.usage.inputTokens;
         metrics.outputTokens = result.usage.outputTokens;
+      }
+
+      // Feature E: Post-hoc token budget check
+      if (this.task.tokenBudget) {
+        const totalTokens = metrics.inputTokens + metrics.outputTokens;
+        metrics.tokenBudget = this.task.tokenBudget;
+        if (totalTokens > this.task.tokenBudget) {
+          metrics.budgetExceeded = true;
+          console.warn(
+            `[InferenceRunner] Task ${this.task.taskId}: token budget exceeded ` +
+            `(${totalTokens} used vs ${this.task.tokenBudget} budget)`
+          );
+        }
       }
 
       // Append assistant response to branch
