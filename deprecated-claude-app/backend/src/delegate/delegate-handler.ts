@@ -496,14 +496,23 @@ export async function delegateWebsocketHandler(
   // Name collision check — reject if delegate with same ID already connected for this user
   const existingDelegate = delegateManager.findDelegate(userId, delegateId);
   if (existingDelegate) {
-    console.warn(`[DelegateHandler] Name collision: "${delegateId}" already connected for user ${userId}`);
-    ws.send(JSON.stringify({
-      type: 'delegate_auth_result',
-      success: false,
-      error: `Delegate "${delegateId}" already connected. Use a different --delegate-id or disconnect the other.`,
-    }));
-    setTimeout(() => ws.close(4001, 'name_collision'), 150);
-    return;
+    // Check if the existing connection is actually alive (ghost detection)
+    if (existingDelegate.ws.readyState !== WebSocket.OPEN) {
+      // Ghost connection — the WebSocket is dead but was never cleaned up.
+      // Force-unregister the ghost and allow the new connection to proceed.
+      console.warn(`[DelegateHandler] Ghost connection detected for "${delegateId}" (readyState: ${existingDelegate.ws.readyState}) — replacing`);
+      delegateManager.unregisterDelegate(existingDelegate.sessionId);
+      toolRegistry.unregisterDelegateTools(userId, delegateId.toLowerCase());
+    } else {
+      console.warn(`[DelegateHandler] Name collision: "${delegateId}" already connected for user ${userId}`);
+      ws.send(JSON.stringify({
+        type: 'delegate_auth_result',
+        success: false,
+        error: `Delegate "${delegateId}" already connected. Use a different --delegate-id or disconnect the other.`,
+      }));
+      setTimeout(() => ws.close(4001, 'name_collision'), 150);
+      return;
+    }
   }
 
   // Create transport — auto-listens on ws (constructor registers ws.on('message'))

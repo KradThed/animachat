@@ -17,6 +17,7 @@ import { checkContent, type UserContext } from '../services/content-filter.js';
 import { toolRegistry } from '../tools/tool-registry.js';
 import type { ToolCall, ToolResult } from '../tools/tool-registry.js';
 import { delegateWebsocketHandler, resolveScopeChange, resolveScopeElevate } from '../delegate/delegate-handler.js';
+import { delegateManager } from '../delegate/delegate-manager.js';
 import { mcplHookManager } from '../services/mcpl-hook-manager.js';
 import type { InferenceHookContext } from '../services/mcpl-hook-manager.js';
 import { mcplEventQueue } from '../services/mcpl-event-queue.js';
@@ -3467,3 +3468,6 @@ async function handleContinue(
 setInterval(() => {
   roomManager.performHeartbeat();
 }, 30000).unref();
+
+// Start delegate heartbeat — detects dead delegate WebSockets (ghost connections)
+delegateManager.startHeartbeat();

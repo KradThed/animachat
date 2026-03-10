@@ -47,6 +47,9 @@ interface PendingToolCall {
 // DelegateManager
 // =============================================================================
 
+/** Default heartbeat interval for delegate connections (30 seconds) */
+const DELEGATE_HEARTBEAT_INTERVAL_MS = 30_000;
+
 export class DelegateManager {
   /** Connected delegates keyed by sessionId */
   private delegates: Map<string, ConnectedDelegate> = new Map();
@@ -61,6 +64,9 @@ export class DelegateManager {
    * server_enabled_changed) survive restarts without persistence layer.
    */
   private serverIdMap: Map<string, string> = new Map();
+
+  /** Heartbeat interval handle */
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
   /**
    * Get or create a stable serverId for a (delegateId, serverName) pair.
@@ -337,6 +343,80 @@ export class DelegateManager {
           isError: true,
         });
       }
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Heartbeat — detect dead delegate WebSockets
+  // --------------------------------------------------------------------------
+
+  /**
+   * Start periodic heartbeat for all delegate connections.
+   * Uses WS-level ping/pong: if a delegate doesn't respond to a ping before the
+   * next cycle, its connection is terminated and cleaned up.
+   *
+   * The delegate client already sends pong responses (DEL-4 in connection.ts).
+   * This is the server-side counterpart that was missing.
+   */
+  startHeartbeat(intervalMs: number = DELEGATE_HEARTBEAT_INTERVAL_MS): void {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      this.performHeartbeat();
+    }, intervalMs);
+    // Don't keep process alive just for this timer
+    if (this.heartbeatTimer && typeof this.heartbeatTimer === 'object' && 'unref' in this.heartbeatTimer) {
+      this.heartbeatTimer.unref();
+    }
+    console.log(`[DelegateManager] Heartbeat started (${intervalMs}ms interval)`);
+  }
+
+  stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  /**
+   * Ping all delegate connections and terminate unresponsive ones.
+   * Uses the same isAlive/ping/pong pattern as roomManager.performHeartbeat().
+   */
+  performHeartbeat(): void {
+    let checked = 0;
+    let terminated = 0;
+
+    for (const [sessionId, delegate] of this.delegates) {
+      checked++;
+      const ws = delegate.ws as any;
+
+      // If WebSocket is not OPEN, terminate immediately
+      if (delegate.ws.readyState !== WebSocket.OPEN) {
+        console.log(`[DelegateManager] Heartbeat: delegate "${delegate.delegateId}" ws not open (readyState: ${delegate.ws.readyState}) — cleaning up`);
+        this.unregisterDelegate(sessionId);
+        terminated++;
+        continue;
+      }
+
+      // Check if previous ping was acknowledged
+      if (ws.isAlive === false) {
+        console.log(`[DelegateManager] Heartbeat: delegate "${delegate.delegateId}" unresponsive — terminating`);
+        delegate.ws.terminate();
+        // The 'close' event handler in delegate-handler.ts will call unregisterDelegate
+        terminated++;
+        continue;
+      }
+
+      // Mark as not alive, send ping. Pong handler (delegate-handler.ts:527) sets isAlive = true.
+      ws.isAlive = false;
+      try {
+        delegate.ws.ping();
+      } catch (err) {
+        console.error(`[DelegateManager] Heartbeat: failed to ping "${delegate.delegateId}":`, err);
+      }
+    }
+
+    if (checked > 0) {
+      console.log(`[DelegateManager] Heartbeat: checked ${checked} delegate(s), terminated ${terminated}`);
     }
   }
 
