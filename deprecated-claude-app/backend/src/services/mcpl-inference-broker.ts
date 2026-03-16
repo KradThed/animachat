@@ -35,7 +35,7 @@ export interface McplInferenceBrokerConfig {
 
 interface PendingInferenceRequest {
   requestId: string;
-  serverId: string;
+  featureSet: string;
   conversationId: string;
   delegateId: string;
   userId: string;
@@ -47,7 +47,7 @@ interface PendingInferenceRequest {
 interface InferenceResult {
   content: string;
   model: string;
-  finishReason: 'end_turn' | 'max_tokens' | 'error';
+  finishReason: 'end_turn' | 'max_tokens' | 'stop_sequence';
   usage: { inputTokens: number; outputTokens: number };
 }
 
@@ -89,10 +89,11 @@ export class McplInferenceBroker {
    */
   async handleInferenceRequest(params: {
     requestId: string;
-    serverId: string;
+    featureSet: string;
     conversationId: string;
     systemMessage?: string;
-    userMessage: string;
+    userMessage?: string;      // F17: legacy (use messages[] instead)
+    messages?: Array<{ role: 'user' | 'assistant'; content: string }>;  // F17: multi-turn
     maxTokens?: number;
     stream?: boolean;
     delegateId: string;
@@ -101,7 +102,7 @@ export class McplInferenceBroker {
     parentChainId?: string;   // Fix #5: chain tracking
     parentFrameId?: string;   // Fix #5: frame tracking
   }): Promise<void> {
-    const { requestId, serverId, conversationId, delegateId, userId, transport } = params;
+    const { requestId, featureSet, conversationId, delegateId, userId, transport } = params;
 
     // 0. Fix #5: Recursion protection — create or continue inference chain
     let chainId: string | undefined;
@@ -112,15 +113,15 @@ export class McplInferenceBroker {
       const chainResult = inferenceChainTracker.continueChain(
         params.parentChainId,
         params.parentFrameId,
-        serverId,
+        featureSet,
       );
       if (!chainResult.allowed) {
-        console.warn(`[McplInferenceBroker] Chain rejected: ${chainResult.reason} (server: ${serverId}, request: ${requestId})`);
+        console.warn(`[McplInferenceBroker] Chain rejected: ${chainResult.reason} (featureSet: ${featureSet}, request: ${requestId})`);
         this.sendResponse(transport, {
-          type: 'mcpl/inference_response',
+          type: 'mcpl/error',
           requestId,
-          success: false,
-          error: `Inference chain rejected: ${chainResult.reason}`,
+          code: -32603,
+          message: `Inference chain rejected: ${chainResult.reason}`,
         });
         return;
       }
@@ -128,14 +129,14 @@ export class McplInferenceBroker {
       frameId = chainResult.frameId;
     } else {
       // New chain (no parent — first inference or parentChainId bypassed)
-      const chainResult = inferenceChainTracker.createChain(conversationId, serverId);
+      const chainResult = inferenceChainTracker.createChain(conversationId, featureSet);
       if (!chainResult.allowed) {
-        console.warn(`[McplInferenceBroker] Chain creation rejected: ${chainResult.reason} (server: ${serverId}, request: ${requestId})`);
+        console.warn(`[McplInferenceBroker] Chain creation rejected: ${chainResult.reason} (featureSet: ${featureSet}, request: ${requestId})`);
         this.sendResponse(transport, {
-          type: 'mcpl/inference_response',
+          type: 'mcpl/error',
           requestId,
-          success: false,
-          error: `Inference request rejected: ${chainResult.reason}`,
+          code: -32603,
+          message: `Inference request rejected: ${chainResult.reason}`,
         });
         return;
       }
@@ -147,17 +148,17 @@ export class McplInferenceBroker {
     this.pruneOldTimestamps(userId);
     const userTimestamps = this.completedTimestamps.get(userId) || [];
     if (userTimestamps.length >= this.config.maxInferencesPerHour) {
-      console.warn(`[McplInferenceBroker] Rate limited: ${serverId} (${userTimestamps.length}/${this.config.maxInferencesPerHour} per hour for user ${userId})`);
+      console.warn(`[McplInferenceBroker] Rate limited: ${featureSet} (${userTimestamps.length}/${this.config.maxInferencesPerHour} per hour for user ${userId})`);
       this.sendResponse(transport, {
-        type: 'mcpl/inference_response',
+        type: 'mcpl/error',
         requestId,
-        success: false,
-        error: `Rate limit exceeded (${this.config.maxInferencesPerHour}/hour). Try again later.`,
+        code: -32603,
+        message: `Rate limit exceeded (${this.config.maxInferencesPerHour}/hour). Try again later.`,
       });
       // Notify user
       roomManager.broadcastToRoom(conversationId, {
         type: 'mcpl/inference_rate_limited',
-        serverId,
+        featureSet,
         delegateId,
         requestId,
       });
@@ -167,10 +168,10 @@ export class McplInferenceBroker {
     // 2. Validate database
     if (!this.db) {
       this.sendResponse(transport, {
-        type: 'mcpl/inference_response',
+        type: 'mcpl/error',
         requestId,
-        success: false,
-        error: 'Server not ready',
+        code: -32603,
+        message: 'Server not ready',
       });
       return;
     }
@@ -178,7 +179,7 @@ export class McplInferenceBroker {
     // 3. Track the request
     this.activeRequests.set(requestId, {
       requestId,
-      serverId,
+      featureSet,
       conversationId,
       delegateId,
       userId,
@@ -186,17 +187,17 @@ export class McplInferenceBroker {
       timestamp: Date.now(),
     });
 
-    console.log(`[McplInferenceBroker] Processing inference request ${requestId} from ${serverId} (delegate: ${delegateId})`);
+    console.log(`[McplInferenceBroker] Processing inference request ${requestId} from ${featureSet} (delegate: ${delegateId})`);
 
     try {
       // Streaming: send chunks as they arrive, then final inference_response
-      let chunkIndex = 0;
+      let chunkIdx = 0;
       const onChunk = params.stream
         ? (delta: string) => {
             this.sendResponse(transport, {
               type: 'mcpl/inference_chunk',
               requestId,
-              chunkIndex: chunkIndex++,
+              index: chunkIdx++,             // spec: index (was: chunkIndex)
               delta,
             });
           }
@@ -204,7 +205,7 @@ export class McplInferenceBroker {
 
       const result = await this.executeInference({
         ...params,
-        serverId: params.serverId,
+        featureSet: params.featureSet,
         delegateId: params.delegateId,
         onChunk,
       });
@@ -214,9 +215,12 @@ export class McplInferenceBroker {
 
       // Persist budget event (audit + replay on restart)
       if (this.db) {
+        // H9: Include model and usage in audit event per spec §11.5
         this.db.appendMcplUserEvent(userId, 'inference_request_completed', {
           _userId: userId,  // replayEvent doesn't receive partition key
-          requestId, serverId, timestamp: new Date().toISOString(),
+          requestId, featureSet, timestamp: new Date().toISOString(),
+          model: result.model,
+          usage: result.usage,
         }).catch(err => console.warn('[McplInferenceBroker] Failed to persist:', err));
       }
 
@@ -224,24 +228,23 @@ export class McplInferenceBroker {
       this.sendResponse(transport, {
         type: 'mcpl/inference_response',
         requestId,
-        success: true,
         content: result.content,
         model: result.model,
         finishReason: result.finishReason,
         usage: result.usage,
       });
 
-      console.log(`[McplInferenceBroker] Completed inference ${requestId} (${result.content.length} chars${params.stream ? `, ${chunkIndex} chunks` : ''}, model: ${result.model})`);
+      console.log(`[McplInferenceBroker] Completed inference ${requestId} (${result.content.length} chars${params.stream ? `, ${chunkIdx} chunks` : ''}, model: ${result.model})`);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       console.error(`[McplInferenceBroker] Inference failed ${requestId}:`, errorMsg);
 
-      // Error mid-stream or otherwise → inference_response { success: false, error }
+      // Error mid-stream or otherwise → JSON-RPC error per spec
       this.sendResponse(transport, {
-        type: 'mcpl/inference_response',
+        type: 'mcpl/error',
         requestId,
-        success: false,
-        error: errorMsg,
+        code: -32603,
+        message: errorMsg,
       });
     } finally {
       this.activeRequests.delete(requestId);
@@ -259,17 +262,25 @@ export class McplInferenceBroker {
   private async executeInference(params: {
     conversationId: string;
     systemMessage?: string;
-    userMessage: string;
+    userMessage?: string;       // F17: legacy
+    messages?: Array<{ role: 'user' | 'assistant'; content: string }>;  // F17: multi-turn
     maxTokens?: number;
     userId: string;
-    serverId?: string;
-    delegateId?: string;
     featureSet?: string;
+    delegateId?: string;
     onChunk?: (delta: string) => void;
   }): Promise<InferenceResult> {
     if (!this.db) throw new Error('Database not set');
 
-    const { conversationId, systemMessage, userMessage, maxTokens, userId } = params;
+    const { conversationId, systemMessage, maxTokens, userId } = params;
+
+    // F17: Resolve messages — prefer messages[], fall back to userMessage
+    const inferenceMessages: Array<{ role: 'user' | 'assistant'; content: string }> =
+      params.messages && params.messages.length > 0
+        ? params.messages
+        : params.userMessage
+          ? [{ role: 'user' as const, content: params.userMessage }]
+          : [];
 
     // Get conversation
     const conversation = await this.db.getConversation(conversationId, userId);
@@ -281,7 +292,6 @@ export class McplInferenceBroker {
     const route = inferenceRouter.resolve({
       featureSet: params.featureSet,
       delegateId: params.delegateId || '',
-      serverId: params.serverId || '',
     });
 
     // Get model — use routed model, fall back to conversation model
@@ -297,7 +307,26 @@ export class McplInferenceBroker {
     const contextManager = ContextManager.getInstance();
     const inferenceService = new EnhancedInferenceService(baseInferenceService, contextManager);
 
-    // Get conversation messages for context
+    // F17: Append incoming messages to DB conversation, then load full context
+    if (inferenceMessages.length > 0) {
+      for (const im of inferenceMessages) {
+        await this.db.createMessage(
+          conversationId,
+          userId,
+          im.content,
+          im.role,
+          im.role === 'assistant' ? modelId : undefined,
+          undefined,    // parent branch (auto-determined)
+          undefined,    // participantId
+          undefined,    // attachments
+          undefined,    // sentByUserId
+          false,        // hiddenFromAi
+          'mcpl_inference',  // creationSource
+        );
+      }
+    }
+
+    // Get conversation messages for context (includes any F17-appended messages)
     const messages = await this.db.getConversationMessages(conversationId, userId);
 
     // Build a simple system prompt
@@ -365,10 +394,10 @@ export class McplInferenceBroker {
    * Map provider stopReason to MCPL finishReason.
    * Anthropic: 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use'
    */
-  private mapStopReason(stopReason?: string): 'end_turn' | 'max_tokens' | 'error' {
+  private mapStopReason(stopReason?: string): 'end_turn' | 'max_tokens' | 'stop_sequence' {
     if (stopReason === 'max_tokens') return 'max_tokens';
-    if (stopReason === 'end_turn' || stopReason === 'stop_sequence' || stopReason === 'tool_use') return 'end_turn';
-    // No stopReason or unknown → default to end_turn (success path)
+    if (stopReason === 'stop_sequence') return 'stop_sequence';
+    // end_turn, tool_use, unknown, or missing → end_turn
     return 'end_turn';
   }
 

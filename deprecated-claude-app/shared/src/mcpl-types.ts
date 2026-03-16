@@ -13,93 +13,284 @@
 // Capabilities
 // =============================================================================
 
-/** MCPL capabilities that servers/delegates can advertise */
+/** Individual capability keys for internal feature set tracking */
 export type McplCapability =
   | 'context_hooks'
   | 'push_events'
   | 'inference_requests'
   | 'tool_management';
 
-/** Feature set per serverId — what each MCP server is allowed to do */
+/** Spec §5.1: Nested capabilities object for hello/ack wire protocol */
+export interface McplCapabilities {
+  version?: string;
+  pushEvents?: boolean;
+  contextHooks?: {
+    beforeInference?: boolean;
+    afterInference?: boolean | { blocking?: boolean };
+  };
+  inferenceRequest?: {
+    streaming?: boolean;
+  };
+  modelInfo?: boolean;
+  featureSets?: boolean;
+  toolManagement?: boolean;
+}
+
+/** Feature set per serverId — what each MCP server is allowed to do.
+ *  §6.2: uses are dotted capability strings (e.g. "pushEvents", "contextHooks.beforeInference"). */
 export interface McplFeatureSet {
-  contextHooks: boolean;
-  pushEvents: boolean;
-  inferenceRequests: boolean;
-  toolManagement: boolean;
+  description?: string;
+  uses: string[];
+  scoped?: boolean;
+  rollback?: boolean;
+  ownerServerId?: string;
+}
+
+/** Internal canonical declaration (session manager layer 1) */
+export interface DeclaredFeatureSet {
+  name: string;
+  ownerServerId?: string;
+  rawUses: string[];
+  description?: string;
+  scoped?: boolean;
+  rollback?: boolean;
+}
+
+/** Scope state per feature set (session manager layer 3) */
+export interface FeatureSetScopeState {
+  whitelist?: string[];
+  blacklist?: string[];
+}
+
+/** Wire shape for capabilities.experimental.mcpl in hello/ack only.
+ *  featureSets here is the dict of declarations, NOT the boolean capability flag. */
+export interface McplHandshakeCapabilities {
+  version?: string;
+  pushEvents?: boolean;
+  contextHooks?: {
+    beforeInference?: boolean;
+    afterInference?: boolean | { blocking?: boolean };
+  };
+  inferenceRequest?: { streaming?: boolean };
+  modelInfo?: boolean;
+  featureSets?: Record<string, McplFeatureSet>;
+  toolManagement?: boolean;
+}
+
+/** Map dotted uses strings → internal McplCapability flags.
+ *  §6.2: uses are spec-defined dotted strings; capabilities are internal 4-value enum. */
+const USES_TO_CAPABILITY: Record<string, McplCapability | undefined> = {
+  'pushEvents':                   'push_events',
+  'push_events':                  'push_events',
+  'contextHooks':                 'context_hooks',
+  'contextHooks.beforeInference': 'context_hooks',
+  'contextHooks.afterInference':  'context_hooks',
+  'context_hooks':                'context_hooks',
+  'inferenceRequest':             'inference_requests',
+  'inferenceRequests':            'inference_requests',
+  'inference_requests':           'inference_requests',
+  'tools':                        'tool_management',
+  'toolManagement':               'tool_management',
+  'tool_management':              'tool_management',
+};
+
+/**
+ * Spec §6.2 declaration values for uses arrays — exhaustive.
+ * Reference set for conformance assertions only; NOT used for quarantine.
+ * Includes capabilities this host does not implement (channels.*).
+ */
+export const SPEC_DECLARATION_USES = new Set([
+  'pushEvents',
+  'contextHooks.beforeInference',
+  'contextHooks.afterInference',
+  'inferenceRequest',
+  'tools',
+  'channels.publish',
+  'channels.observe',
+]);
+
+/**
+ * Host-supported declaration uses — the subset of SPEC_DECLARATION_USES
+ * that this host actually implements.
+ * Quarantine is based on this set.
+ *
+ * - Does NOT include `toolManagement` — stays in USES_TO_CAPABILITY only
+ *   (runtime compatibility, not a declaration value).
+ * - Strict subset of SPEC_DECLARATION_USES.
+ * - Separate from USES_TO_CAPABILITY — that is a runtime compatibility map
+ *   that also accepts legacy aliases (push_events, context_hooks, etc.).
+ */
+export const HOST_SUPPORTED_DECLARATION_USES = new Set([
+  'pushEvents',
+  'contextHooks.beforeInference',
+  'contextHooks.afterInference',
+  'inferenceRequest',
+  'tools',
+]);
+
+/**
+ * Validate uses strings against host-supported declarations.
+ * Returns { supported, unsupported } partitions.
+ * - Spec-valid but unsupported by host (channels.publish) → unsupported
+ * - Not spec-valid at all (foo.bar) → unsupported
+ * - Legacy aliases (push_events) → unsupported (strict declaration only)
+ */
+export function validateDeclarationUses(uses: string[]): {
+  supported: string[];
+  unsupported: string[];
+} {
+  const supported: string[] = [];
+  const unsupported: string[] = [];
+  for (const u of uses) {
+    if (HOST_SUPPORTED_DECLARATION_USES.has(u)) {
+      supported.push(u);
+    } else {
+      unsupported.push(u);
+    }
+  }
+  return { supported, unsupported };
+}
+
+/** Resolve dotted uses strings to internal McplCapability flags. */
+export function resolveCapabilities(uses: string[]): McplCapability[] {
+  const caps = new Set<McplCapability>();
+  for (const u of uses) {
+    const cap = USES_TO_CAPABILITY[u];
+    if (cap) caps.add(cap);
+  }
+  return [...caps];
 }
 
 // =============================================================================
 // Handshake
 // =============================================================================
 
-/** Sent by delegate after WebSocket connects */
+/** H5: MCP initialize request with experimental.mcpl (spec §3.1, §5.1) */
 export interface McplHello {
-  type: 'mcpl/hello';
-  protocolVersion: string;       // e.g. "mcpl-1.0"
-  capabilities: McplCapability[];
-  delegateId: string;
-  delegateName: string;
-  sessionId?: string;            // for session resume on reconnect
+  type: 'initialize';
+  protocolVersion: string;       // e.g. "2024-11-05"
+  clientInfo?: { name: string; version?: string };
+  capabilities?: {
+    experimental?: { mcpl?: McplHandshakeCapabilities };
+  };
+  _mcpl?: {
+    delegateId?: string;
+    sessionId?: string;          // for session resume on reconnect
+    lastReceivedSeq?: number;    // RC resume
+  };
 }
 
-/** Sent by server in response to mcpl/hello */
+/** H5: MCP initializeResult with experimental.mcpl (spec §5.2) */
 export interface McplAck {
   type: 'mcpl/ack';
-  sessionId: string;
-  negotiatedCapabilities: McplCapability[];
-  featureSets: Record<string, McplFeatureSet>;  // keyed by serverId
+  protocolVersion: string;
+  serverInfo?: { name: string; version?: string };
+  capabilities?: {
+    experimental?: { mcpl?: McplHandshakeCapabilities };
+  };
+  _mcpl?: {
+    sessionId: string;
+    resumedFromSeq?: number;
+  };
 }
 
 // =============================================================================
 // Context Hooks
 // =============================================================================
 
-/** Server → Delegate: request context injections before inference */
+/** Model metadata per spec Section 10.1 */
+export interface McplModelInfo {
+  id: string;
+  vendor: string;
+  contextWindow: number;
+  capabilities: string[];        // e.g. ["vision", "tools", "computer_use"]
+}
+
+/** Server → Delegate: request context injections before inference (spec Section 10.1) */
 export interface McplBeforeInferenceRequest {
   type: 'mcpl/beforeInference';
   requestId: string;
-  conversationId: string;
+  // Spec fields (top-level):
+  inferenceId: string;           // unique identifier for this inference
+  conversationId: string;        // persistent across turns
+  turnIndex?: number;            // 0-indexed turn number
+  userMessage?: string | null;   // user input (null for continued generation)
+  model?: McplModelInfo;         // current model metadata
+  // Extensions:
   messagesSummary?: string;      // optional summary for context-aware injections
-  context?: {                    // Gap 6: additional context per MCPL spec
-    conversationId: string;
-    userId: string;
-    isSubAgent: boolean;
-    inferenceId?: string;        // unique ID for this inference run
-    turnIndex?: number;          // conversation turn number
-    model?: string;              // model ID being used for inference
-  };
+  userId?: string;
+  isSubAgent?: boolean;
 }
 
-/** Delegate → Server: injections from a server */
+/** Delegate → Server: injections from a server (spec Section 10.2) */
 export interface McplBeforeInferenceResponse {
   type: 'mcpl/beforeInference_response';
   requestId: string;
-  injections: McplContextInjection[];
+  featureSet?: string;                       // spec: declaring feature set
+  contextInjections: McplContextInjection[]; // spec: was 'injections'
   abort?: boolean;        // Gap 3: if true, host should NOT run inference
   abortReason?: string;   // Gap 3: human-readable reason for abort
 }
 
-/** Content block for multimodal injections (Gap 5) */
+/** Content block for multimodal injections (Spec Section 10.3) */
 export interface McplContentBlock {
-  type: 'text' | 'image';
+  type: 'text' | 'image' | 'audio' | 'resource';
   text?: string;               // for type: 'text'
-  data?: string;               // base64 for type: 'image'
-  mimeType?: string;           // e.g. 'image/png' for type: 'image'
+  data?: string;               // base64 for type: 'image' or 'audio'
+  mimeType?: string;           // e.g. 'image/png', 'audio/wav'
+  uri?: string;                // for type: 'audio' (alt source) or 'resource'
 }
 
-/** A single context injection from an MCPL server */
+/** A single context injection (spec Section 10.4) */
 export interface McplContextInjection {
-  serverId: string;
+  namespace: string;             // spec: server-defined namespace (was: serverId)
   position: 'system' | 'beforeUser' | 'afterUser';
-  content: string | McplContentBlock[];  // Gap 5: string (text-only) or array of content blocks (multimodal)
+  content: string | McplContentBlock[];  // spec: string or ContentBlock[]
+  metadata?: Record<string, unknown>;    // spec: arbitrary metadata
 }
 
-/** Server → Delegate: notify after inference completes */
+/**
+ * F4 fix: Normalize injection content to string.
+ * Handles both string content and McplContentBlock[] (multimodal).
+ * Without this, .join('\n') on McplContentBlock[] produces "[object Object]".
+ */
+export function normalizeInjectionContent(content: string | McplContentBlock[]): string {
+  if (typeof content === 'string') return content;
+  return content
+    .filter(b => b.type === 'text')
+    .map(b => b.text ?? '')
+    .join('');
+}
+
+/**
+ * F5 fix: Get the byte size of injection content for budget enforcement.
+ * For string: character count. For McplContentBlock[]: serialized JSON length
+ * (accounts for base64 image data that would trivially pass a char-count budget).
+ */
+export function getInjectionContentSize(content: string | McplContentBlock[]): number {
+  if (typeof content === 'string') return content.length;
+  return JSON.stringify(content).length;
+}
+
+/** Server → Delegate: notify after inference completes (spec Section 10.5) */
 export interface McplAfterInferenceNotify {
   type: 'mcpl/afterInference';
   requestId: string;
-  conversationId: string;
+  // Spec fields (top-level):
+  inferenceId?: string;          // unique identifier for this inference
+  conversationId: string;        // persistent across turns
+  turnIndex?: number;            // 0-indexed turn number
+  userMessage?: string;          // user input that triggered inference
+  assistantMessage?: string;     // the assistant's response content
+  model?: McplModelInfo;         // model metadata (spec: object, was: string)
+  usage?: {                      // token usage from inference
+    inputTokens?: number;
+    outputTokens?: number;
+  };
+  // Extensions:
   responseSummary?: string;      // optional summary of the response
+  userId?: string;
+  isSubAgent?: boolean;
 }
 
 /** Delegate → Server: acknowledgement (legacy, kept for backward compat) */
@@ -108,11 +299,13 @@ export interface McplAfterInferenceAck {
   requestId: string;
 }
 
-/** Delegate → Server: afterInference response (Gap 4: blocking with optional modification) */
+/** Delegate → Server: afterInference response (spec Section 10.5, blocking) */
 export interface McplAfterInferenceResponse {
   type: 'mcpl/afterInference_response';
   requestId: string;
-  modifiedResponse?: string;  // if set, host should use this instead of original response
+  featureSet?: string;                       // spec: declaring feature set
+  modifiedResponse?: string;                 // if set, host should use this instead of original response
+  metadata?: Record<string, unknown>;        // spec: arbitrary metadata
 }
 
 // =============================================================================
@@ -122,14 +315,25 @@ export interface McplAfterInferenceResponse {
 /** Delegate → Server: external event that should trigger inference */
 export interface McplPushEvent {
   type: 'mcpl/push_event';
-  id: string;
-  source: string;                // e.g. "github", "gitlab", "calendar"
+  eventId: string;                         // spec: unique event identifier (was: id)
+  featureSet: string;                      // spec: declaring feature set
+  timestamp: string;                       // spec: ISO 8601
+  origin?: Record<string, unknown>;        // spec: provenance metadata object (was: string)
+  payload: unknown;                        // spec: { content: ContentBlock[] }; we accept any shape as extension
+  // Extensions beyond spec:
   conversationId: string;
   eventType: string;             // e.g. "push", "issue_opened"
-  payload: unknown;
   systemMessage: string;         // context message for the model
   idempotencyKey: string;        // deliveryId ?? sha256(eventType + payload + timeBucket5min)
-  timestamp: string;             // ISO 8601
+}
+
+/** Server → Delegate: push event response (spec Section 9.3) */
+export interface McplPushEventResponse {
+  type: 'mcpl/push_event_response';
+  requestId: string;
+  accepted: boolean;
+  inferenceId?: string;          // spec: ID of inference triggered by this event
+  reason?: string;               // spec: rejection reason
 }
 
 /** Server → Client: queue update notification */
@@ -143,7 +347,7 @@ export interface McplQueueUpdate {
 /** A single entry in the push event queue */
 export interface McplQueueEntry {
   id: string;
-  source: string;
+  featureSet: string;  // F8a: was 'source'
   eventType: string;
   status: 'queued' | 'processing' | 'completed' | 'failed' | 'rate_limited' | 'duplicate_ignored';
   timestamp: string;
@@ -172,24 +376,28 @@ export interface McplResumeQueue {
 export interface McplInferenceRequest {
   type: 'mcpl/inference_request';
   requestId: string;
-  serverId: string;
-  conversationId: string;
+  featureSet: string;            // spec: declaring feature set (was: serverId)
+  conversationId?: string;       // spec: optional
+  stream?: boolean;
+  messages?: Array<{ role: 'user' | 'assistant'; content: string }>;  // F17: multi-turn context
+  preferences?: {                // spec Section 11.2: generation preferences
+    maxTokens?: number;
+    temperature?: number;
+  };
+  // Extensions beyond spec:
   systemMessage?: string;
-  userMessage: string;
-  maxTokens?: number;
-  stream?: boolean;            // Phase 7 Batch 5: request streaming response
+  userMessage?: string;          // F17: optional (legacy, use messages[] instead)
+  parentChainId?: string;        // chain tracking for recursion prevention
+  parentFrameId?: string;        // frame tracking for recursion prevention
 }
 
 /** Server → Delegate: inference result (also serves as stream completion signal) */
 export interface McplInferenceResponse {
   type: 'mcpl/inference_response';
   requestId: string;
-  success: boolean;
   content?: string;            // full text (for non-streaming, or verification for streaming)
-  error?: string;
-  // Gap 2: MCPL spec requires model metadata in inference responses
   model?: string;              // model ID used for inference (e.g. "claude-sonnet-4-20250514")
-  finishReason?: 'end_turn' | 'max_tokens' | 'error';  // why inference stopped
+  finishReason?: 'end_turn' | 'max_tokens' | 'stop_sequence';  // spec enum (no 'error')
   usage?: {                    // token usage counters
     inputTokens: number;
     outputTokens: number;
@@ -201,7 +409,7 @@ export interface McplInferenceResponse {
 export interface McplInferenceChunk {
   type: 'mcpl/inference_chunk';
   requestId: string;
-  chunkIndex: number;        // sequential from 0
+  index: number;             // spec: sequential chunk index from 0 (was: chunkIndex)
   delta: string;             // text delta
 }
 
@@ -219,6 +427,7 @@ export interface McplScopeChangeRequest {
   serverName: string;
   requestedCapabilities: McplCapability[];
   reason: string;
+  payload?: Record<string, unknown>;  // F12: arbitrary data for UI display
 }
 
 /** Server → Client: approval needed */
@@ -246,6 +455,7 @@ export interface McplScopeChangeResult {
   requestId: string;
   approved: boolean;
   newCapabilities?: McplCapability[];
+  scoped?: boolean;  // F12: true = scoped operation per spec
 }
 
 // =============================================================================
@@ -324,12 +534,28 @@ export interface McplScopeChangeResolvedEvent {
 // Feature Sets Changed (Phase 7 — Batch 2a)
 // =============================================================================
 
-/** Delegate → Server: dynamic featureSet update (full replacement, server computes diff).
- *  Use case: delegate reconnects or changes its MCP servers at runtime.
- *  Server diffs against previous featureSets — removed keys → auto-disable servers. */
+/** Delegate → Server: dynamic featureSet update (delta semantics).
+ *  Use case: delegate adds/removes MCP servers at runtime.
+ *  F15: delta format with legacy fallback. */
 export interface McplFeatureSetsChanged {
   type: 'mcpl/featureSets_changed';
-  featureSets: Record<string, McplFeatureSet>;  // full replacement, server computes diff
+  added?: Record<string, McplFeatureSet>;     // new or updated featureSets
+  removed?: string[];                          // feature set names to remove
+  featureSets?: Record<string, McplFeatureSet>;  // legacy: full replacement fallback
+}
+
+// =============================================================================
+// Feature Sets Update (F16 — Server→Delegate notification)
+// =============================================================================
+
+/** Server → Delegate: notify about capability changes the server made.
+ *  Sent after scope elevation approval, admin action, etc.
+ *  Spec Section 5.3, 6.7: enabled/disabled are featureSet name lists. */
+export interface McplFeatureSetsUpdate {
+  type: 'mcpl/featureSets_update';
+  enabled?: string[];                          // featureSet names that were enabled
+  disabled?: string[];                         // featureSet names that were disabled
+  scopes?: Record<string, { whitelist: string[]; blacklist: string[] }>;  // per-featureSet scope rules
 }
 
 // =============================================================================
@@ -343,9 +569,15 @@ export interface McplScopePolicy {
 }
 
 export interface McplScopePolicyRule {
-  featureSet: string;         // supports wildcards via matchesPattern()
-  capabilities: McplCapability[];
+  featureSet: string;         // supports wildcards via matchesFeatureSetRule() in policy layer only
+  uses: string[];             // §6.2 dotted uses strings
   label?: string;             // optional: only match specific label
+  /** S-1 fix: feature set names that were known when this wildcard rule was approved.
+   *  New names matching the wildcard require re-approval. */
+  approvedFeatureSetNames?: string[];
+  /** S-3 fix: timestamp when this rule was created (ms since epoch).
+   *  Rules older than TTL are ignored. */
+  createdAt?: number;
 }
 
 // =============================================================================
@@ -356,22 +588,30 @@ export interface McplScopePolicyRule {
 export interface McplScopeElevateRequest {
   type: 'mcpl/scope_elevate_request';
   requestId: string;
+  featureSet: string;
+  scope: {                     // spec Section 7.4: nested scope object
+    label: string;
+    payload?: Record<string, unknown>;
+  };
+  // Extensions beyond spec:
   delegateId: string;
   serverId: string;
   conversationId: string;
-  featureSet: string;          // which feature set label
-  label: string;               // human-readable label
-  requestedCapabilities: McplCapability[];
+  requestedUses: string[];     // §6.2 dotted uses strings
   reason: string;
-  timeoutMs?: number;          // default 60s
+  timeoutMs?: number;
 }
 
-/** Server → Delegate: scope elevate result */
+/** Server → Delegate: scope elevate result (spec Section 7.5) */
 export interface McplScopeElevateResult {
   type: 'mcpl/scope_elevate_result';
   requestId: string;
   approved: boolean;
-  newCapabilities?: McplCapability[];
+  payload?: Record<string, unknown>;  // spec: echo back payload
+  reason?: string;                    // spec: denial reason
+  // Extensions beyond spec:
+  newUses?: string[];                 // §6.2 dotted uses strings
+  scoped?: boolean;
 }
 
 /** Server → Client: scope elevate approval needed (sent to user's UI) */
@@ -383,7 +623,7 @@ export interface McplScopeElevateApprovalNeeded {
   delegateName: string;
   featureSet: string;
   label: string;
-  requestedCapabilities: McplCapability[];
+  requestedUses: string[];     // §6.2 dotted uses strings
   reason: string;
   timeout: number;
 }
@@ -402,7 +642,7 @@ export interface McplScopeElevateDecision {
 /** Scope context attached to tool calls for MCP server awareness */
 export interface McplScopeContext {
   featureSet: string;
-  activeCapabilities: McplCapability[];
+  activeCapabilities: string[];  // §6.2 dotted uses strings
 }
 
 // =============================================================================
@@ -495,25 +735,18 @@ export interface McplCheckpointListResponse {
 export interface McplModelInfoRequest {
   type: 'mcpl/model_info_request';
   requestId: string;
-  // no modelId — backend resolves from conversation context
-  // MCP server doesn't know and shouldn't know which model is configured
+  conversationId?: string;  // optional: resolve conversation's active model
 }
 
 export interface McplModelInfoResponse {
   type: 'mcpl/model_info_response';
   requestId: string;
-  modelId: string;
-  provider: string;
+  id: string;                        // spec: model ID (was: modelId)
+  vendor: string;                    // spec: model vendor (was: provider)
   contextWindow: number;
-  outputTokenLimit: number;
-  supportsThinking: boolean;
-  supportsPrefill: boolean;
-  capabilities: {
-    imageInput: boolean;
-    pdfInput: boolean;
-    audioInput: boolean;
-    videoInput: boolean;
-    imageOutput: boolean;
-    audioOutput: boolean;
-  };
+  capabilities: string[];            // spec: string array e.g. ['vision','pdf','audio'] (was: object)
+  // Extensions beyond spec:
+  outputTokenLimit?: number;
+  supportsThinking?: boolean;
+  supportsPrefill?: boolean;
 }

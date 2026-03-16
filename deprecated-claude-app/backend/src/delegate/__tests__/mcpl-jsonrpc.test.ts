@@ -3,6 +3,9 @@ import {
   RESPONSE_TYPE_MAP,
   REQUEST_TO_RESPONSE_TYPE,
   NOTIFICATION_TYPES,
+  SPEC_INTERNAL_TO_WIRE,
+  EXTENSION_INTERNAL_TO_WIRE,
+  INTERNAL_TO_WIRE,
   isJsonRpcRequest,
   isJsonRpcNotification,
   isJsonRpcResponse,
@@ -20,7 +23,7 @@ describe('mcpl-jsonrpc maps', () => {
 
   describe('RESPONSE_TYPE_MAP', () => {
     it('contains expected response types', () => {
-      expect(RESPONSE_TYPE_MAP['mcpl/ack']).toBe('mcpl/hello');
+      expect(RESPONSE_TYPE_MAP['mcpl/ack']).toBe('initialize');
       expect(RESPONSE_TYPE_MAP['mcpl/beforeInference_response']).toBe('mcpl/beforeInference');
       expect(RESPONSE_TYPE_MAP['mcpl/afterInference_response']).toBe('mcpl/afterInference');
       expect(RESPONSE_TYPE_MAP['mcpl/afterInference_ack']).toBe('mcpl/afterInference');
@@ -54,8 +57,8 @@ describe('mcpl-jsonrpc maps', () => {
       }
     });
 
-    it('mcpl/hello → mcpl/ack', () => {
-      expect(REQUEST_TO_RESPONSE_TYPE['mcpl/hello']).toBe('mcpl/ack');
+    it('initialize → mcpl/ack', () => {
+      expect(REQUEST_TO_RESPONSE_TYPE['initialize']).toBe('mcpl/ack');
     });
 
     it('mcpl/beforeInference → mcpl/beforeInference_response', () => {
@@ -85,8 +88,10 @@ describe('mcpl-jsonrpc maps', () => {
 
   describe('NOTIFICATION_TYPES', () => {
     it('contains expected notification types', () => {
-      expect(NOTIFICATION_TYPES.has('mcpl/push_event')).toBe(true);
+      // F8c fix: push_event is now a request (expects push_event_response), not a notification
+      expect(NOTIFICATION_TYPES.has('mcpl/push_event')).toBe(false);
       expect(NOTIFICATION_TYPES.has('mcpl/featureSets_changed')).toBe(true);
+      expect(NOTIFICATION_TYPES.has('mcpl/featureSets_update')).toBe(true);
       expect(NOTIFICATION_TYPES.has('mcpl/inference_chunk')).toBe(true);
       expect(NOTIFICATION_TYPES.has('mcpl/connect_server')).toBe(true);
       expect(NOTIFICATION_TYPES.has('mcpl/connect_server_result')).toBe(true);
@@ -130,6 +135,31 @@ describe('mcpl-jsonrpc maps', () => {
     it('REQUEST_TO_RESPONSE_TYPE includes state_rollback (manual addition)', () => {
       // state_rollback is NOT in RESPONSE_TYPE_MAP values, it is manually added
       expect(REQUEST_TO_RESPONSE_TYPE['mcpl/state_rollback']).toBeDefined();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // SPEC / EXTENSION split
+  // ---------------------------------------------------------------------------
+
+  describe('SPEC_INTERNAL_TO_WIRE / EXTENSION_INTERNAL_TO_WIRE', () => {
+    it('are disjoint (no key in both)', () => {
+      const specKeys = new Set(Object.keys(SPEC_INTERNAL_TO_WIRE));
+      for (const key of Object.keys(EXTENSION_INTERNAL_TO_WIRE)) {
+        expect(specKeys.has(key)).toBe(false);
+      }
+    });
+
+    it('combined equals INTERNAL_TO_WIRE', () => {
+      const combined = { ...SPEC_INTERNAL_TO_WIRE, ...EXTENSION_INTERNAL_TO_WIRE };
+      expect(combined).toEqual(INTERNAL_TO_WIRE);
+    });
+
+    it('wire values are also disjoint', () => {
+      const specValues = new Set(Object.values(SPEC_INTERNAL_TO_WIRE));
+      for (const val of Object.values(EXTENSION_INTERNAL_TO_WIRE)) {
+        expect(specValues.has(val)).toBe(false);
+      }
     });
   });
 });

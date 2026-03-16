@@ -30,3 +30,9 @@ backend/config/siteConfig.production.json
 
 *.md
 *.txt
+
+# Compiled JS in shared (TypeScript source)
+shared/src/*.js
+
+# Windows artifact
+nul

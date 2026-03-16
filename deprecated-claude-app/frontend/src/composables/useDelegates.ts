@@ -141,6 +141,15 @@ export function useDelegates() {
     }
   };
 
+  // Handle session-level feature set runtime changes (scope decisions, enable/disable via MCPL)
+  const handleFeatureSetsRuntimeChanged = (_data: any) => {
+    if (toolFetchTimeout) clearTimeout(toolFetchTimeout);
+    toolFetchTimeout = setTimeout(async () => {
+      await Promise.all([fetchDelegates(), fetchTools()]);
+      toolFetchTimeout = null;
+    }, 500);
+  };
+
   // Dismiss notification
   const dismissNotification = () => {
     notification.value = null;
@@ -153,6 +162,7 @@ export function useDelegates() {
     const wsService = store.state.wsService;
     if (wsService) {
       wsService.on('delegate_status_changed', handleDelegateStatusChanged);
+      wsService.on('mcpl/feature_sets_runtime_changed', handleFeatureSetsRuntimeChanged);
       wsHandlerRegistered = true;
     }
   };
@@ -164,6 +174,7 @@ export function useDelegates() {
     const wsService = store.state.wsService;
     if (wsService) {
       wsService.off('delegate_status_changed', handleDelegateStatusChanged);
+      wsService.off('mcpl/feature_sets_runtime_changed', handleFeatureSetsRuntimeChanged);
       wsHandlerRegistered = false;
     }
   };

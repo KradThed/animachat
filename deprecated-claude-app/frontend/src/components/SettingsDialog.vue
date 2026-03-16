@@ -372,7 +372,12 @@
 
             <!-- Connected Delegates Status -->
             <h4 class="text-subtitle-1 mb-2">Connected Delegates</h4>
-            <DelegateStatusPanel @delegates-updated="onDelegatesUpdated" />
+            <DelegateStatusPanel
+              :delegates="settingsDelegates"
+              :loading="false"
+              mode="global"
+              :on-refresh="() => refreshSettingsDelegates(false)"
+            />
           </v-card-text>
         </v-window-item>
 
@@ -503,6 +508,7 @@ import CustomModelsTab from './CustomModelsTab.vue';
 import AvatarPacksTab from './AvatarPacksTab.vue';
 import GrantsTab from './GrantsTab.vue';
 import DelegateStatusPanel from './DelegateStatusPanel.vue';
+import { useDelegates } from '@/composables/useDelegates';
 
 const props = defineProps<{
   modelValue: boolean;
@@ -533,7 +539,11 @@ const delegateApiKeys = ref<DelegateApiKeyPublic[]>([]);
 const newDelegateKeyName = ref('');
 const creatingDelegateKey = ref(false);
 const newlyCreatedKey = ref<string | null>(null);
-const hasConnectedDelegates = ref(false);
+const {
+  delegates: settingsDelegates,
+  refresh: refreshSettingsDelegates,
+} = useDelegates();
+const hasConnectedDelegates = computed(() => settingsDelegates.value.length > 0);
 
 // Delegate entities state (new system)
 const delegateEntities = ref<DelegateEntity[]>([]);
@@ -757,9 +767,6 @@ async function copyToClipboard(text: string) {
   }
 }
 
-function onDelegatesUpdated(delegates: any[]) {
-  hasConnectedDelegates.value = delegates.length > 0;
-}
 
 // Delegate entity methods
 async function loadDelegateEntities() {

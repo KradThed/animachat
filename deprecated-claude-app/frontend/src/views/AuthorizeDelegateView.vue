@@ -81,17 +81,35 @@ async function authorize() {
       state,
     });
 
-    // Redirect to CLI callback with auth code
-    window.location.href = response.data.redirectUrl;
+    // Redirect to CLI callback with auth code (validate to prevent open redirect)
+    const targetUrl = response.data.redirectUrl;
+    if (isAllowedRedirect(targetUrl)) {
+      window.location.href = targetUrl;
+    } else {
+      error.value = 'Invalid redirect URL received from server.';
+      submitting.value = false;
+    }
   } catch (err: any) {
     submitting.value = false;
     error.value = err.response?.data?.error || 'Authorization failed. Please try again.';
   }
 }
 
+function isAllowedRedirect(uri: string): boolean {
+  try {
+    const url = new URL(uri, window.location.origin);
+    // Allow only same-origin redirects and localhost (CLI callback)
+    return url.origin === window.location.origin
+      || url.hostname === 'localhost'
+      || url.hostname === '127.0.0.1';
+  } catch {
+    return false;
+  }
+}
+
 function cancel() {
   // Redirect to CLI callback with error
-  if (redirectUri && state) {
+  if (redirectUri && state && isAllowedRedirect(redirectUri)) {
     window.location.href = `${redirectUri}?error=access_denied&state=${encodeURIComponent(state)}`;
   } else {
     window.location.href = '/conversation';

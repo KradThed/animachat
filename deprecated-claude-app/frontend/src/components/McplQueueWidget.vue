@@ -26,7 +26,7 @@
             style="min-height: 28px;"
           >
             <v-list-item-title class="text-caption">
-              {{ item.source }}/{{ item.eventType }}
+              {{ item.featureSet }}/{{ item.eventType }}
             </v-list-item-title>
             <template v-slot:append>
               <v-chip
@@ -56,14 +56,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue';
+import { ref, computed, withDefaults } from 'vue';
 
 interface QueueItem {
   id: string;
-  source: string;
+  featureSet: string;
   eventType: string;
   status: string;
   timestamp: string;
+  systemMessage?: string;
 }
 
 interface QueueState {
@@ -72,10 +73,29 @@ interface QueueState {
   isPaused: boolean;
 }
 
-const props = defineProps<{ queue: QueueState }>();
-const emit = defineEmits<{ 'toggle-pause': [] }>();
+const props = withDefaults(defineProps<{
+  queue: QueueState;
+  modelValue?: boolean;
+}>(), {
+  modelValue: undefined,
+});
+const emit = defineEmits<{
+  'toggle-pause': [];
+  'update:modelValue': [value: boolean];
+}>();
 
-const expanded = ref(false);
+// If modelValue is provided (v-model), use it; otherwise use local state
+const localExpanded = ref(false);
+const expanded = computed({
+  get: () => props.modelValue !== undefined ? props.modelValue : localExpanded.value,
+  set: (v: boolean) => {
+    if (props.modelValue !== undefined) {
+      emit('update:modelValue', v);
+    } else {
+      localExpanded.value = v;
+    }
+  },
+});
 
 const displayItems = computed(() => props.queue.items.slice(0, 5));
 

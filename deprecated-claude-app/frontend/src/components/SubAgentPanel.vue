@@ -1,5 +1,5 @@
 <template>
-  <div class="sub-agent-panel">
+  <div class="sub-agent-panel" v-if="!dismissed">
     <!-- Progress banner: active sub-agents running -->
     <v-alert
       v-if="active && !finalized"
@@ -17,7 +17,17 @@
         />
       </template>
       <div class="sub-agent-title">
-        Sub-agents working ({{ tasks.length }} {{ tasks.length === 1 ? 'task' : 'tasks' }})
+        Sub-agents working
+      </div>
+      <!-- Queue count summary -->
+      <div class="sub-agent-summary">
+        {{ runningCount }} running<span v-if="queuedCount > 0"> · {{ queuedCount }} queued</span><span v-if="doneCount > 0"> · {{ doneCount }}/{{ tasks.length }} done</span>
+      </div>
+      <!-- Progress bar -->
+      <div class="sub-agent-progress" v-if="tasks.length > 1">
+        <div class="progress-bar">
+          <div class="progress-fill" :style="{ width: progressPercent + '%' }" />
+        </div>
       </div>
       <div class="sub-agent-task-list">
         <div
@@ -43,7 +53,7 @@
       Message queued — will be sent after sub-agents finish
     </v-alert>
 
-    <!-- Post-finalize: show task results -->
+    <!-- Post-finalize: show task results (auto-dismisses after 3s if all OK) -->
     <v-alert
       v-if="finalized"
       type="success"
@@ -53,6 +63,9 @@
     >
       <div class="sub-agent-title">
         Subtasks completed ({{ tasks.length }} {{ tasks.length === 1 ? 'task' : 'tasks' }})
+        <span v-if="autoDismissCountdown > 0" class="auto-dismiss-timer">
+          closing in {{ autoDismissCountdown }}s
+        </span>
       </div>
       <div class="sub-agent-task-list">
         <div
@@ -76,7 +89,7 @@
           color="primary"
           variant="tonal"
           size="small"
-          @click="$emit('summarize-results')"
+          @click="cancelAutoDismiss(); $emit('summarize-results')"
         >
           Summarize results
         </v-btn>
@@ -140,7 +153,9 @@
 </template>
 
 <script setup lang="ts">
-defineProps<{
+import { computed, ref, watch, onBeforeUnmount } from 'vue';
+
+const props = defineProps<{
   active: boolean;
   groupId: string | null;
   tasks: Array<{
@@ -155,7 +170,7 @@ defineProps<{
   queuedText: string | null;
 }>();
 
-defineEmits<{
+const emit = defineEmits<{
   'send-queued': [];
   'edit-queued': [];
   'discard-queued': [];
@@ -163,6 +178,58 @@ defineEmits<{
   'summarize-results': [];
 }>();
 
+// --- Queue count summary ---
+const runningCount = computed(() => props.tasks.filter(t => t.status === 'RUNNING' || t.status === 'FINALIZING').length);
+const queuedCount = computed(() => props.tasks.filter(t => t.status === 'QUEUED').length);
+const doneCount = computed(() => props.tasks.filter(t => t.status === 'FINALIZED' || t.status === 'ERROR' || t.status === 'CANCELLED').length);
+const progressPercent = computed(() => {
+  if (props.tasks.length === 0) return 0;
+  return Math.round((doneCount.value / props.tasks.length) * 100);
+});
+
+// --- Auto-dismiss ---
+const dismissed = ref(false);
+const autoDismissCountdown = ref(0);
+let autoDismissTimer: ReturnType<typeof setInterval> | null = null;
+
+const allTasksOk = computed(() =>
+  props.tasks.length > 0 && props.tasks.every(t => t.status === 'FINALIZED')
+);
+
+function cancelAutoDismiss() {
+  if (autoDismissTimer) {
+    clearInterval(autoDismissTimer);
+    autoDismissTimer = null;
+  }
+  autoDismissCountdown.value = 0;
+}
+
+watch(() => props.finalized, (finalized) => {
+  if (finalized && allTasksOk.value && !props.queuedText) {
+    // Auto-dismiss after 3 seconds if all tasks succeeded and no queued message
+    autoDismissCountdown.value = 3;
+    autoDismissTimer = setInterval(() => {
+      autoDismissCountdown.value--;
+      if (autoDismissCountdown.value <= 0) {
+        cancelAutoDismiss();
+        dismissed.value = true;
+        emit('dismiss');
+      }
+    }, 1000);
+  }
+});
+
+// Reset dismissed state when a new group starts
+watch(() => props.groupId, () => {
+  dismissed.value = false;
+  cancelAutoDismiss();
+});
+
+onBeforeUnmount(() => {
+  cancelAutoDismiss();
+});
+
+// --- Helpers ---
 function statusIcon(status: string): string {
   switch (status) {
     case 'FINALIZED': return '\u2705';
@@ -204,6 +271,40 @@ function truncateResult(text: string): string {
   font-weight: 500;
   font-size: 0.85rem;
   margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sub-agent-summary {
+  font-size: 0.78rem;
+  opacity: 0.8;
+  margin-bottom: 4px;
+}
+
+.sub-agent-progress {
+  margin-bottom: 6px;
+}
+
+.progress-bar {
+  height: 4px;
+  background: rgba(128, 128, 128, 0.2);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: rgb(var(--v-theme-primary));
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.auto-dismiss-timer {
+  font-size: 0.7rem;
+  opacity: 0.6;
+  font-weight: 400;
+  font-style: italic;
 }
 
 .sub-agent-task-list {

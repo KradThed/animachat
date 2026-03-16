@@ -25,6 +25,8 @@ import type { McplHookManager, InferenceHookContext } from '../services/mcpl-hoo
 import type { SubAgentTask, TaskMetrics } from './types.js';
 import { MAX_ITERATIONS } from './types.js';
 import { SUB_AGENT_TOOL_NAMES, MCPL_MANAGEMENT_TOOL_NAMES } from './sub-agent-tools.js';
+import { normalizeInjectionContent } from '@deprecated-claude/shared';
+import { applyUserInjections } from '../utils/message-helpers.js';
 
 // =============================================================================
 // Types
@@ -149,9 +151,6 @@ export class InferenceRunner {
         conversationId: this.task.conversationId,
         userId: this.task.userId,
         isSubAgent: true,
-        taskId: this.task.taskId,
-        groupId: this.task.groupId,
-        instruction: this.task.instruction,
       };
 
       if (this.hookManager) {
@@ -165,34 +164,27 @@ export class InferenceRunner {
         if (hookResult.abort) {
           throw new Error(`MCPL beforeInference aborted: ${hookResult.abortReason ?? 'no reason'}`);
         }
-        const injections = hookResult.injections;
+        const injections = hookResult.contextInjections;
         if (injections.length > 0) {
           // system injections → systemPrompt
-          const systemInj = injections.filter(i => i.position === 'system').map(i => i.content);
+          // F4 fix: normalizeInjectionContent handles McplContentBlock[] (avoids "[object Object]")
+          const systemInj = injections.filter(i => i.position === 'system').map(i => normalizeInjectionContent(i.content));
           if (systemInj.length > 0) {
             systemPrompt = systemPrompt
               ? `${systemPrompt}\n\n${systemInj.join('\n')}`
               : systemInj.join('\n');
           }
           // beforeUser/afterUser → immutable message update (don't mutate shared reference)
-          const beforeUser = injections.filter(i => i.position === 'beforeUser').map(i => i.content);
-          const afterUser = injections.filter(i => i.position === 'afterUser').map(i => i.content);
-          if ((beforeUser.length > 0 || afterUser.length > 0) && messages.length > 0) {
-            const lastIdx = messages.length - 1;
-            messages = messages.map((m, i) => {
-              if (i !== lastIdx) return m;
-              const branch = m.branches.find(b => b.id === m.activeBranchId);
-              if (!branch) return m;
-              let content = branch.content;
-              if (beforeUser.length > 0) content = beforeUser.join('\n') + '\n\n' + content;
-              if (afterUser.length > 0) content = content + '\n\n' + afterUser.join('\n');
-              return {
-                ...m,
-                branches: m.branches.map(b =>
-                  b.id === m.activeBranchId ? { ...b, content } : b
-                ),
-              };
-            });
+          // F4 fix: normalizeInjectionContent handles McplContentBlock[]
+          const beforeUser = injections.filter(i => i.position === 'beforeUser').map(i => normalizeInjectionContent(i.content));
+          const afterUser = injections.filter(i => i.position === 'afterUser').map(i => normalizeInjectionContent(i.content));
+          if (beforeUser.length > 0 || afterUser.length > 0) {
+            const result = applyUserInjections(messages, beforeUser, afterUser);
+            messages = result.messages;
+            if (result.systemAppend) {
+              systemPrompt = systemPrompt
+                ? `${systemPrompt}\n\n${result.systemAppend}` : result.systemAppend;
+            }
           }
         }
       }

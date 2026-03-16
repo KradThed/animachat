@@ -33,7 +33,7 @@ export interface RoutingRule {
   match: {
     featureSet?: string;    // PRIMARY routing key (per spec). Wildcard via matchesPattern()
     delegateId?: string;    // supports wildcard via matchesPattern()
-    serverId?: string;      // supports wildcard via matchesPattern()
+    serverId?: string;      // DEPRECATED: legacy alias — matches context.featureSet, not a real serverId
     tag?: string;           // future use
   };
   route: InferenceRoute;
@@ -107,6 +107,12 @@ export class InferenceRouter {
           console.warn(`[InferenceRouter] Unknown model "${rule.route.model}" in rule matching ${JSON.stringify(rule.match)}, skipping`);
           continue;
         }
+        if (rule.match.serverId) {
+          console.warn(
+            `[InferenceRouter] Rule uses deprecated "match.serverId" — ` +
+            `use "match.featureSet" instead. serverId now aliases featureSet matching.`
+          );
+        }
         validRules.push(rule);
       }
 
@@ -164,7 +170,6 @@ export class InferenceRouter {
   resolve(context: {
     featureSet?: string;
     delegateId: string;
-    serverId: string;
     tags?: string[];
   }): InferenceRoute | null {
     for (const rule of this.rules) {
@@ -213,7 +218,7 @@ export class InferenceRouter {
    */
   private matchesRule(
     rule: RoutingRule,
-    context: { featureSet?: string; delegateId: string; serverId: string; tags?: string[] }
+    context: { featureSet?: string; delegateId: string; tags?: string[] }
   ): boolean {
     const { match } = rule;
 
@@ -231,9 +236,11 @@ export class InferenceRouter {
       }
     }
 
-    // serverId match
+    // serverId match — DEPRECATED ALIAS: matches context.featureSet, not a real serverId.
+    // Legacy configs may use match.serverId; it now maps to the same featureSet-based matching.
     if (match.serverId) {
-      if (!matchesPattern(match.serverId, context.serverId)) {
+      const candidate = context.featureSet ?? '';
+      if (!matchesPattern(match.serverId, candidate)) {
         return false;
       }
     }

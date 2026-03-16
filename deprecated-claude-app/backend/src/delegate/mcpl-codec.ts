@@ -16,6 +16,8 @@ import {
   RESPONSE_TYPE_MAP,
   REQUEST_TO_RESPONSE_TYPE,
   NOTIFICATION_TYPES,
+  INTERNAL_TO_WIRE,
+  WIRE_TO_INTERNAL,
   isJsonRpcRequest,
   isJsonRpcNotification,
   isJsonRpcResponse,
@@ -94,12 +96,15 @@ export class McplCodec implements McplTransport {
       return;
     }
 
+    // F1 fix: Translate internal method name → spec wire name
+    const wireMethod = INTERNAL_TO_WIRE[type] ?? type;
+
     // 3. Notification — fire-and-forget, no id
     if (NOTIFICATION_TYPES.has(type)) {
       const { type: _, ...rest } = msg;
       this.inner.send({
         jsonrpc: '2.0',
-        method: type,
+        method: wireMethod,
         params: rest,
       });
       return;
@@ -111,7 +116,7 @@ export class McplCodec implements McplTransport {
       console.warn(`[McplCodec] Request "${type}" has no requestId — sending as notification`);
       this.inner.send({
         jsonrpc: '2.0',
-        method: type,
+        method: wireMethod,
         params: rest,
       });
       return;
@@ -120,7 +125,7 @@ export class McplCodec implements McplTransport {
     this.inner.send({
       jsonrpc: '2.0',
       id: requestId,
-      method: type,
+      method: wireMethod,
       params: rest,
     });
   }
@@ -213,14 +218,16 @@ export class McplCodec implements McplTransport {
 
     // 3. Request (has method + id)
     if (isJsonRpcRequest(raw)) {
-      const method = raw.method as string;
+      const wireMethod = raw.method as string;
+      // F1 fix: Translate spec wire name → internal name
+      const internalType = WIRE_TO_INTERNAL[wireMethod] ?? wireMethod;
       const id = raw.id as string | number;
       const params = (raw.params && typeof raw.params === 'object')
         ? raw.params as Record<string, unknown>
         : {};
 
       this.messageHandler({
-        type: method,
+        type: internalType,
         requestId: id,
         ...params,
       });
@@ -229,13 +236,15 @@ export class McplCodec implements McplTransport {
 
     // 4. Notification (has method, no id)
     if (isJsonRpcNotification(raw)) {
-      const method = raw.method as string;
+      const wireMethod = raw.method as string;
+      // F1 fix: Translate spec wire name → internal name
+      const internalType = WIRE_TO_INTERNAL[wireMethod] ?? wireMethod;
       const params = (raw.params && typeof raw.params === 'object')
         ? raw.params as Record<string, unknown>
         : {};
 
       this.messageHandler({
-        type: method,
+        type: internalType,
         ...params,
       });
       return;

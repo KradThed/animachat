@@ -31,6 +31,9 @@ import { InferenceRunner } from './inference-runner.js';
 import type { NotificationBus } from './notification-bus.js';
 import type { ResourceCoordinator } from '../services/resource-coordinator.js';
 import type { McplHookManager } from '../services/mcpl-hook-manager.js';
+import fs from 'fs/promises';
+import path from 'path';
+import { atomicWriteJSON } from '../database/atomic-write.js';
 import {
   LEASE_MS,
   FINALIZE_GRACE_MS,
@@ -91,6 +94,9 @@ export class SubAgentManager {
   // C3: Cache results after group deletion (for late get_subtask_results/poll calls)
   private finalizeResultCache: Map<string, FinalizeResultCacheEntry> = new Map();
   private cacheCleanupTimer: NodeJS.Timeout | null = null;
+  private diskCleanupTimer: NodeJS.Timeout | null = null;
+  private finalizedGroupsDir = './data/finalized-groups';
+  private static RETENTION_DAYS = 7;
 
   // Queued user messages (depth=1 per user per conversation, in-memory)
   // Key: `${conversationId}:${userId}` — per-user queue prevents privacy leaks in shared conversations
@@ -111,6 +117,77 @@ export class SubAgentManager {
   ) {
     // Prune expired cache entries every 60 seconds
     this.cacheCleanupTimer = setInterval(() => this.pruneExpiredCache(), 60_000);
+    // Cleanup old finalized-group files hourly (separate from cheap in-memory prune)
+    this.diskCleanupTimer = setInterval(() => this.cleanupOldFinalizedGroups(), 3_600_000);
+  }
+
+  // --------------------------------------------------------------------------
+  // Finalized Group Persistence
+  // --------------------------------------------------------------------------
+
+  private async persistFinalizedGroupResults(
+    groupId: string, entry: FinalizeResultCacheEntry
+  ): Promise<void> {
+    try {
+      await fs.mkdir(this.finalizedGroupsDir, { recursive: true });
+      await atomicWriteJSON(
+        path.join(this.finalizedGroupsDir, `${groupId}.json`),
+        { conversationId: entry.conversationId, results: entry.results, persistedAt: Date.now() }
+      );
+    } catch (err) {
+      console.error(`[SubAgentManager] Failed to persist group ${groupId}:`, err);
+    }
+  }
+
+  private async loadFinalizedGroupResults(groupId: string): Promise<FinalizeResultCacheEntry | null> {
+    try {
+      const raw = await fs.readFile(path.join(this.finalizedGroupsDir, `${groupId}.json`), 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (!parsed.conversationId || !Array.isArray(parsed.results)) return null;
+      // Validate every element for all consumers:
+      // getSubtaskResults/WithMeta needs taskId, instruction, state
+      // getGroupMetrics aggregates metrics.inputTokens/outputTokens/toolCalls/durationMs
+      for (const r of parsed.results) {
+        if (typeof r.taskId !== 'string' || typeof r.state !== 'string'
+          || typeof r.instruction !== 'string'
+          || !r.metrics
+          || typeof r.metrics.iterations !== 'number'
+          || typeof r.metrics.inputTokens !== 'number'
+          || typeof r.metrics.outputTokens !== 'number'
+          || typeof r.metrics.toolCalls !== 'number'
+          || typeof r.metrics.durationMs !== 'number') {
+          return null;
+        }
+      }
+      const entry: FinalizeResultCacheEntry = {
+        conversationId: parsed.conversationId,
+        results: parsed.results,
+        expiresAt: Date.now() + FINALIZE_CACHE_TTL_MS,
+      };
+      this.finalizeResultCache.set(groupId, entry);
+      return entry;
+    } catch { return null; }
+  }
+
+  private async getCachedOrDiskResults(groupId: string): Promise<FinalizeResultCacheEntry | null> {
+    const cached = this.finalizeResultCache.get(groupId);
+    if (cached && cached.expiresAt > Date.now()) return cached;
+    return this.loadFinalizedGroupResults(groupId);
+  }
+
+  private async cleanupOldFinalizedGroups(): Promise<void> {
+    try {
+      const files = await fs.readdir(this.finalizedGroupsDir);
+      const cutoff = Date.now() - SubAgentManager.RETENTION_DAYS * 86400000;
+      for (const file of files) {
+        if (!file.endsWith('.json')) continue;
+        const filePath = path.join(this.finalizedGroupsDir, file);
+        const stat = await fs.stat(filePath);
+        if (stat.mtimeMs < cutoff) {
+          await fs.unlink(filePath).catch(() => {});
+        }
+      }
+    } catch {}
   }
 
   // --------------------------------------------------------------------------
@@ -521,12 +598,16 @@ export class SubAgentManager {
    * Get results for a task group (only returns results for completed tasks).
    * Falls back to finalizeResultCache if group has been deleted.
    */
-  getSubtaskResults(groupId: string, conversationId?: string): { results: SubAgentResult[] } {
+  async getSubtaskResults(groupId: string, conversationId?: string): Promise<{ results: SubAgentResult[] }> {
     const group = this.groups.get(groupId);
     if (!group) {
-      // C3: Check cache for recently finalized groups
-      const cached = this.finalizeResultCache.get(groupId);
-      if (cached && cached.expiresAt > Date.now()) {
+      // C3: Check cache or disk for finalized groups
+      const cached = await this.getCachedOrDiskResults(groupId);
+      if (cached) {
+        // Ownership check for cached/disk results too
+        if (conversationId && cached.conversationId !== conversationId) {
+          throw new Error('Group does not belong to this conversation');
+        }
         return { results: cached.results };
       }
       return { results: [] };
@@ -558,11 +639,11 @@ export class SubAgentManager {
    * Like getSubtaskResults but also returns conversationId for access control
    * and a `found` flag to distinguish "group exists but empty results" from "group not found".
    */
-  getSubtaskResultsWithMeta(groupId: string): {
+  async getSubtaskResultsWithMeta(groupId: string): Promise<{
     found: boolean;
     results: SubAgentResult[];
     conversationId: string | null;
-  } {
+  }> {
     const group = this.groups.get(groupId);
     if (group) {
       const results: SubAgentResult[] = [];
@@ -581,9 +662,9 @@ export class SubAgentManager {
       return { found: true, results, conversationId: group.conversationId };
     }
 
-    // Check cache for recently finalized groups
-    const cached = this.finalizeResultCache.get(groupId);
-    if (cached && cached.expiresAt > Date.now()) {
+    // Check cache or disk for finalized groups
+    const cached = await this.getCachedOrDiskResults(groupId);
+    if (cached) {
       return { found: true, results: cached.results, conversationId: cached.conversationId };
     }
 
@@ -749,10 +830,10 @@ export class SubAgentManager {
    * Get aggregated metrics across all tasks in a group.
    * Works from in-memory groups or finalizeResultCache.
    */
-  getGroupMetrics(
+  async getGroupMetrics(
     groupId: string,
     conversationId: string,
-  ): {
+  ): Promise<{
     groupId: string;
     taskCount: number;
     completedCount: number;
@@ -764,7 +845,7 @@ export class SubAgentManager {
     totalOutputTokens: number;
     totalToolCalls: number;
     totalDurationMs: number;
-  } {
+  }> {
     // Try active group first
     const group = this.groups.get(groupId);
     if (group) {
@@ -774,9 +855,9 @@ export class SubAgentManager {
       return this.aggregateGroupMetrics(groupId, [...group.tasks.values()]);
     }
 
-    // Fallback to cache
-    const cached = this.finalizeResultCache.get(groupId);
-    if (cached && cached.expiresAt > Date.now()) {
+    // Fallback to cache or disk
+    const cached = await this.getCachedOrDiskResults(groupId);
+    if (cached) {
       if (cached.conversationId !== conversationId) {
         throw new Error('Group does not belong to this conversation');
       }
@@ -967,11 +1048,15 @@ export class SubAgentManager {
       }, group.userId);
 
       // C3: Cache results before deleting group
-      this.finalizeResultCache.set(groupId, {
+      const cacheEntry: FinalizeResultCacheEntry = {
         conversationId: group.conversationId,
         results,
         expiresAt: Date.now() + FINALIZE_CACHE_TTL_MS,
-      });
+      };
+      this.finalizeResultCache.set(groupId, cacheEntry);
+
+      // Persist to disk for survival across restarts (full SubAgentResult[], not truncated)
+      await this.persistFinalizedGroupResults(groupId, cacheEntry);
 
       // Notify bus
       this.notificationBus.unfreezeParent(group.conversationId, groupId, autoFinalized);
@@ -1701,6 +1786,10 @@ export class SubAgentManager {
     if (this.cacheCleanupTimer) {
       clearInterval(this.cacheCleanupTimer);
       this.cacheCleanupTimer = null;
+    }
+    if (this.diskCleanupTimer) {
+      clearInterval(this.diskCleanupTimer);
+      this.diskCleanupTimer = null;
     }
 
     // Cancel all active runners (abort in-flight LLM calls)

@@ -61,6 +61,7 @@ export class NotificationBus extends EventEmitter {
     // 1. UI broadcast
     this.roomManager?.broadcastToRoom(conversationId, {
       type: 'subtask_status_changed',
+      conversationId,
       groupId,
       taskId,
       status,
@@ -78,6 +79,7 @@ export class NotificationBus extends EventEmitter {
     // UI broadcast — use distinct event type so frontend can show CTA for auto-finalized groups
     this.roomManager?.broadcastToRoom(conversationId, {
       type: autoFinalized ? 'subtask_group_auto_finalized' : 'subtask_group_finalized',
+      conversationId,
       groupId,
     });
 

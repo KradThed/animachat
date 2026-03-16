@@ -1,5 +1,6 @@
 import fs from 'fs/promises';
 import path from 'path';
+import { atomicWriteJSON } from './atomic-write.js';
 
 /**
  * Shared conversation state - synced to all attached users
@@ -76,6 +77,16 @@ export class ConversationUIStateStore {
       return state;
     } catch (error: any) {
       if (error.code === 'ENOENT') {
+        // Recovery: try .bak (crash between rename(file→.bak) and rename(tmp→file))
+        const filePath = this.getSharedFilePath(conversationId);
+        try {
+          const bakData = await fs.readFile(filePath + '.bak', 'utf-8');
+          const state = JSON.parse(bakData) as SharedConversationState;
+          this.sharedCache.set(conversationId, state);
+          // Best-effort restore: only if main file still missing
+          try { await fs.rename(filePath + '.bak', filePath); } catch {}
+          return state;
+        } catch {}
         const empty: SharedConversationState = { activeBranches: {} };
         this.sharedCache.set(conversationId, empty);
         return empty;
@@ -88,7 +99,7 @@ export class ConversationUIStateStore {
     const filePath = this.getSharedFilePath(conversationId);
     const dir = path.dirname(filePath);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(filePath, JSON.stringify(state, null, 2));
+    await atomicWriteJSON(filePath, state);
     this.sharedCache.set(conversationId, state);
   }
 
@@ -141,6 +152,15 @@ export class ConversationUIStateStore {
       return state;
     } catch (error: any) {
       if (error.code === 'ENOENT') {
+        // Recovery: try .bak (crash between rename(file→.bak) and rename(tmp→file))
+        const filePath = this.getUserFilePath(conversationId, userId);
+        try {
+          const bakData = await fs.readFile(filePath + '.bak', 'utf-8');
+          const state = JSON.parse(bakData) as UserConversationState;
+          this.userCache.set(cacheKey, state);
+          try { await fs.rename(filePath + '.bak', filePath); } catch {}
+          return state;
+        } catch {}
         const empty: UserConversationState = {};
         this.userCache.set(cacheKey, empty);
         return empty;
@@ -153,7 +173,7 @@ export class ConversationUIStateStore {
     const filePath = this.getUserFilePath(conversationId, userId);
     const dir = path.dirname(filePath);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(filePath, JSON.stringify(state, null, 2));
+    await atomicWriteJSON(filePath, state);
     this.userCache.set(this.getUserCacheKey(conversationId, userId), state);
   }
 

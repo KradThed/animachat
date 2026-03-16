@@ -1396,60 +1396,55 @@ watch(isThinkingStreaming, (streaming, oldStreaming) => {
   }
 }, { immediate: true });
 
-const renderedContent = computed(() => {
-  // Use edited content if this message has a post-hoc edit applied
-  let content = props.postHocAffected?.editedContent ?? currentBranch.value.content;
-  
+// Markdown render pipeline — extracted to function for throttled invocation
+function renderMarkdown(raw: string): string {
+  let content = raw;
+
   // Preserve leading/trailing whitespace by converting to non-breaking spaces
   const leadingSpaces = content.match(/^(\s+)/)?.[1] || '';
   const trailingSpaces = content.match(/(\s+)$/)?.[1] || '';
-  
+
   // First, protect code blocks and inline code from HTML escaping
   const codeBlocks: string[] = [];
   const inlineCode: string[] = [];
-  
+
   // Save code blocks with placeholders
   content = content.replace(/```[\s\S]*?```/g, (match) => {
     const index = codeBlocks.length;
     codeBlocks.push(match);
     return `__CODE_BLOCK_${index}__`;
   });
-  
+
   // Save inline code with placeholders
   content = content.replace(/`[^`\n]+`/g, (match) => {
     const index = inlineCode.length;
     inlineCode.push(match);
     return `__INLINE_CODE_${index}__`;
   });
-  
+
   // Escape HTML/XML tags that aren't in code blocks
-  // This prevents raw HTML from being rendered but preserves it visually
   content = content.replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  
-  // Preserve multiple consecutive spaces by converting to non-breaking spaces
-  // (do this before markdown rendering, which would collapse them)
-  // Convert 2+ spaces to alternating space/nbsp to preserve them
+
+  // Preserve multiple consecutive spaces
   content = content.replace(/ {2,}/g, (match) => {
-    // Alternate between regular space and nbsp to allow wrapping while preserving count
     return match.split('').map((_, i) => i % 2 === 0 ? ' ' : '&nbsp;').join('');
   });
-  
+
   // Also preserve leading spaces on each line (for indentation)
   content = content.replace(/^( +)/gm, (match) => {
     return match.replace(/ /g, '&nbsp;');
   });
-  
+
   // Restore code blocks and inline code
   content = content.replace(/__CODE_BLOCK_(\d+)__/g, (_, index) => codeBlocks[parseInt(index)]);
   content = content.replace(/__INLINE_CODE_(\d+)__/g, (_, index) => inlineCode[parseInt(index)]);
-  
+
   // Handle code blocks with syntax highlighting
   const renderer = new marked.Renderer();
-  
+
   renderer.code = (code, language) => {
     if (language) {
       try {
-        // In a real app, you'd use a syntax highlighter like Prism or highlight.js
         return `<pre><code class="language-${language}">${escapeHtml(code)}</code></pre>`;
       } catch (e) {
         // Fallback for unknown languages
@@ -1457,36 +1452,33 @@ const renderedContent = computed(() => {
     }
     return `<pre><code>${escapeHtml(code)}</code></pre>`;
   };
-  
+
   marked.setOptions({
     renderer,
     breaks: true,
     gfm: true
   });
-  
+
   let html = marked.parse ? marked.parse(content) : marked(content);
-  // Handle if marked returns a promise (newer versions)
   if (html instanceof Promise) {
-    html = ''; // Fallback, but this shouldn't happen with sync parse
+    html = '';
   }
-  
+
   // Render LaTeX after markdown (so LaTeX in code blocks is protected)
   html = renderLatex(html as string);
-  
+
   // Convert leading/trailing spaces to non-breaking spaces to preserve them
   const leadingNbsp = leadingSpaces.replace(/ /g, '&nbsp;').replace(/\n/g, '<br>');
   const trailingNbsp = trailingSpaces.replace(/ /g, '&nbsp;').replace(/\n/g, '<br>');
-  
-  // Add preserved whitespace back
+
   if (leadingNbsp) {
     html = leadingNbsp + html;
   }
   if (trailingNbsp) {
     html = html + trailingNbsp;
   }
-  
+
   return DOMPurify.sanitize(html, {
-    // Allow safe HTML tags from markdown plus KaTeX
     ALLOWED_TAGS: [
       'p', 'br', 'strong', 'em', 'u', 's', 'code', 'pre',
       'blockquote', 'ul', 'ol', 'li', 'a', 'img',
@@ -1497,6 +1489,54 @@ const renderedContent = computed(() => {
     ],
     ALLOWED_ATTR: ['href', 'src', 'alt', 'title', 'class', 'id', 'target', 'rel', ...KATEX_ALLOWED_ATTRS]
   });
+}
+
+// Throttled markdown rendering — 100ms during streaming, immediate otherwise
+const renderedContent = ref('');
+let lastRenderedRaw = '';
+let renderThrottleTimer: ReturnType<typeof setTimeout> | null = null;
+const RENDER_THROTTLE_MS = 100;
+
+function doRender(raw: string) {
+  lastRenderedRaw = raw;
+  renderedContent.value = renderMarkdown(raw);
+}
+
+watch(
+  () => props.postHocAffected?.editedContent ?? currentBranch.value.content,
+  (raw) => {
+    if (raw === lastRenderedRaw) return;
+
+    if (!props.isStreaming) {
+      // Not streaming → immediate render (edit, completion, initial load)
+      if (renderThrottleTimer) { clearTimeout(renderThrottleTimer); renderThrottleTimer = null; }
+      doRender(raw);
+      return;
+    }
+
+    // Streaming → time-based throttle (100ms)
+    if (!renderThrottleTimer) {
+      renderThrottleTimer = setTimeout(() => {
+        renderThrottleTimer = null;
+        const latest = props.postHocAffected?.editedContent ?? currentBranch.value.content;
+        doRender(latest);
+      }, RENDER_THROTTLE_MS);
+    }
+  },
+  { immediate: true }
+);
+
+// Immediate final render when streaming ends
+watch(() => props.isStreaming, (streaming, oldStreaming) => {
+  if (oldStreaming && !streaming) {
+    if (renderThrottleTimer) { clearTimeout(renderThrottleTimer); renderThrottleTimer = null; }
+    const raw = props.postHocAffected?.editedContent ?? currentBranch.value.content;
+    doRender(raw);
+  }
+});
+
+onUnmounted(() => {
+  if (renderThrottleTimer) clearTimeout(renderThrottleTimer);
 });
 
 function escapeHtml(text: string): string {

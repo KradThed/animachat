@@ -16,6 +16,7 @@ import { USER_FACING_ERRORS } from '../utils/error-messages.js';
 import { checkContent, type UserContext } from '../services/content-filter.js';
 import { toolRegistry } from '../tools/tool-registry.js';
 import type { ToolCall, ToolResult } from '../tools/tool-registry.js';
+import { buildFeatureSetPredicate } from '../utils/feature-set-predicate.js';
 import { delegateWebsocketHandler, resolveScopeChange, resolveScopeElevate } from '../delegate/delegate-handler.js';
 import { delegateManager } from '../delegate/delegate-manager.js';
 import { mcplHookManager } from '../services/mcpl-hook-manager.js';
@@ -23,6 +24,8 @@ import type { InferenceHookContext } from '../services/mcpl-hook-manager.js';
 import { mcplEventQueue } from '../services/mcpl-event-queue.js';
 import { mcplStateManager } from '../services/mcpl-state-manager.js';
 import type { McplContextInjection } from '@deprecated-claude/shared';
+import { normalizeInjectionContent, getInjectionContentSize } from '@deprecated-claude/shared';
+import { findLastUserMessageIndex } from '../utils/message-helpers.js';
 
 interface AuthenticatedWebSocket extends WebSocket {
   userId?: string;
@@ -40,11 +43,11 @@ interface SubAgentManagerLike {
   releaseQueuedMessage(conversationId: string, userId: string): QueuedUserMessage | null;
   cancelQueuedMessage(conversationId: string, userId: string): void;
   getStateSnapshot(conversationId: string, userId: string): SubAgentStateSnapshot;
-  getSubtaskResultsWithMeta(groupId: string): {
+  getSubtaskResultsWithMeta(groupId: string): Promise<{
     found: boolean;
     results: import('../sub-agents/types.js').SubAgentResult[];
     conversationId: string | null;
-  };
+  }>;
 }
 
 let _subAgentManager: SubAgentManagerLike | null = null;
@@ -182,20 +185,20 @@ export function buildToolOptions(
     return undefined;
   }
 
-  // Get all tools available to this user (filtering disabled servers if db available)
+  // Get all tools available to this user (filtering disabled feature sets if db available)
   const conversationId = conversation.id;
-  const isServerEnabled = db
-    ? (serverId: string) => db.isServerEnabled(conversationId, serverId)
+  const isFeatureSetEnabled = db
+    ? buildFeatureSetPredicate(userId, conversationId, db)
     : undefined;
-  const allTools = toolRegistry.getToolsForUser(userId, isServerEnabled);
+  const allTools = toolRegistry.getToolsForUser(userId, isFeatureSetEnabled);
   console.log('[buildToolOptions] All tools for user:', allTools.length);
 
   // Filter by toolConfig if present
-  // BUG T-11: pass isServerEnabled to getToolsForUserWithSource (was missing, causing
-  // disabled servers to be re-included when toolConfig filtering was active)
+  // BUG T-11: pass isFeatureSetEnabled to getToolsForUserWithSource (was missing, causing
+  // disabled feature sets to be re-included when toolConfig filtering was active)
   const tools = toolConfig
     ? toolRegistry.getToolsForParticipant(
-        toolRegistry.getToolsForUserWithSource(userId, isServerEnabled),
+        toolRegistry.getToolsForUserWithSource(userId, isFeatureSetEnabled),
         toolConfig
       )
     : allTools;
@@ -501,10 +504,10 @@ function applyUserMessageInjections(
   _effectiveSystemPrompt: string, // unused, kept for signature clarity
   fallbackToSystemPrompt: (text: string) => void,
 ): void {
-  // Sort injections deterministically: by serverId, then by original index
+  // Sort injections deterministically: by namespace, then by original index
   const sortInjections = (arr: McplContextInjection[]): McplContextInjection[] =>
     arr.map((inj, idx) => ({ ...inj, _idx: idx }))
-      .sort((a, b) => a.serverId.localeCompare(b.serverId) || (a as any)._idx - (b as any)._idx)
+      .sort((a, b) => a.namespace.localeCompare(b.namespace) || (a as any)._idx - (b as any)._idx)
       .map(({ _idx, ...rest }) => rest as McplContextInjection);
 
   const sortedBefore = sortInjections(beforeUser);
@@ -518,11 +521,13 @@ function applyUserMessageInjections(
 
   // beforeUser first, then afterUser
   for (const inj of [...sortedBefore, ...sortedAfter]) {
-    if (totalChars + inj.content.length > MAX_INJECTION_CHARS) {
+    // F5 fix: getInjectionContentSize handles McplContentBlock[] (counts serialized size, not array length)
+    const contentSize = getInjectionContentSize(inj.content);
+    if (totalChars + contentSize > MAX_INJECTION_CHARS) {
       truncatedCount++;
       continue;
     }
-    totalChars += inj.content.length;
+    totalChars += contentSize;
     if (inj.position === 'beforeUser') {
       budgetedBefore.push(inj);
     } else {
@@ -539,21 +544,13 @@ function applyUserMessageInjections(
   }
 
   // Find last user message (walk backwards)
-  let lastUserIdx = -1;
-  for (let i = historyMessages.length - 1; i >= 0; i--) {
-    const msg = historyMessages[i];
-    const activeBranch = msg.branches?.find((b: any) => b.id === msg.activeBranchId);
-    if (activeBranch?.role === 'user') {
-      lastUserIdx = i;
-      break;
-    }
-  }
+  const lastUserIdx = findLastUserMessageIndex(historyMessages);
 
   if (lastUserIdx === -1) {
     // Edge case: no user messages → fall back to system prompt (existing behavior)
     const allContents = [
-      ...budgetedBefore.map(i => `[Context from ${i.serverId}]\n${i.content}`),
-      ...budgetedAfter.map(i => `[Context from ${i.serverId}]\n${i.content}`),
+      ...budgetedBefore.map(i => `[Context from ${i.namespace}]\n${normalizeInjectionContent(i.content)}`),
+      ...budgetedAfter.map(i => `[Context from ${i.namespace}]\n${normalizeInjectionContent(i.content)}`),
     ].join('\n\n');
     fallbackToSystemPrompt(allContents);
     return;
@@ -583,12 +580,12 @@ function applyUserMessageInjections(
   // Handles both string (text-only) and McplContentBlock[] (multimodal) content.
   const injectionToBlocks = (inj: McplContextInjection): Array<{ type: string; text?: string; source?: any }> => {
     if (typeof inj.content === 'string') {
-      return [{ type: 'text', text: `[Context from ${inj.serverId}]\n${inj.content}` }];
+      return [{ type: 'text', text: `[Context from ${inj.namespace}]\n${inj.content}` }];
     }
     // Multimodal: array of content blocks
     const blocks: Array<{ type: string; text?: string; source?: any }> = [];
     // Prepend server label as text block
-    blocks.push({ type: 'text', text: `[Context from ${inj.serverId}]` });
+    blocks.push({ type: 'text', text: `[Context from ${inj.namespace}]` });
     for (const cb of inj.content) {
       if (cb.type === 'text' && cb.text) {
         blocks.push({ type: 'text', text: cb.text });
@@ -605,13 +602,13 @@ function applyUserMessageInjections(
   // Helper: extract text representation for string-only path
   const injectionToString = (inj: McplContextInjection): string => {
     if (typeof inj.content === 'string') {
-      return `[Context from ${inj.serverId}]\n${inj.content}`;
+      return `[Context from ${inj.namespace}]\n${inj.content}`;
     }
     // Multimodal: extract text blocks only (images can't be injected into plain string)
     const texts = inj.content
       .filter(cb => cb.type === 'text' && cb.text)
       .map(cb => cb.text!);
-    return `[Context from ${inj.serverId}]\n${texts.join('\n')}`;
+    return `[Context from ${inj.namespace}]\n${texts.join('\n')}`;
   };
 
   if (hasContentBlocks) {
@@ -752,14 +749,31 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
   }
 
   // Phase 4: MCPL beforeInference hooks — collect context injections
+  // F9: extract last user message for context hooks
+  const lastUserMsg = [...historyMessages].reverse().find((m: any) => m.role === 'user');
+  const userMessageText = typeof lastUserMsg?.content === 'string'
+    ? lastUserMsg.content
+    : Array.isArray(lastUserMsg?.content)
+      ? lastUserMsg.content.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('')
+      : undefined;
+
   const parentContext: InferenceHookContext = {
     conversationId,
     userId: conversation.userId,
     isSubAgent: false,
-    // Gap 6: additional context per MCPL spec
-    inferenceId: initialBranchId,  // unique per inference run (branch ID)
+    // Spec fields (Section 10.1):
+    inferenceId: initialBranchId,
     turnIndex: historyMessages.length,
-    model,
+    model: modelConfig ? {
+      id: model,
+      vendor: modelConfig.provider ?? 'unknown',
+      contextWindow: modelConfig.contextWindow ?? 0,
+      capabilities: [
+        ...(modelConfig.capabilities?.imageInput ? ['vision'] : []),
+        ...(modelConfig.capabilities?.audioInput ? ['audio'] : []),
+      ],
+    } : undefined,
+    userMessage: userMessageText,
   };
   try {
     const hookResult = await mcplHookManager.beforeInference(
@@ -773,7 +787,7 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
     // Gap 3: abort — MCP server can block inference (content moderation, compliance, etc.)
     if (hookResult.abort) {
       const reason = hookResult.abortReason || 'Inference blocked by MCP server';
-      console.warn(`[ParallelInference] Inference aborted by ${hookResult.abortServerId}: ${reason}`);
+      console.warn(`[ParallelInference] Inference aborted by ${hookResult.abortDelegateId}: ${reason}`);
       ws.send(JSON.stringify({
         type: 'error',
         error: `Inference blocked: ${reason}`,
@@ -781,10 +795,11 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
       return [];
     }
 
-    const injections = hookResult.injections;
+    const injections = hookResult.contextInjections;
     if (injections.length > 0) {
-      // Place injections by position (already sorted by serverId)
-      const systemInjections = injections.filter(i => i.position === 'system').map(i => i.content);
+      // Place injections by position (already sorted by namespace)
+      // F4 fix: normalizeInjectionContent handles McplContentBlock[] (avoids "[object Object]")
+      const systemInjections = injections.filter(i => i.position === 'system').map(i => normalizeInjectionContent(i.content));
       if (systemInjections.length > 0) {
         effectiveSystemPrompt = effectiveSystemPrompt
           ? `${effectiveSystemPrompt}\n\n${systemInjections.join('\n')}`
@@ -1043,12 +1058,17 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
   };
   
   // Run inference for all branches in parallel
-  await Promise.all(
+  const branchResults = await Promise.all(
     branchesToGenerate.map((branch, index) => runBranchInference(branch.branchId, index))
   );
 
   // Phase 4: MCPL afterInference hooks — fire-and-forget notify
-  mcplHookManager.afterInference(conversation.userId, conversationId, undefined, parentContext).catch(err => {
+  // F9: pass assistantMessage from first branch result
+  const afterContext: InferenceHookContext = {
+    ...parentContext,
+    assistantMessage: branchResults[0] || undefined,
+  };
+  mcplHookManager.afterInference(conversation.userId, conversationId, undefined, afterContext).catch(err => {
     console.error('[ParallelInference] MCPL afterInference error:', err);
   });
 
@@ -1135,9 +1155,51 @@ export function websocketHandler(ws: AuthenticatedWebSocket, req: IncomingMessag
 }
 
 function setupAuthenticatedMessageHandler(ws: AuthenticatedWebSocket, db: Database, inferenceService: EnhancedInferenceService, baseInferenceService: MembraneInferenceService) {
-  ws.on('message', async (data) => {
+  ws.on('message', (data) => {
+    handleAuthenticatedMessage(ws, db, inferenceService, baseInferenceService, data)
+      .catch((err) => {
+        console.error('[FATAL] Unhandled error in ws message handler:', err);
+      });
+  });
+
+  ws.on('close', async () => {
+    Logger.websocket(`WebSocket closed for user ${ws.userId}`);
+
+    // Unregister from room manager (removes from all rooms)
+    roomManager.unregisterConnection(ws);
+
+    // Abort active generations for this user (two-phase delete to avoid iterator invalidation)
+    if (ws.userId) {
+      // Phase 1: collect matching keys
+      const keysToAbort: string[] = [];
+      for (const key of activeGenerations.keys()) {
+        if (key.startsWith(`${ws.userId}:`)) {
+          keysToAbort.push(key);
+        }
+      }
+      // Phase 2: abort + delete
+      for (const key of keysToAbort) {
+        const gen = activeGenerations.get(key);
+        if (gen) gen.controller.abort();
+        activeGenerations.delete(key);
+      }
+      if (keysToAbort.length > 0) {
+        Logger.websocket(`Cleaned up ${keysToAbort.length} active generation(s) for ${ws.userId}`);
+      }
+    }
+  });
+
+  ws.on('error', (error) => {
+    console.error('WebSocket error:', error);
+  });
+
+  // Send initial connection success
+  ws.send(JSON.stringify({ type: 'connected', userId: ws.userId }));
+}
+
+async function handleAuthenticatedMessage(ws: AuthenticatedWebSocket, db: Database, inferenceService: EnhancedInferenceService, baseInferenceService: MembraneInferenceService, data: unknown) {
     try {
-      const raw = JSON.parse(data.toString());
+      const raw = JSON.parse((data as Buffer).toString());
 
       // Handle MCPL messages (not part of WsMessageSchema)
       // M6: Intentional: Delegates bypass frozen gate.
@@ -1253,7 +1315,8 @@ function setupAuthenticatedMessageHandler(ws: AuthenticatedWebSocket, db: Databa
             break;
           }
 
-          const result = mcplStateManager.getCheckpoints(convId);
+          // H8+L2: featureSet from message, or '' for legacy client requests
+          const result = mcplStateManager.getCheckpoints((data as any).featureSet || '', convId);
           ws.send(JSON.stringify({
             type: 'checkpoint_list_response',
             conversationId: convId,
@@ -1298,7 +1361,8 @@ function setupAuthenticatedMessageHandler(ws: AuthenticatedWebSocket, db: Databa
           }
 
           // Atomic can+commit — eliminates TOCTOU between canRollback/commitRollback
-          const rollbackResult = mcplStateManager.tryRollback(convId, targetId);
+          // H8+L2: featureSet from message, or '' for legacy client rollbacks
+          const rollbackResult = mcplStateManager.tryRollback((data as any).featureSet || '', convId, targetId);
 
           if (!rollbackResult.success) {
             const errorMap: Record<string, string> = {
@@ -1360,6 +1424,37 @@ function setupAuthenticatedMessageHandler(ws: AuthenticatedWebSocket, db: Databa
             conversationId: convId,
             events,
             ...(reqId && { requestId: reqId }),
+          }));
+          break;
+        }
+
+        case 'checkpoint_state_at': {
+          if (!ws.userId) { ws.close(1008, 'unauthorized'); break; }
+          const stateAtMsg = message as Extract<WsMessage, { type: 'checkpoint_state_at' }>;
+          const stateAtConvId = stateAtMsg.conversationId;
+          const stateAtCheckpointId = stateAtMsg.checkpointId;
+          const stateAtReqId = stateAtMsg.requestId;
+
+          const stateAtConv = await db.getConversation(stateAtConvId, ws.userId);
+          if (!stateAtConv) {
+            ws.send(JSON.stringify({
+              type: 'checkpoint_state_at_response',
+              conversationId: stateAtConvId,
+              error: 'conversation_access_denied',
+              ...(stateAtReqId && { requestId: stateAtReqId }),
+            }));
+            break;
+          }
+
+          const stateResult = mcplStateManager.getStateAtCheckpoint(
+            stateAtMsg.featureSet || '', stateAtConvId, stateAtCheckpointId,
+          );
+          ws.send(JSON.stringify({
+            type: 'checkpoint_state_at_response',
+            conversationId: stateAtConvId,
+            checkpointId: stateAtCheckpointId,
+            ...stateResult,
+            ...(stateAtReqId && { requestId: stateAtReqId }),
           }));
           break;
         }
@@ -1535,7 +1630,7 @@ function setupAuthenticatedMessageHandler(ws: AuthenticatedWebSocket, db: Databa
           }
 
           const { found, results: taskResults, conversationId: resultConvId } =
-            _subAgentManager.getSubtaskResultsWithMeta(resultsMsg.groupId);
+            await _subAgentManager.getSubtaskResultsWithMeta(resultsMsg.groupId);
 
           // Access control: verify user has access to this conversation
           if (resultConvId) {
@@ -1578,41 +1673,6 @@ function setupAuthenticatedMessageHandler(ws: AuthenticatedWebSocket, db: Databa
         error: error instanceof Error ? error.message : 'Internal server error'
       });
     }
-  });
-
-  ws.on('close', async () => {
-    Logger.websocket(`WebSocket closed for user ${ws.userId}`);
-
-    // Unregister from room manager (removes from all rooms)
-    roomManager.unregisterConnection(ws);
-
-    // Abort active generations for this user (two-phase delete to avoid iterator invalidation)
-    if (ws.userId) {
-      // Phase 1: collect matching keys
-      const keysToAbort: string[] = [];
-      for (const key of activeGenerations.keys()) {
-        if (key.startsWith(`${ws.userId}:`)) {
-          keysToAbort.push(key);
-        }
-      }
-      // Phase 2: abort + delete
-      for (const key of keysToAbort) {
-        const gen = activeGenerations.get(key);
-        if (gen) gen.controller.abort();
-        activeGenerations.delete(key);
-      }
-      if (keysToAbort.length > 0) {
-        Logger.websocket(`Cleaned up ${keysToAbort.length} active generation(s) for ${ws.userId}`);
-      }
-    }
-  });
-
-  ws.on('error', (error) => {
-    console.error('WebSocket error:', error);
-  });
-
-  // Send initial connection success
-  ws.send(JSON.stringify({ type: 'connected', userId: ws.userId }));
 }
 
 function handleAbort(
@@ -1716,6 +1776,7 @@ async function handleChatMessage(
       if (existing) {
         ws.send(JSON.stringify({
           type: 'subtask_queue_blocked',
+          conversationId: message.conversationId,
           groupId: existing.groupId,
           queuedText: existing.text,
         }));
@@ -1752,6 +1813,7 @@ async function handleChatMessage(
       );
       ws.send(JSON.stringify({
         type: 'subtask_queue_blocked',
+        conversationId: message.conversationId,
         groupId: blockingGroupId,
         queuedText: message.content,
       }));

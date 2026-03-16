@@ -86,6 +86,7 @@
             :availability="store.state.modelAvailability"
             :personas="personas || []"
             :can-use-personas="canUsePersonas || false"
+            :conversation-id="props.conversation?.id"
           />
           
           <v-divider class="my-4" />
@@ -658,7 +659,15 @@
             </v-alert>
 
             <!-- Delegate Status Panel -->
-            <DelegateStatusPanel class="mt-2 mb-3" @delegates-updated="onDelegatesUpdated" />
+            <DelegateStatusPanel
+              class="mt-2 mb-3"
+              :delegates="connectedDelegates"
+              :feature-sets="conversationDelegateFeatureSets"
+              :loading="false"
+              mode="conversation"
+              :on-refresh="fetchToolsAndDelegates"
+              :on-toggle-feature-set="handleToggleFeatureSet"
+            />
           </template>
         </div>
 
@@ -728,9 +737,10 @@ import ParticipantsSection from './ParticipantsSection.vue';
 import ModelSelector from './ModelSelector.vue';
 import ModelSpecificSettings from './ModelSpecificSettings.vue';
 import DelegateStatusPanel from './DelegateStatusPanel.vue';
-import { api, testTool, type ToolInfo, type DelegateInfo } from '@/services/api';
+import { api, testTool, enableFeatureSet, disableFeatureSet, type ToolInfo, type DelegateInfo } from '@/services/api';
 import { useStore } from '@/store';
 import { useDelegates } from '@/composables/useDelegates';
+import { useConversationDelegateTools } from '@/composables/useConversationDelegateTools';
 
 const router = useRouter();
 
@@ -799,16 +809,40 @@ async function handleTestTool(toolName: string) {
   }
 }
 
-// Use the useDelegates composable for real-time updates
+// Use the useDelegates composable for delegate info
 const {
-  allTools: composableTools,
   delegates: composableDelegates,
   refresh: refreshDelegates,
 } = useDelegates();
 
+// Use conversation-scoped composable for visible tools
+const conversationIdRef = computed(() => props.conversation?.id);
+const {
+  visibleTools: conversationVisibleTools,
+  delegateFeatureSets: conversationDelegateFeatureSets,
+  refresh: refreshConversationTools,
+} = useConversationDelegateTools(conversationIdRef);
+
 // Wrap composable refs with computed to maintain reactivity
-const availableTools = computed(() => composableTools.value);
+const availableTools = computed(() => conversationVisibleTools.value);
 const connectedDelegates = computed(() => composableDelegates.value);
+
+// Handle feature set toggle from DelegateStatusPanel
+async function handleToggleFeatureSet(delegateId: string, featureSet: string, enabled: boolean) {
+  const convId = props.conversation?.id;
+  if (!convId) return;
+
+  try {
+    if (enabled) {
+      await enableFeatureSet(delegateId, featureSet, convId);
+    } else {
+      await disableFeatureSet(delegateId, featureSet, convId);
+    }
+    // Refresh is handled by WS event listener in the composable
+  } catch (err) {
+    console.error('[ConversationSettingsDialog] Feature set toggle failed:', err);
+  }
+}
 
 // Warning snackbar state
 const warningSnackbar = ref(false);
@@ -835,7 +869,7 @@ const allowAllTools = computed({
 // Fetch tools and delegates via composable (shares state across components)
 async function fetchToolsAndDelegates() {
   try {
-    await refreshDelegates();
+    await Promise.all([refreshDelegates(), refreshConversationTools()]);
   } catch (error) {
     console.error('Failed to fetch tools/delegates:', error);
   }
@@ -855,12 +889,6 @@ onMounted(() => {
   fetchToolsAndDelegates();
 });
 
-// Handler for when DelegateStatusPanel refreshes - composable handles the state now
-function onDelegatesUpdated(_delegates: DelegateInfo[]) {
-  // The useDelegates composable automatically syncs state, but we can force a refresh
-  // to ensure tools are up to date
-  fetchToolsAndDelegates();
-}
 
 // Grouped tools for the select dropdown
 const groupedToolItems = computed(() => {

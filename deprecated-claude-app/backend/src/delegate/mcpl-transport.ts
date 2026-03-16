@@ -28,15 +28,18 @@ export interface McplTransport {
 export class WebSocketTransport implements McplTransport {
   private handler: ((msg: Record<string, unknown>) => void) | null = null;
   private closeHandler: ((code: number, reason: string) => void) | null = null;
+  /** Buffer messages received before onMessage() handler is set */
+  private earlyBuffer: Record<string, unknown>[] | null = [];
 
   constructor(private ws: WebSocket) {
-    // Auto-listen — messages arrive as soon as ws is open.
-    // handler is set immediately after construction in delegate-handler,
-    // so messages received before handler is set are silently dropped.
     ws.on('message', (data) => {
       try {
         const msg = JSON.parse(data.toString());
-        this.handler?.(msg);
+        if (this.handler) {
+          this.handler(msg);
+        } else if (this.earlyBuffer) {
+          this.earlyBuffer.push(msg);
+        }
       } catch {
         // Malformed JSON — skip
       }
@@ -61,6 +64,11 @@ export class WebSocketTransport implements McplTransport {
 
   onMessage(handler: (msg: Record<string, unknown>) => void): void {
     this.handler = handler;
+    // Replay any messages received before handler was set
+    if (this.earlyBuffer) {
+      for (const msg of this.earlyBuffer) handler(msg);
+      this.earlyBuffer = null;
+    }
   }
 
   onClose(handler: (code: number, reason: string) => void): void {
@@ -97,6 +105,7 @@ export class ReliableChannel implements McplTransport {
   private bareAckTimer: ReturnType<typeof setTimeout> | null = null;
 
   private static readonly MAX_UNACKED = 64;
+  private static readonly MAX_PENDING = 500;
   private static readonly BARE_ACK_DELAY_MS = 50;
   private static readonly MAX_BUFFER_AGE_MS = 120_000; // 2 min max age for buffered frames
 
@@ -179,8 +188,12 @@ export class ReliableChannel implements McplTransport {
     // Duplicate → ignore
     if (frame.seq <= this.inSeq) return;
 
-    // Out-of-order → buffer for later
+    // Out-of-order → buffer for later (with size limit)
     if (frame.seq > this.inSeq + 1) {
+      if (this.pending.size >= ReliableChannel.MAX_PENDING) {
+        this.close(1008, 'backpressure: too many out-of-order frames');
+        return;
+      }
       this.pending.set(frame.seq, frame.payload);
       return;
     }

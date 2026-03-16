@@ -31,6 +31,8 @@ import {
   ForkHistoryBranchRequest
 } from '@deprecated-claude/shared';
 import { encryption } from '../utils/encryption.js';
+import type { ToolRegistry } from '../tools/tool-registry.js';
+import { buildFeatureSetPredicate } from '../utils/feature-set-predicate.js';
 
 // Metrics interface for tracking token usage
 export interface MetricsData {
@@ -384,25 +386,29 @@ export class Database {
   }
 
   // ---------------------------------------------------------------------------
-  // Disabled Servers State (per-conversation)
+  // Disabled Feature Sets State (per-conversation, delegate-scoped)
   // ---------------------------------------------------------------------------
 
-  private disabledServers: Map<string, Set<string>> = new Map(); // conversationId → Set<serverId>
+  private disabledFeatureSets: Map<string, Set<string>> = new Map(); // conversationId → Set<policyKey>
 
-  isServerEnabled(conversationId: string, serverId: string): boolean {
-    return !this.disabledServers.get(conversationId)?.has(serverId);
+  private static makeFeatureSetPolicyKey(delegateId: string, featureSet: string): string {
+    return `${delegateId}:${featureSet}`;
   }
 
-  async setServerEnabled(
+  isFeatureSetEnabled(conversationId: string, delegateId: string, featureSet: string): boolean {
+    const key = Database.makeFeatureSetPolicyKey(delegateId, featureSet);
+    return !this.disabledFeatureSets.get(conversationId)?.has(key);
+  }
+
+  async setFeatureSetEnabled(
     conversationId: string,
-    serverId: string,
     delegateId: string,
+    featureSet: string,
     enabled: boolean,
     source: 'agent' | 'user'
   ): Promise<void> {
-    // _conversationId included for replay — replayEvent doesn't receive the partition key
-    await this.appendAndReplayConversationEvent(conversationId, 'server_enabled_changed', {
-      _conversationId: conversationId, serverId, delegateId, enabled, source,
+    await this.appendAndReplayConversationEvent(conversationId, 'feature_set_enabled_changed', {
+      _conversationId: conversationId, delegateId, featureSet, enabled, source,
     });
   }
 
@@ -661,9 +667,10 @@ export class Database {
     this.uiEventLog.clearCache(conversationId);
 
     // Simple conversationId-keyed maps
-    this.disabledServers.delete(conversationId);
+    this.disabledFeatureSets.delete(conversationId);
     this.lastToolsetHash.delete(conversationId);
     this.lastToolsetSnapshot.delete(conversationId);
+    this.lastHistoryToolsetHash.delete(conversationId);
 
     // Two-phase delete: userConversationStates (keyed `${conversationId}::${userId}`)
     const stateKeysToDelete: string[] = [];
@@ -2120,6 +2127,16 @@ export class Database {
         break;
       }
 
+      case 'toolset_changed': {
+        // Rebuild history-only baseline (for dedup in recordToolsetChangedForUser).
+        // Does NOT touch lastToolsetHash/lastToolsetSnapshot (inference path baseline).
+        const { _conversationId, snapshotHash } = event.data;
+        if (_conversationId && snapshotHash) {
+          this.lastHistoryToolsetHash.set(_conversationId, snapshotHash);
+        }
+        break;
+      }
+
       // MCPL event store events
       case 'push_event_received':
       case 'push_event_processed':
@@ -2136,21 +2153,20 @@ export class Database {
       }
 
       case 'server_enabled_changed': {
-        const { serverId, enabled } = event.data;
-        // conversationId is implicit from the event store partition
-        // For replay, we need to find which conversation this belongs to
-        // The conversationId is passed via the event store key
-        if (!enabled) {
-          // We'll use a special _conversationId field if available
-          const convId = event.data._conversationId;
-          if (convId) {
-            if (!this.disabledServers.has(convId)) this.disabledServers.set(convId, new Set());
-            this.disabledServers.get(convId)!.add(serverId);
-          }
-        } else {
-          const convId = event.data._conversationId;
-          if (convId) {
-            this.disabledServers.get(convId)?.delete(serverId);
+        // Legacy event — silently ignored after featureSet migration.
+        break;
+      }
+
+      case 'feature_set_enabled_changed': {
+        const { delegateId: evDelegateId, featureSet: evFeatureSet, enabled } = event.data;
+        const convId = event.data._conversationId;
+        if (convId && evDelegateId && evFeatureSet) {
+          const key = Database.makeFeatureSetPolicyKey(evDelegateId, evFeatureSet);
+          if (!enabled) {
+            if (!this.disabledFeatureSets.has(convId)) this.disabledFeatureSets.set(convId, new Set());
+            this.disabledFeatureSets.get(convId)!.add(key);
+          } else {
+            this.disabledFeatureSets.get(convId)?.delete(key);
           }
         }
         break;
@@ -3440,7 +3456,7 @@ export class Database {
   }
 
   // Message methods
-  async createMessage(conversationId: string, conversationOwnerUserId: string, content: string, role: 'user' | 'assistant' | 'system', model?: string, explicitParentBranchId?: string, participantId?: string, attachments?: any[], sentByUserId?: string, hiddenFromAi?: boolean, creationSource?: 'inference' | 'human_edit' | 'regeneration' | 'split' | 'import' | 'fork'): Promise<Message> {
+  async createMessage(conversationId: string, conversationOwnerUserId: string, content: string, role: 'user' | 'assistant' | 'system', model?: string, explicitParentBranchId?: string, participantId?: string, attachments?: any[], sentByUserId?: string, hiddenFromAi?: boolean, creationSource?: 'inference' | 'human_edit' | 'regeneration' | 'split' | 'import' | 'fork' | 'mcpl_inference'): Promise<Message> {
     const conversation = await this.tryLoadAndVerifyConversation(conversationId, conversationOwnerUserId);
     if (!conversation) throw new Error("Conversation not found");
     // Get conversation messages to determine parent
@@ -3626,7 +3642,7 @@ export class Database {
     return message;
   }
 
-  async addMessageBranch(messageId: string, conversationId: string, conversationOwnerUserId: string, content: string, role: 'user' | 'assistant' | 'system', parentBranchId?: string, model?: string, participantId?: string, attachments?: any[], sentByUserId?: string, hiddenFromAi?: boolean, preserveActiveBranch?: boolean, creationSource?: 'inference' | 'human_edit' | 'regeneration' | 'split' | 'import' | 'fork'): Promise<Message | null> {
+  async addMessageBranch(messageId: string, conversationId: string, conversationOwnerUserId: string, content: string, role: 'user' | 'assistant' | 'system', parentBranchId?: string, model?: string, participantId?: string, attachments?: any[], sentByUserId?: string, hiddenFromAi?: boolean, preserveActiveBranch?: boolean, creationSource?: 'inference' | 'human_edit' | 'regeneration' | 'split' | 'import' | 'fork' | 'mcpl_inference'): Promise<Message | null> {
     const message = await this.tryLoadAndVerifyMessage(messageId, conversationId, conversationOwnerUserId);
     if (!message) return null;
     
@@ -3825,6 +3841,90 @@ export class Database {
 
   /** Last snapshot tool names per conversation (for computing diffs) */
   private lastToolsetSnapshot: Map<string, string[]> = new Map();
+
+  /** Per-conversation history-only baseline for toolset_changed dedup.
+   *  Independent from inference baselines (lastToolsetHash/lastToolsetSnapshot). */
+  private lastHistoryToolsetHash: Map<string, string> = new Map();
+
+  /**
+   * Write toolset_changed snapshot to ALL conversations for this user.
+   * Builds per-conversation tool snapshot using isFeatureSetEnabled predicate.
+   * Snapshot-only (no diff). Uses separate history-only baseline (lastHistoryToolsetHash)
+   * to deduplicate — does NOT touch lastToolsetHash/lastToolsetSnapshot (inference path).
+   */
+  async recordToolsetChangedForUser(
+    userId: string,
+    delegateId: string,
+    toolRegistry: ToolRegistry
+  ): Promise<void> {
+    const conversationIds = this.userConversations.get(userId);
+    if (!conversationIds) return;
+    const now = Date.now();
+
+    const promises = [...conversationIds].map(convId => {
+      // Per-conversation tool list (respects disabled feature sets)
+      const isEnabled = buildFeatureSetPredicate(userId, convId, this);
+      const tools = toolRegistry.getToolsForUser(userId, isEnabled);
+      const snapshotHash = toolRegistry.computeToolsetHash(tools);
+
+      // Deduplicate against history-only baseline (separate from inference baseline)
+      const prevHistoryHash = this.lastHistoryToolsetHash.get(convId);
+      if (prevHistoryHash === snapshotHash) return Promise.resolve();
+
+      // Advance history baseline ONLY after successful write
+      return this.appendAndReplayConversationEvent(convId, 'toolset_changed', {
+        _conversationId: convId,
+        delegateId,
+        availableTools: tools.map(t => ({ name: t.name, description: t.description })),
+        snapshotHash,
+        toolCount: tools.length,
+        timestamp: now,
+      })
+        .then(() => {
+          this.lastHistoryToolsetHash.set(convId, snapshotHash);
+        })
+        .catch(err => {
+          console.warn(`[Database] Failed toolset_changed for ${convId}:`, err);
+          // baseline NOT advanced — next trigger will retry
+        });
+    });
+    await Promise.all(promises);
+  }
+
+  /**
+   * Write toolset_changed snapshot to ONE conversation only.
+   * Used by user-triggered per-conversation feature-set enable/disable toggles.
+   * Best-effort: failure is logged but does not propagate.
+   */
+  async recordToolsetChangedForConversation(
+    conversationId: string,
+    userId: string,
+    delegateId: string,
+    toolRegistry: ToolRegistry
+  ): Promise<void> {
+    const isEnabled = buildFeatureSetPredicate(userId, conversationId, this);
+    const tools = toolRegistry.getToolsForUser(userId, isEnabled);
+    const snapshotHash = toolRegistry.computeToolsetHash(tools);
+
+    const prevHistoryHash = this.lastHistoryToolsetHash.get(conversationId);
+    if (prevHistoryHash === snapshotHash) return;
+
+    await this.appendAndReplayConversationEvent(conversationId, 'toolset_changed', {
+      _conversationId: conversationId,
+      delegateId,
+      availableTools: tools.map(t => ({ name: t.name, description: t.description })),
+      snapshotHash,
+      toolCount: tools.length,
+      timestamp: Date.now(),
+    })
+      .then(() => {
+        this.lastHistoryToolsetHash.set(conversationId, snapshotHash);
+      })
+      .catch(err => {
+        console.warn(`[Database] Failed toolset_changed for ${conversationId}:`, err);
+        // baseline NOT advanced — next trigger will retry
+      });
+  }
 
   async updateMessage(messageId: string, conversationId: string, conversationOwnerUserId: string, message: Message, updatedByUserId?: string): Promise<boolean> {
     const oldMessage = await this.tryLoadAndVerifyMessage(messageId, conversationId, conversationOwnerUserId);
@@ -4701,7 +4801,10 @@ export class Database {
 
     for (const e of allEvents) {
       if (e.type !== 'checkpoint_tree_updated') continue;
-      if (e.data?._conversationId !== conversationId) continue;
+      // Backward compat: old events may only have _compoundKey (format: featureSet:conversationId)
+      const eventConvId = e.data?._conversationId
+        ?? (e.data?._compoundKey ? (e.data._compoundKey as string).split(':').pop() : undefined);
+      if (eventConvId !== conversationId) continue;
 
       // 1) Normalize timestamp strictly to ISO — skip corrupt entries
       const t = e.timestamp instanceof Date ? e.timestamp : new Date(e.timestamp as any);

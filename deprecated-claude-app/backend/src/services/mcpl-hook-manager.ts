@@ -7,19 +7,19 @@
  *   1. User sends message
  *   2. Host calls beforeInference on ALL MCPL servers with context_hooks (parallel, with timeout)
  *   3. Servers return injections: { position, content }
- *   4. Sort injections by serverId for deterministic ordering
+ *   4. Sort injections by namespace for deterministic ordering
  *   5. Host assembles context placing injections by position
  *   6. Run inference
  *   7. Host calls afterInference (fire-and-forget notify for MVP)
  *
- * Critical: deterministic ordering — injections sorted by serverId before injection.
+ * Critical: deterministic ordering — injections sorted by namespace before injection.
  * Same config = same context regardless of response timing.
  */
 
 import { randomUUID } from 'crypto';
 import type { McplTransport } from '../delegate/mcpl-transport.js';
 import type { McplContextInjection } from '@deprecated-claude/shared';
-import { matchesPattern } from './mcpl-wildcard.js';
+// matchesPattern removed — hook manager uses exact match only (no wildcards in runtime identity)
 
 // =============================================================================
 // Types
@@ -36,22 +36,22 @@ interface RegisteredHookServer {
   delegateId: string;
   userId: string;
   transport: McplTransport;
-  serverIds: string[];         // which serverIds support context_hooks (may contain wildcards)
+  featureSetNames: string[];   // which feature sets support context_hooks
 }
 
 /** Per-server response from beforeInference (internal) */
 interface ServerBeforeInferenceResult {
-  injections: McplContextInjection[];
+  contextInjections: McplContextInjection[];  // spec: was 'injections'
   abort?: boolean;
   abortReason?: string;
 }
 
 /** Aggregated result from beforeInference (public) */
 export interface BeforeInferenceResult {
-  injections: McplContextInjection[];
+  contextInjections: McplContextInjection[];  // spec: was 'injections'
   abort: boolean;
   abortReason?: string;
-  abortServerId?: string;  // which server requested abort (for logging/UI)
+  abortDelegateId?: string;  // which delegate requested abort (for logging/UI)
 }
 
 interface PendingHookRequest {
@@ -64,13 +64,70 @@ export interface InferenceHookContext {
   conversationId: string;
   userId: string;
   isSubAgent: boolean;
-  taskId?: string;    // sub-agent only
-  groupId?: string;   // sub-agent only
-  instruction?: string; // sub-agent task instruction
-  // Gap 6: additional context per MCPL spec
-  inferenceId?: string;   // unique ID for this inference run
-  turnIndex?: number;     // conversation turn number
-  model?: string;         // model ID being used
+  // Spec fields (sent at top level per Section 10.1/10.5):
+  inferenceId?: string;
+  turnIndex?: number;
+  model?: { id: string; vendor: string; contextWindow: number; capabilities: string[] };
+  userMessage?: string;          // beforeInference: the user message triggering inference
+  assistantMessage?: string;     // afterInference: the assistant response content
+  usage?: {                      // afterInference: token usage from inference
+    inputTokens?: number;
+    outputTokens?: number;
+  };
+}
+
+// =============================================================================
+// §10 Security: Injection sanitization
+// =============================================================================
+
+/**
+ * Wrap injection content in provenance tags so the model knows the source.
+ * Also strips image/audio from "system" position to prevent multimodal injection (7.2).
+ */
+function sanitizeInjection(inj: McplContextInjection): McplContextInjection {
+  const server = inj.namespace || 'unknown';
+
+  if (typeof inj.content === 'string') {
+    // 7.1: Wrap text in provenance tags
+    return {
+      ...inj,
+      content: `<context_injection server="${escapeAttr(server)}" position="${inj.position}">\n${inj.content}\n</context_injection>`,
+    };
+  }
+
+  // Array of content blocks (multimodal)
+  if (inj.position === 'system') {
+    // 7.2: Strip non-text blocks from system position — only text allowed
+    const textOnly = inj.content
+      .filter(cb => cb.type === 'text' && cb.text)
+      .map(cb => ({ ...cb }));
+
+    if (textOnly.length < inj.content.length) {
+      console.warn(`[McplHookManager] Stripped ${inj.content.length - textOnly.length} non-text block(s) from system injection by ${server}`);
+    }
+
+    // Wrap the text content in provenance tags
+    const wrappedText = textOnly.map(cb => cb.text!).join('\n');
+    return {
+      ...inj,
+      content: `<context_injection server="${escapeAttr(server)}" position="system">\n${wrappedText}\n</context_injection>`,
+    };
+  }
+
+  // Non-system positions: wrap text blocks, pass through media
+  const wrappedBlocks = inj.content.map(cb => {
+    if (cb.type === 'text' && cb.text) {
+      return { ...cb, text: `<context_injection server="${escapeAttr(server)}" position="${inj.position}">\n${cb.text}\n</context_injection>` };
+    }
+    return { ...cb };
+  });
+
+  return { ...inj, content: wrappedBlocks };
+}
+
+/** Escape XML attribute value to prevent tag injection */
+function escapeAttr(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // =============================================================================
@@ -109,34 +166,34 @@ export class McplHookManager {
   // --------------------------------------------------------------------------
 
   /**
-   * Register a delegate connection as supporting context hooks for specific serverIds.
+   * Register a delegate connection as supporting context hooks for specific feature sets.
    */
   registerServer(
     sessionId: string,
     delegateId: string,
     userId: string,
     transport: McplTransport,
-    serverIds: string[]
+    featureSetNames: string[]
   ): void {
-    this.servers.set(sessionId, { sessionId, delegateId, userId, transport, serverIds });
-    console.log(`[McplHookManager] Registered hook server: ${delegateId} (serverIds: ${serverIds.join(', ')})`);
+    this.servers.set(sessionId, { sessionId, delegateId, userId, transport, featureSetNames });
+    console.log(`[McplHookManager] Registered hook server: ${delegateId} (featureSetNames: ${featureSetNames.join(', ')})`);
   }
 
   /**
-   * Update registered serverIds for a hook server (e.g., after featureSets_changed).
-   * If new serverIds is empty, unregisters the server.
+   * Update registered feature set names for a hook server (e.g., after featureSets_changed).
+   * If new featureSetNames is empty, unregisters the server.
    */
-  updateServerIds(sessionId: string, serverIds: string[]): void {
+  updateFeatureSetNames(sessionId: string, featureSetNames: string[]): void {
     const server = this.servers.get(sessionId);
     if (!server) return;
 
-    if (serverIds.length === 0) {
+    if (featureSetNames.length === 0) {
       this.unregisterServer(sessionId);
       return;
     }
 
-    server.serverIds = serverIds;
-    console.log(`[McplHookManager] Updated hook server ${server.delegateId} serverIds: ${serverIds.join(', ')}`);
+    server.featureSetNames = featureSetNames;
+    console.log(`[McplHookManager] Updated hook server ${server.delegateId} featureSetNames: ${featureSetNames.join(', ')}`);
   }
 
   /**
@@ -151,15 +208,15 @@ export class McplHookManager {
   }
 
   /**
-   * Check if a serverId is allowed for a specific hook server.
-   * Validates against registered serverIds using wildcard pattern matching.
+   * Check if a feature set name is allowed for a specific hook server.
+   * Exact match only — no wildcards in runtime identity.
    * Used at runtime to validate incoming push/inference messages.
    */
-  isServerAllowed(sessionId: string, serverId: string): boolean {
+  isFeatureSetAllowed(sessionId: string, featureSetName: string): boolean {
     const server = this.servers.get(sessionId);
     if (!server) return false;
 
-    return server.serverIds.some(pattern => matchesPattern(pattern, serverId));
+    return server.featureSetNames.includes(featureSetName);
   }
 
   // --------------------------------------------------------------------------
@@ -192,7 +249,7 @@ export class McplHookManager {
     hookDepth = 0,
     context?: InferenceHookContext,
   ): Promise<BeforeInferenceResult> {
-    const noAbort: BeforeInferenceResult = { injections: [], abort: false };
+    const noAbort: BeforeInferenceResult = { contextInjections: [], abort: false };
 
     // Sync loop prevention: stop at max depth
     if (hookDepth >= McplHookManager.MAX_HOOK_DEPTH) {
@@ -215,17 +272,17 @@ export class McplHookManager {
     );
 
     // Gap 3: track first abort (deterministic — sorted by delegateId)
-    let abortResult: { abortReason?: string; abortServerId: string } | undefined;
+    let abortResult: { abortReason?: string; abortDelegateId: string } | undefined;
 
     for (let i = 0; i < results.length; i++) {
       const result = results[i];
       if (result.status === 'fulfilled') {
-        allInjections.push(...result.value.injections);
+        allInjections.push(...result.value.contextInjections);
         // First abort wins (servers sorted by delegateId)
         if (!abortResult && result.value.abort) {
           abortResult = {
             abortReason: result.value.abortReason,
-            abortServerId: sortedServers[i].delegateId,
+            abortDelegateId: sortedServers[i].delegateId,
           };
         }
       } else {
@@ -234,18 +291,21 @@ export class McplHookManager {
       }
     }
 
-    // CRITICAL: sort by serverId for deterministic ordering
-    allInjections.sort((a, b) => a.serverId.localeCompare(b.serverId));
+    // CRITICAL: sort by namespace for deterministic ordering
+    allInjections.sort((a, b) => a.namespace.localeCompare(b.namespace));
+
+    // §10 Security: Wrap injections in provenance tags + strip media from system position
+    const sanitizedInjections = allInjections.map(inj => sanitizeInjection(inj));
 
     if (abortResult) {
-      console.warn(`[McplHookManager] Inference abort requested by ${abortResult.abortServerId}: ${abortResult.abortReason ?? '(no reason)'}`);
+      console.warn(`[McplHookManager] Inference abort requested by ${abortResult.abortDelegateId}: ${abortResult.abortReason ?? '(no reason)'}`);
     }
 
     return {
-      injections: allInjections,
+      contextInjections: sanitizedInjections,
       abort: !!abortResult,
       abortReason: abortResult?.abortReason,
-      abortServerId: abortResult?.abortServerId,
+      abortDelegateId: abortResult?.abortDelegateId,
     };
   }
 
@@ -259,7 +319,7 @@ export class McplHookManager {
     messagesSummary?: string,
     context?: InferenceHookContext,
   ): Promise<ServerBeforeInferenceResult> {
-    const empty: ServerBeforeInferenceResult = { injections: [] };
+    const empty: ServerBeforeInferenceResult = { contextInjections: [] };
 
     if (!server.transport.isOpen) {
       return Promise.resolve(empty);
@@ -286,9 +346,16 @@ export class McplHookManager {
         server.transport.send({
           type: 'mcpl/beforeInference',
           requestId,
+          // Spec fields at top level (Section 10.1):
+          inferenceId: context?.inferenceId ?? requestId,
           conversationId,
+          turnIndex: context?.turnIndex,
+          userMessage: context?.userMessage,
+          model: context?.model,
+          // Extensions:
           messagesSummary,
-          context,
+          userId: context?.userId,
+          isSubAgent: context?.isSubAgent,
         });
       } catch (err) {
         clearTimeout(timeout);
@@ -304,7 +371,7 @@ export class McplHookManager {
    */
   handleBeforeInferenceResponse(
     requestId: string,
-    injections: McplContextInjection[],
+    contextInjections: McplContextInjection[],
     abort?: boolean,
     abortReason?: string,
   ): void {
@@ -313,7 +380,7 @@ export class McplHookManager {
 
     clearTimeout(pending.timeout);
     this.pendingRequests.delete(requestId);
-    pending.resolve({ injections, abort, abortReason });
+    pending.resolve({ contextInjections, abort, abortReason });
   }
 
   // --------------------------------------------------------------------------
@@ -322,39 +389,30 @@ export class McplHookManager {
 
   /** Pending afterInference requests keyed by requestId */
   private pendingAfterRequests: Map<string, {
-    resolve: (modifiedResponse?: string) => void;
+    resolve: (result?: { modifiedResponse?: string; featureSet?: string; metadata?: Record<string, unknown> }) => void;
     timeout: ReturnType<typeof setTimeout>;
   }> = new Map();
 
   /**
    * Notify all registered hook servers after inference completes.
-   * Blocking with timeout — waits for responses that may contain modifiedResponse.
-   * If any server returns modifiedResponse, the FIRST one wins (sorted by serverId for determinism).
-   * Timeout → skip that server (never block response delivery).
+   * Notification-only — fires all servers in parallel, does not collect modifiedResponse.
+   * Host does not support blocking afterInference (see mcpl-session-manager negotiation).
    */
   async afterInference(
     userId: string,
     conversationId: string,
     responseSummary?: string,
     context?: InferenceHookContext,
-  ): Promise<string | undefined> {
+  ): Promise<void> {
     const servers = this.getServersForUser(userId);
-    if (servers.length === 0) return undefined;
+    if (servers.length === 0) return;
 
-    // Sort by delegateId for deterministic ordering (first modifiedResponse wins)
+    // Sort by delegateId for deterministic ordering
     const sorted = [...servers].sort((a, b) => a.delegateId.localeCompare(b.delegateId));
 
-    const results = await Promise.allSettled(
+    await Promise.allSettled(
       sorted.map(server => this.requestAfterInference(server, conversationId, responseSummary, context))
     );
-
-    // Return first modifiedResponse found (deterministic order due to sort)
-    for (const result of results) {
-      if (result.status === 'fulfilled' && result.value !== undefined) {
-        return result.value;
-      }
-    }
-    return undefined;
   }
 
   /**
@@ -366,14 +424,14 @@ export class McplHookManager {
     conversationId: string,
     responseSummary?: string,
     context?: InferenceHookContext,
-  ): Promise<string | undefined> {
+  ): Promise<{ modifiedResponse?: string; featureSet?: string; metadata?: Record<string, unknown> } | undefined> {
     if (!server.transport.isOpen) {
       return Promise.resolve(undefined);
     }
 
     const requestId = randomUUID();
 
-    return new Promise<string | undefined>((resolve) => {
+    return new Promise<{ modifiedResponse?: string; featureSet?: string; metadata?: Record<string, unknown> } | undefined>((resolve) => {
       const timeout = setTimeout(() => {
         this.pendingAfterRequests.delete(requestId);
         console.warn(`[McplHookManager] afterInference timed out for ${server.delegateId} (${this.config.afterInferenceTimeoutMs}ms)`);
@@ -383,12 +441,22 @@ export class McplHookManager {
       this.pendingAfterRequests.set(requestId, { resolve, timeout });
 
       try {
+        const ctx = context ?? { conversationId, userId: server.userId, isSubAgent: false };
         server.transport.send({
           type: 'mcpl/afterInference',
           requestId,
+          // Spec fields at top level (Section 10.5):
+          inferenceId: ctx.inferenceId,
           conversationId,
+          turnIndex: ctx.turnIndex,
+          userMessage: ctx.userMessage,
+          assistantMessage: ctx.assistantMessage,
+          model: ctx.model,
+          usage: ctx.usage,
+          // Extensions:
           responseSummary,
-          context: context ?? { conversationId, userId: server.userId, isSubAgent: false },
+          userId: ctx.userId,
+          isSubAgent: ctx.isSubAgent,
         });
       } catch (err) {
         clearTimeout(timeout);
@@ -403,13 +471,18 @@ export class McplHookManager {
    * Handle an afterInference response from a delegate.
    * Replaces the old mcpl/afterInference_ack handler — now supports modifiedResponse.
    */
-  handleAfterInferenceResponse(requestId: string, modifiedResponse?: string): void {
+  handleAfterInferenceResponse(
+    requestId: string,
+    modifiedResponse?: string,
+    featureSet?: string,
+    metadata?: Record<string, unknown>,
+  ): void {
     const pending = this.pendingAfterRequests.get(requestId);
     if (!pending) return;
 
     clearTimeout(pending.timeout);
     this.pendingAfterRequests.delete(requestId);
-    pending.resolve(modifiedResponse);
+    pending.resolve({ modifiedResponse, featureSet, metadata });
   }
 
   // --------------------------------------------------------------------------

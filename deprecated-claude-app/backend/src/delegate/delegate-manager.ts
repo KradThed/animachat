@@ -239,6 +239,7 @@ export class DelegateManager {
     timeoutMs: number = 300_000,  // 5min safety net — real timeout in ToolRegistry.executeWithTimeout()
     scopeContext?: { featureSet: string; activeCapabilities: string[] },  // Phase 7 Batch 4c — scope tagging
     inferenceContext?: { chainId: string; frameId: string },  // BUG 9 — chain/frame tracking for _mcpl injection
+    mcplState?: { state: Record<string, unknown> | null; checkpoint?: string; stateVersion?: number },  // H7: Spec §8.4 — top-level state/checkpoint
   ): Promise<ToolResult> {
     const delegate = this.findDelegate(userId, delegateId);
     if (!delegate) {
@@ -272,6 +273,12 @@ export class DelegateManager {
       timeout: timeoutMs,
       ...(scopeContext ? { scopeContext } : {}),  // Phase 7 Batch 4c — scope tagging
       ...(inferenceContext ? { inferenceContext } : {}),  // BUG 9 — chain/frame for _mcpl injection
+      // H7: Spec §8.4 — state/checkpoint at params top level (not in mcplState wrapper)
+      ...(mcplState ? {
+        state: mcplState.state,
+        ...(mcplState.checkpoint ? { checkpoint: mcplState.checkpoint } : {}),
+        ...(mcplState.stateVersion ? { stateVersion: mcplState.stateVersion } : {}),
+      } : {}),
     };
 
     return new Promise<ToolResult>((resolve, reject) => {

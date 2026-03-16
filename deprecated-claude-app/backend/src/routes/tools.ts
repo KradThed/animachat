@@ -4,6 +4,10 @@
  * Provides endpoints for:
  * - GET /api/tools - List all available tools for the authenticated user
  * - GET /api/tools/delegates - List connected delegates for the authenticated user
+ * - GET /api/tools/delegate-feature-sets - Feature sets grouped by delegate (with conversation state)
+ * - GET /api/tools/visible - Tools visible in a conversation (filtered by feature set policy)
+ * - POST /api/tools/feature-sets/enable - Enable a feature set for a conversation
+ * - POST /api/tools/feature-sets/disable - Disable a feature set for a conversation
  * - GET /api/tools/api-keys - List delegate API keys for the authenticated user
  * - POST /api/tools/api-keys - Create a new delegate API key
  * - DELETE /api/tools/api-keys/:keyId - Revoke a delegate API key
@@ -14,7 +18,10 @@ import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { toolRegistry, ToolRegistry } from '../tools/tool-registry.js';
 import { delegateManager, DelegateManager } from '../delegate/delegate-manager.js';
+import { mcplSessionManager } from '../delegate/mcpl-session-manager.js';
+import { roomManager } from '../websocket/room-manager.js';
 import { Database } from '../database/index.js';
+import { buildFeatureSetPredicate } from '../utils/feature-set-predicate.js';
 
 // Extend Express Request to include userId from auth middleware
 interface AuthRequest extends Request {
@@ -164,6 +171,230 @@ export function toolsRouter(deps: ToolsRouterDeps = {}): Router {
       console.error('[tools/api-keys] Failed to revoke API key:', error);
       res.status(500).json({ error: 'Failed to revoke API key' });
     }
+  });
+
+  // =============================================================================
+  // Feature Set API
+  // =============================================================================
+
+  /**
+   * GET /api/tools/delegate-feature-sets?conversationId=...
+   * Groups feature sets by delegate. Two-layer enabled state when conversationId provided.
+   */
+  router.get('/delegate-feature-sets', async (req: AuthRequest, res: Response) => {
+    if (!req.userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    if (!db) {
+      return res.status(500).json({ error: 'Database not available' });
+    }
+
+    const conversationId = req.query.conversationId as string | undefined;
+
+    // Validate conversation access if provided
+    if (conversationId) {
+      const conversation = await db.getConversation(conversationId, req.userId);
+      if (!conversation) {
+        return res.status(404).json({ error: 'Conversation not found' });
+      }
+    }
+
+    const entries = mcplSessionManager.getFeatureSetEntriesForUser(req.userId);
+    const delegateMap = new Map<string, any[]>();
+
+    for (const entry of entries) {
+      const session = mcplSessionManager.getSessionForDelegate(req.userId, entry.delegateId);
+      if (!session) continue;
+
+      const decl = session.declaredFeatureSets[entry.featureSet];
+      if (!decl) continue;
+
+      const runtimeEnabled = mcplSessionManager.isFeatureSetEffectivelyEnabled(session.sessionId, entry.featureSet);
+      const quarantined = session.invalidFeatureSets.has(entry.featureSet);
+
+      // Tool counts
+      const allTools = registry.getToolsForUserWithSource(req.userId);
+      const totalToolCount = allTools.filter(
+        t => t.source === 'delegate' && t.delegateId === entry.delegateId && t.featureSet === entry.featureSet
+      ).length;
+
+      const featureSetInfo: any = {
+        name: entry.featureSet,
+        description: decl.description,
+        uses: decl.rawUses,
+        runtimeEnabled,
+        quarantined,
+        totalToolCount,
+      };
+
+      if (conversationId) {
+        const conversationEnabled = db.isFeatureSetEnabled(conversationId, entry.delegateId, entry.featureSet);
+        featureSetInfo.conversationEnabled = conversationEnabled;
+        featureSetInfo.visible = runtimeEnabled && conversationEnabled;
+
+        // Visible tool count (with conversation filter)
+        const isEnabled = buildFeatureSetPredicate(req.userId!, conversationId, db);
+        const visibleTools = registry.getToolsForUserWithSource(req.userId, isEnabled);
+        featureSetInfo.visibleToolCount = visibleTools.filter(
+          t => t.source === 'delegate' && t.delegateId === entry.delegateId && t.featureSet === entry.featureSet
+        ).length;
+      }
+
+      if (!delegateMap.has(entry.delegateId)) {
+        delegateMap.set(entry.delegateId, []);
+      }
+      delegateMap.get(entry.delegateId)!.push(featureSetInfo);
+    }
+
+    const result = Array.from(delegateMap.entries()).map(([delegateId, featureSets]) => ({
+      delegateId,
+      featureSets,
+    }));
+
+    res.json({ delegates: result });
+  });
+
+  /**
+   * GET /api/tools/visible?conversationId=...
+   * Returns tools visible to the user, optionally filtered by conversation feature set policy.
+   */
+  router.get('/visible', async (req: AuthRequest, res: Response) => {
+    if (!req.userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    if (!db) {
+      return res.status(500).json({ error: 'Database not available' });
+    }
+
+    const conversationId = req.query.conversationId as string | undefined;
+
+    // Validate conversation access if provided
+    if (conversationId) {
+      const conversation = await db.getConversation(conversationId, req.userId);
+      if (!conversation) {
+        return res.status(404).json({ error: 'Conversation not found' });
+      }
+    }
+
+    const isEnabled = conversationId
+      ? buildFeatureSetPredicate(req.userId!, conversationId, db)
+      : undefined;
+    const tools = registry.getToolsForUserWithSource(req.userId, isEnabled);
+    res.json({ tools });
+  });
+
+  /**
+   * POST /api/tools/feature-sets/enable
+   * Enable a feature set for a conversation.
+   */
+  router.post('/feature-sets/enable', async (req: AuthRequest, res: Response) => {
+    if (!req.userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    if (!db) {
+      return res.status(500).json({ error: 'Database not available' });
+    }
+
+    const { delegateId, featureSet, conversationId } = req.body;
+    if (!delegateId || !featureSet || !conversationId) {
+      return res.status(400).json({ error: 'delegateId, featureSet, and conversationId are required' });
+    }
+
+    // Validate conversation access + ownership
+    const conversation = await db.getConversation(conversationId, req.userId);
+    if (!conversation) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    if (conversation.userId !== req.userId) {
+      return res.status(403).json({ error: 'Not the conversation owner' });
+    }
+
+    // Validate delegate ownership
+    const delegate = delegates.findDelegate(req.userId, delegateId);
+    if (!delegate) {
+      return res.status(404).json({ error: `Delegate "${delegateId}" not found` });
+    }
+
+    // Validate feature set existence
+    const declaredNames = mcplSessionManager.getFeatureSetNamesForDelegate(req.userId, delegateId);
+    if (!declaredNames.includes(featureSet)) {
+      return res.status(404).json({ error: `Feature set "${featureSet}" not found on delegate "${delegateId}"` });
+    }
+
+    // 1. Source of truth — toggle state
+    await db.setFeatureSetEnabled(conversationId, delegateId, featureSet, true, 'user');
+
+    // 2. Broadcast to conversation room
+    roomManager.broadcastToRoom(conversationId, {
+      type: 'mcpl/conversation_feature_sets_changed',
+      conversationId,
+      delegateId,
+      changedFeatureSets: [featureSet],
+      timestamp: Date.now(),
+    });
+
+    // 3. Best-effort toolset history
+    db.recordToolsetChangedForConversation(conversationId, req.userId, delegateId, registry)
+      .catch(err => console.warn('[tools/feature-sets/enable] toolset_changed failed:', err));
+
+    res.json({ success: true });
+  });
+
+  /**
+   * POST /api/tools/feature-sets/disable
+   * Disable a feature set for a conversation.
+   */
+  router.post('/feature-sets/disable', async (req: AuthRequest, res: Response) => {
+    if (!req.userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    if (!db) {
+      return res.status(500).json({ error: 'Database not available' });
+    }
+
+    const { delegateId, featureSet, conversationId } = req.body;
+    if (!delegateId || !featureSet || !conversationId) {
+      return res.status(400).json({ error: 'delegateId, featureSet, and conversationId are required' });
+    }
+
+    // Validate conversation access + ownership
+    const conversation = await db.getConversation(conversationId, req.userId);
+    if (!conversation) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    if (conversation.userId !== req.userId) {
+      return res.status(403).json({ error: 'Not the conversation owner' });
+    }
+
+    // Validate delegate ownership
+    const delegate = delegates.findDelegate(req.userId, delegateId);
+    if (!delegate) {
+      return res.status(404).json({ error: `Delegate "${delegateId}" not found` });
+    }
+
+    // Validate feature set existence
+    const declaredNames = mcplSessionManager.getFeatureSetNamesForDelegate(req.userId, delegateId);
+    if (!declaredNames.includes(featureSet)) {
+      return res.status(404).json({ error: `Feature set "${featureSet}" not found on delegate "${delegateId}"` });
+    }
+
+    // 1. Source of truth — toggle state
+    await db.setFeatureSetEnabled(conversationId, delegateId, featureSet, false, 'user');
+
+    // 2. Broadcast to conversation room
+    roomManager.broadcastToRoom(conversationId, {
+      type: 'mcpl/conversation_feature_sets_changed',
+      conversationId,
+      delegateId,
+      changedFeatureSets: [featureSet],
+      timestamp: Date.now(),
+    });
+
+    // 3. Best-effort toolset history
+    db.recordToolsetChangedForConversation(conversationId, req.userId, delegateId, registry)
+      .catch(err => console.warn('[tools/feature-sets/disable] toolset_changed failed:', err));
+
+    res.json({ success: true });
   });
 
   /**

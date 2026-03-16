@@ -361,8 +361,18 @@ export function conversationRouter(db: Database): Router {
         return res.status(404).json({ error: 'Conversation not found' });
       }
 
-      const events = await db.getConversationEvents(req.params.id, conversation.userId);
-      res.json(events);
+      const allEvents = await db.getConversationEvents(req.params.id, conversation.userId);
+      const total = allEvents.length;
+      const limit = req.query.limit ? Math.max(1, Math.min(parseInt(req.query.limit as string, 10) || 50, 200)) : undefined;
+      const offset = Math.max(0, parseInt(req.query.offset as string, 10) || 0);
+
+      // Tail-first pagination: offset=0 returns newest events
+      const end = total - offset;
+      const start = limit ? Math.max(0, end - limit) : 0;
+      const paginated = end > 0 ? allEvents.slice(start, end) : [];
+
+      res.setHeader('X-Total-Count', String(total));
+      res.json(paginated);
     } catch (error) {
       console.error('Get conversation events error:', error);
       res.status(500).json({ error: 'Internal server error' });

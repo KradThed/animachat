@@ -80,6 +80,8 @@ export interface ToolDefinition {
 export interface ToolDefinitionWithSource extends ToolDefinition {
   source: 'server' | 'delegate';
   delegateName?: string;  // normalized (lowercase) delegate name
+  delegateId?: string;    // original-case delegate identifier
+  featureSet?: string;    // feature set name from delegate metadata
   serverId?: string;      // stable UUID for (delegateId, serverName) pair
 }
 
@@ -95,7 +97,7 @@ export interface ToolCall {
   input: Record<string, unknown>;
 }
 
-type ToolExecutor = (input: Record<string, unknown>) => Promise<ToolResult>;
+type ToolExecutor = (input: Record<string, unknown>, ctx?: { conversationId?: string }) => Promise<ToolResult>;
 
 /** Extended executor for MCPL management tools that need userId + conversationId context */
 export type McplToolExecutor = (
@@ -108,7 +110,9 @@ interface RegisteredTool {
   source: 'server' | 'delegate';
   delegateName?: string;   // normalized (lowercase)
   displayName?: string;    // original case for UI
+  delegateId?: string;     // original-case delegate identifier (for policy scoping)
   serverId?: string;       // stable UUID for (delegateId, serverName) pair
+  featureSet?: string;     // explicit featureSet name from delegate metadata
   userId?: string;
   execute: ToolExecutor;
   /** MCPL management tools use this instead of execute */
@@ -168,8 +172,8 @@ export class ToolRegistry {
     userId: string,
     delegateName: string,
     displayName: string,
-    tools: Array<ToolDefinition & { serverId?: string }>,
-    executor: (originalName: string, input: Record<string, unknown>) => Promise<ToolResult>
+    tools: Array<ToolDefinition & { serverId?: string; featureSet?: string }>,
+    executor: (originalName: string, input: Record<string, unknown>, ctx?: { conversationId?: string }) => Promise<ToolResult>
   ): void {
     for (const tool of tools) {
       const prefixedName = `${delegateName}${NS_SEP}${tool.name}`;
@@ -180,9 +184,11 @@ export class ToolRegistry {
         source: 'delegate',
         delegateName,
         displayName,
+        delegateId: displayName,  // displayName IS the original-case delegateId (see delegate-handler.ts:1280)
         serverId: tool.serverId,
+        featureSet: tool.featureSet,
         userId,
-        execute: (input) => executor(tool.name, input),  // delegate receives ORIGINAL name
+        execute: (input, ctx) => executor(tool.name, input, ctx),  // delegate receives ORIGINAL name + context
       });
     }
     Logger.debug(`[ToolRegistry] Registered ${tools.length} delegate tools for user ${userId}, delegate ${delegateName} (display: ${displayName})`);
@@ -210,18 +216,13 @@ export class ToolRegistry {
    * Get all tool definitions available to a user.
    * Server tools are unprefixed; delegate tools have `{delegateName}__` prefix.
    * No conflict resolution needed — uniqueness is structural.
-   */
-  /**
-   * Get all tool definitions available to a user.
-   * Server tools are unprefixed; delegate tools have `{delegateName}__` prefix.
-   * No conflict resolution needed — uniqueness is structural.
    *
-   * @param isServerEnabled - Optional filter: (serverId) => boolean.
-   *   If provided, delegate tools from disabled servers are excluded.
+   * @param isFeatureSetEnabled - Optional filter: (delegateId, featureSet) => boolean.
+   *   If provided, delegate tools from disabled feature sets are excluded.
    */
   getToolsForUser(
     userId: string,
-    isServerEnabled?: (serverId: string) => boolean
+    isFeatureSetEnabled?: (delegateId: string, featureSet: string) => boolean
   ): ToolDefinition[] {
     const tools: ToolDefinition[] = [];
 
@@ -234,8 +235,8 @@ export class ToolRegistry {
     const userPrefix = `${userId}:`;
     for (const [key, tool] of this.delegateTools) {
       if (key.startsWith(userPrefix)) {
-        // Filter by enabled state if provided
-        if (isServerEnabled && tool.serverId && !isServerEnabled(tool.serverId)) {
+        // Filter by feature set enabled state if provided
+        if (isFeatureSetEnabled && tool.featureSet && tool.delegateId && !isFeatureSetEnabled(tool.delegateId, tool.featureSet)) {
           continue;
         }
         tools.push(tool.definition);
@@ -249,12 +250,12 @@ export class ToolRegistry {
    * Get all tool definitions available to a user WITH source info.
    * Use this for API/UI to show where each tool comes from.
    *
-   * BUG T-11: Added isServerEnabled param — without it, disabled servers
+   * BUG T-11: Added isFeatureSetEnabled param — without it, disabled feature sets
    * were re-included when toolConfig filtering was active.
    */
   getToolsForUserWithSource(
     userId: string,
-    isServerEnabled?: (serverId: string) => boolean
+    isFeatureSetEnabled?: (delegateId: string, featureSet: string) => boolean
   ): ToolDefinitionWithSource[] {
     const tools: ToolDefinitionWithSource[] = [];
 
@@ -267,11 +268,11 @@ export class ToolRegistry {
     const userPrefix = `${userId}:`;
     for (const [key, tool] of this.delegateTools) {
       if (key.startsWith(userPrefix)) {
-        // BUG T-11: Filter by enabled state (same as getToolsForUser)
-        if (isServerEnabled && tool.serverId && !isServerEnabled(tool.serverId)) {
+        // BUG T-11: Filter by feature set enabled state (same as getToolsForUser)
+        if (isFeatureSetEnabled && tool.featureSet && tool.delegateId && !isFeatureSetEnabled(tool.delegateId, tool.featureSet)) {
           continue;
         }
-        tools.push({ ...tool.definition, source: 'delegate', delegateName: tool.delegateName, serverId: tool.serverId });
+        tools.push({ ...tool.definition, source: 'delegate', delegateName: tool.delegateName, delegateId: tool.delegateId, serverId: tool.serverId, featureSet: tool.featureSet });
       }
     }
 
@@ -365,7 +366,7 @@ export class ToolRegistry {
       if (!this.isToolAllowedForParticipant(name, toolConfig)) {
         return { toolUseId, content: `Tool "${name}" is not allowed for this participant`, isError: true };
       }
-      return this.executeWithTimeout(delegateTool.execute(input), timeout, toolUseId, name);
+      return this.executeWithTimeout(delegateTool.execute(input, { conversationId }), timeout, toolUseId, name);
     }
 
     // 3. Compat shim — unprefixed name resolution
@@ -380,7 +381,7 @@ export class ToolRegistry {
             timeout, toolUseId, resolved.definition.name
           );
         }
-        return this.executeWithTimeout(resolved.execute(input), timeout, toolUseId, resolved.definition.name);
+        return this.executeWithTimeout(resolved.execute(input, { conversationId }), timeout, toolUseId, resolved.definition.name);
       }
 
       // Ambiguous or disabled hints

@@ -108,6 +108,17 @@
                 <v-icon size="16" class="mr-1">mdi-undo</v-icon>
                 Rollback to here
               </v-btn>
+              <v-btn
+                block
+                size="small"
+                variant="text"
+                class="mt-1"
+                :loading="loadingState"
+                @click="loadStateAtCheckpoint(selectedNode!.id)"
+              >
+                <v-icon size="16" class="mr-1">mdi-code-json</v-icon>
+                View State
+              </v-btn>
             </v-card-text>
           </v-card>
         </template>
@@ -178,6 +189,21 @@
       </v-card>
     </v-dialog>
 
+    <!-- Checkpoint State Dialog -->
+    <v-dialog v-model="showStateDialog" max-width="600">
+      <v-card>
+        <v-card-title class="text-h6 d-flex align-center">
+          Checkpoint State
+          <v-spacer />
+          <v-btn icon="mdi-close" size="small" variant="text" @click="showStateDialog = false" />
+        </v-card-title>
+        <v-card-text>
+          <div v-if="stateError" class="text-error">{{ stateError }}</div>
+          <pre v-else class="state-json">{{ JSON.stringify(stateData, null, 2) }}</pre>
+        </v-card-text>
+      </v-card>
+    </v-dialog>
+
     <!-- Snackbar for errors/feedback -->
     <v-snackbar
       v-model="snackbar.show"
@@ -236,6 +262,14 @@ const pendingRollbackRequestId = ref<string | null>(null);
 const snackbar = reactive({ show: false, text: '', color: 'error' });
 const svgRef = ref<SVGSVGElement | null>(null);
 const activeView = ref<'tree' | 'timeline'>('tree');
+
+// Checkpoint state viewer
+const loadingState = ref(false);
+const showStateDialog = ref(false);
+const stateData = ref<Record<string, unknown> | null>(null);
+const stateError = ref<string | null>(null);
+const pendingStateRequestId = ref<string | null>(null);
+let stateTimeout: ReturnType<typeof setTimeout> | null = null;
 
 const selectedNode = computed(() => {
   if (!selectedNodeId.value) return null;
@@ -358,6 +392,39 @@ function doRollback() {
       rollingBack.value = false;
       pendingRollbackRequestId.value = null;
       snackbar.text = 'Rollback request timed out';
+      snackbar.color = 'warning';
+      snackbar.show = true;
+    }
+  }, 15_000);
+}
+
+// --------------------------------------------------------------------------
+// View State at Checkpoint
+// --------------------------------------------------------------------------
+
+function loadStateAtCheckpoint(checkpointId: string) {
+  if (!wsService.value) return;
+
+  loadingState.value = true;
+  stateError.value = null;
+  stateData.value = null;
+
+  const requestId = generateRequestId();
+  pendingStateRequestId.value = requestId;
+
+  wsService.value.sendMessage({
+    type: 'checkpoint_state_at',
+    conversationId: props.conversationId,
+    checkpointId,
+    requestId,
+  });
+
+  if (stateTimeout) clearTimeout(stateTimeout);
+  stateTimeout = setTimeout(() => {
+    if (pendingStateRequestId.value === requestId) {
+      loadingState.value = false;
+      pendingStateRequestId.value = null;
+      snackbar.text = 'State request timed out';
       snackbar.color = 'warning';
       snackbar.show = true;
     }
@@ -554,6 +621,33 @@ const onTimelineResponse = (data: any) => {
   }
 };
 
+const onStateAtResponse = (data: any) => {
+  if (data.requestId !== pendingStateRequestId.value) return;
+  if (data.conversationId !== props.conversationId) return;
+
+  if (stateTimeout) { clearTimeout(stateTimeout); stateTimeout = null; }
+  loadingState.value = false;
+  pendingStateRequestId.value = null;
+
+  if (data.error) {
+    const errorMessages: Record<string, string> = {
+      'conversation_access_denied': 'Access denied',
+      'no_checkpoints': 'No checkpoints available',
+      'unknown': 'Checkpoint not found',
+      'expired': 'Checkpoint expired (evicted)',
+      'no_snapshot': 'No snapshot available (server-managed state)',
+    };
+    stateError.value = errorMessages[data.error] ?? String(data.error);
+    stateData.value = null;
+    showStateDialog.value = true;
+    return;
+  }
+
+  stateError.value = null;
+  stateData.value = data.state ?? {};
+  showStateDialog.value = true;
+};
+
 // --------------------------------------------------------------------------
 // D3 Tree Builder — eviction-safe + cycle-safe
 // --------------------------------------------------------------------------
@@ -718,13 +812,16 @@ function onConnectionState(data: { state: string }) {
   pendingListRequestId.value = null;
   pendingRollbackRequestId.value = null;
   pendingTimelineRequestId.value = null;
+  pendingStateRequestId.value = null;
   loading.value = false;
   rollingBack.value = false;
+  loadingState.value = false;
   timelineLoading.value = false;
   timelinePendingReload.value = false;
   if (listTimeout) { clearTimeout(listTimeout); listTimeout = null; }
   if (rollbackTimeout) { clearTimeout(rollbackTimeout); rollbackTimeout = null; }
   if (timelineTimeout) { clearTimeout(timelineTimeout); timelineTimeout = null; }
+  if (stateTimeout) { clearTimeout(stateTimeout); stateTimeout = null; }
   // Reload active view with fresh data
   if (activeView.value === 'timeline') loadTimeline();
   else loadCheckpoints();
@@ -735,6 +832,7 @@ function registerAllListeners(ws: typeof wsService.value) {
     registeredWs.off('checkpoint_list_response', onListResponse);
     registeredWs.off('checkpoint_rollback_response', onRollbackResponse);
     registeredWs.off('checkpoint_timeline_response', onTimelineResponse);
+    registeredWs.off('checkpoint_state_at_response', onStateAtResponse);
     registeredWs.off('connection_state', onConnectionState);
   }
   registeredWs = ws;
@@ -742,6 +840,7 @@ function registerAllListeners(ws: typeof wsService.value) {
     ws.on('checkpoint_list_response', onListResponse);
     ws.on('checkpoint_rollback_response', onRollbackResponse);
     ws.on('checkpoint_timeline_response', onTimelineResponse);
+    ws.on('checkpoint_state_at_response', onStateAtResponse);
     ws.on('connection_state', onConnectionState);
   }
 }
@@ -756,12 +855,14 @@ onUnmounted(() => {
     registeredWs.off('checkpoint_list_response', onListResponse);
     registeredWs.off('checkpoint_rollback_response', onRollbackResponse);
     registeredWs.off('checkpoint_timeline_response', onTimelineResponse);
+    registeredWs.off('checkpoint_state_at_response', onStateAtResponse);
     registeredWs.off('connection_state', onConnectionState);
     registeredWs = null;
   }
   if (listTimeout) clearTimeout(listTimeout);
   if (rollbackTimeout) clearTimeout(rollbackTimeout);
   if (timelineTimeout) clearTimeout(timelineTimeout);
+  if (stateTimeout) clearTimeout(stateTimeout);
 });
 
 // Watch conversationId: reset ALL state, then reload
@@ -782,9 +883,15 @@ watch(() => props.conversationId, () => {
   timelineError.value = null;
   timelineLoading.value = false;
   timelinePendingReload.value = false;
+  loadingState.value = false;
+  showStateDialog.value = false;
+  stateData.value = null;
+  stateError.value = null;
+  pendingStateRequestId.value = null;
   if (listTimeout) { clearTimeout(listTimeout); listTimeout = null; }
   if (rollbackTimeout) { clearTimeout(rollbackTimeout); rollbackTimeout = null; }
   if (timelineTimeout) { clearTimeout(timelineTimeout); timelineTimeout = null; }
+  if (stateTimeout) { clearTimeout(stateTimeout); stateTimeout = null; }
   snackbar.show = false;
   if (activeView.value === 'timeline') loadTimeline();
   else loadCheckpoints();
@@ -955,5 +1062,17 @@ watch(selectedNodeId, () => {
   font-size: 11px;
   color: rgba(255, 255, 255, 0.45);
   margin-top: 2px;
+}
+.state-json {
+  max-height: 400px;
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: rgba(0, 0, 0, 0.2);
+  padding: 12px;
+  border-radius: 4px;
+  margin: 0;
 }
 </style>

@@ -1,14 +1,14 @@
 /**
  * MCPL Agent Management Tools
  *
- * Built-in tools that let the AI agent inspect and manage connected MCP servers.
+ * Built-in tools that let the AI agent inspect and manage connected MCP feature sets.
  * These are registered as server-side tools (available to all users, unprefixed).
  *
  * Tools:
- *   - list_mcp_servers: List connected delegates and their servers (MCPL tool — user-scoped)
- *   - get_server_status: Get health/capabilities for a specific server (MCPL tool — user-scoped)
- *   - enable_server: Enable a server's tools for the current conversation (MCPL tool)
- *   - disable_server: Disable a server's tools for the current conversation (MCPL tool)
+ *   - list_mcp_feature_sets: List delegates and their feature sets (MCPL tool — user-scoped)
+ *   - get_feature_set_status: Get detail for a specific feature set (MCPL tool — user-scoped)
+ *   - enable_feature_set: Enable a feature set for the current conversation (MCPL tool)
+ *   - disable_feature_set: Disable a feature set for the current conversation (MCPL tool)
  */
 
 import { toolRegistry } from './tool-registry.js';
@@ -20,21 +20,53 @@ import { mcplInferenceBroker } from '../services/mcpl-inference-broker.js';
 import { matchesPattern } from '../services/mcpl-wildcard.js';
 import { getScopePoliciesForUser, revokeScopePolicyRule } from '../delegate/delegate-handler.js';
 import type { Database } from '../database/index.js';
+import { buildFeatureSetPredicate } from '../utils/feature-set-predicate.js';
+
+/**
+ * Count delegate tools for a user, optionally filtered by delegateId and featureSet.
+ * Returns total count (no conversation filter) and visible count (with conversation filter).
+ */
+function countToolsForFeatureSet(
+  userId: string,
+  delegateId: string,
+  featureSet: string,
+  conversationId?: string,
+  db?: Database
+): { totalToolCount: number; visibleToolCount?: number } {
+  // Get all tools with source info (no conversation filter = total)
+  const allTools = toolRegistry.getToolsForUserWithSource(userId);
+  const totalToolCount = allTools.filter(
+    t => t.source === 'delegate' && t.delegateId === delegateId && t.featureSet === featureSet
+  ).length;
+
+  if (!conversationId || !db) {
+    return { totalToolCount };
+  }
+
+  // With conversation filter (combined runtime + conversation predicate)
+  const isEnabled = buildFeatureSetPredicate(userId, conversationId, db);
+  const visibleTools = toolRegistry.getToolsForUserWithSource(userId, isEnabled);
+  const visibleToolCount = visibleTools.filter(
+    t => t.source === 'delegate' && t.delegateId === delegateId && t.featureSet === featureSet
+  ).length;
+
+  return { totalToolCount, visibleToolCount };
+}
 
 /**
  * Register all MCPL management tools with the tool registry.
  */
 export function registerMcplManagementTools(db: Database): void {
   // -------------------------------------------------------------------------
-  // list_mcp_servers (MCPL tool — BUG T-1: was registerServerTool, leaked cross-user data)
+  // list_mcp_feature_sets (MCPL tool — user-scoped)
   // -------------------------------------------------------------------------
   toolRegistry.registerMcplManagementTool(
-    'list_mcp_servers',
+    'list_mcp_feature_sets',
     {
-      name: 'list_mcp_servers',
+      name: 'list_mcp_feature_sets',
       description:
-        'List your connected delegate apps and their MCP servers. ' +
-        'Shows delegate names, connected servers, tool counts, and capabilities.',
+        'List your connected delegate apps and their feature sets. ' +
+        'Shows delegate names, feature set names, enabled state, tool counts, and capabilities.',
       inputSchema: {
         type: 'object',
         properties: {},
@@ -42,29 +74,62 @@ export function registerMcplManagementTools(db: Database): void {
       },
     },
     async (_input, context) => {
-      const { userId } = context;
-      const stats = delegateManager.getStats();
-      // BUG T-1: Filter to calling user's delegates only
-      const delegates = stats.delegates
-        .filter(d => d.userId === userId)
-        .map(d => {
-          const full = delegateManager.findDelegate(d.userId, d.delegateId);
-          const serverNames = new Set<string>();
-          if (full) {
-            for (const tool of full.tools) {
-              if ((tool as any).serverName) {
-                serverNames.add((tool as any).serverName);
-              }
-            }
-          }
+      const { userId, conversationId } = context;
 
-          return {
-            delegateId: d.delegateId,
-            toolCount: d.toolCount,
-            servers: Array.from(serverNames),
-            connectedAt: d.connectedAt.toISOString(),
-          };
-        });
+      // Group feature sets by delegate
+      const entries = mcplSessionManager.getFeatureSetEntriesForUser(userId);
+      const delegateMap = new Map<string, Array<{
+        name: string;
+        description?: string;
+        uses: string[];
+        runtimeEnabled: boolean;
+        conversationEnabled?: boolean;
+        visible?: boolean;
+        totalToolCount: number;
+        visibleToolCount?: number;
+      }>>();
+
+      for (const entry of entries) {
+        const session = mcplSessionManager.getSessionForDelegate(userId, entry.delegateId);
+        if (!session) continue;
+
+        const decl = session.declaredFeatureSets[entry.featureSet];
+        if (!decl) continue;
+
+        const runtimeEnabled = mcplSessionManager.isFeatureSetEffectivelyEnabled(session.sessionId, entry.featureSet);
+        const quarantined = session.invalidFeatureSets.has(entry.featureSet);
+
+        const counts = countToolsForFeatureSet(
+          userId, entry.delegateId, entry.featureSet,
+          conversationId || undefined, db
+        );
+
+        const featureSetInfo: any = {
+          name: entry.featureSet,
+          description: decl.description,
+          uses: decl.rawUses,
+          runtimeEnabled,
+          quarantined,
+          totalToolCount: counts.totalToolCount,
+        };
+
+        if (conversationId) {
+          const conversationEnabled = db.isFeatureSetEnabled(conversationId, entry.delegateId, entry.featureSet);
+          featureSetInfo.conversationEnabled = conversationEnabled;
+          featureSetInfo.visible = runtimeEnabled && conversationEnabled;
+          featureSetInfo.visibleToolCount = counts.visibleToolCount;
+        }
+
+        if (!delegateMap.has(entry.delegateId)) {
+          delegateMap.set(entry.delegateId, []);
+        }
+        delegateMap.get(entry.delegateId)!.push(featureSetInfo);
+      }
+
+      const delegates = Array.from(delegateMap.entries()).map(([delegateId, featureSets]) => ({
+        delegateId,
+        featureSets,
+      }));
 
       const queueStats = mcplEventQueue.getStats();
       const hookStats = mcplHookManager.getStats();
@@ -97,38 +162,39 @@ export function registerMcplManagementTools(db: Database): void {
   );
 
   // -------------------------------------------------------------------------
-  // get_server_status (MCPL tool — BUG T-1: was registerServerTool, leaked cross-user data)
+  // get_feature_set_status (MCPL tool — user-scoped)
   // -------------------------------------------------------------------------
   toolRegistry.registerMcplManagementTool(
-    'get_server_status',
+    'get_feature_set_status',
     {
-      name: 'get_server_status',
+      name: 'get_feature_set_status',
       description:
-        'Get detailed status and capabilities for a specific delegate and its servers. ' +
-        'Pass the delegateId to inspect.',
+        'Get detailed status for a specific feature set from a delegate. ' +
+        'Shows uses, scope rules, enabled state, and tool counts.',
       inputSchema: {
         type: 'object',
         properties: {
           delegateId: {
             type: 'string',
-            description: 'The delegate ID to inspect',
+            description: 'The exact delegate ID to inspect',
+          },
+          featureSet: {
+            type: 'string',
+            description: 'The exact feature set name to inspect',
           },
         },
-        required: ['delegateId'],
+        required: ['delegateId', 'featureSet'],
       },
     },
     async (input, context) => {
       const delegateId = input.delegateId as string;
-      const { userId } = context;
+      const featureSetName = input.featureSet as string;
+      const { userId, conversationId } = context;
 
-      // BUG T-1: Filter to calling user's delegates only
-      const stats = delegateManager.getStats();
-      const matches = stats.delegates.filter(
-        d => d.delegateId === delegateId && d.userId === userId
-      );
-
-      if (matches.length === 0) {
-        // BUG T-1: Only show user's own delegates in error hint (not all users')
+      // Validate delegate exists for this user
+      const delegate = delegateManager.findDelegate(userId, delegateId);
+      if (!delegate) {
+        const stats = delegateManager.getStats();
         const userDelegates = stats.delegates
           .filter(d => d.userId === userId)
           .map(d => d.delegateId);
@@ -142,195 +208,217 @@ export function registerMcplManagementTools(db: Database): void {
         };
       }
 
-      const results = matches.map(match => {
-        const full = delegateManager.findDelegate(match.userId, match.delegateId);
-        const mcplSession = mcplSessionManager.getSessionForDelegate(match.userId, match.delegateId);
-
-        // Group tools by server
-        const serverTools: Record<string, string[]> = {};
-        if (full) {
-          for (const tool of full.tools) {
-            const serverName = (tool as any).serverName || 'default';
-            if (!serverTools[serverName]) serverTools[serverName] = [];
-            serverTools[serverName].push(tool.name);
-          }
-        }
-
+      // Validate feature set exists
+      const session = mcplSessionManager.getSessionForDelegate(userId, delegateId);
+      if (!session) {
         return {
-          delegateId: match.delegateId,
-          connectedAt: match.connectedAt.toISOString(),
-          toolCount: match.toolCount,
-          capabilities: full?.capabilities || [],
-          isMcpl: !!mcplSession,
-          mcplCapabilities: mcplSession?.capabilities || [],
-          featureSets: mcplSession?.featureSets || {},
-          servers: serverTools,
+          toolUseId: '',
+          content: JSON.stringify({ error: `No MCPL session for delegate "${delegateId}"` }),
+          isError: true,
         };
-      });
+      }
+
+      const decl = session.declaredFeatureSets[featureSetName];
+      if (!decl) {
+        const available = Object.keys(session.declaredFeatureSets);
+        return {
+          toolUseId: '',
+          content: JSON.stringify({
+            error: `Feature set "${featureSetName}" not found on delegate "${delegateId}"`,
+            availableFeatureSets: available,
+          }),
+          isError: true,
+        };
+      }
+
+      const runtimeEnabled = mcplSessionManager.isFeatureSetEffectivelyEnabled(session.sessionId, featureSetName);
+      const quarantined = session.invalidFeatureSets.has(featureSetName);
+      const scopeState = session.scopesByFeatureSet[featureSetName];
+
+      const counts = countToolsForFeatureSet(
+        userId, delegateId, featureSetName,
+        conversationId || undefined, db
+      );
+
+      const result: any = {
+        delegateId,
+        featureSet: featureSetName,
+        description: decl.description,
+        uses: decl.rawUses,
+        scoped: decl.scoped ?? false,
+        runtimeEnabled,
+        quarantined,
+        totalToolCount: counts.totalToolCount,
+      };
+
+      if (conversationId) {
+        const conversationEnabled = db.isFeatureSetEnabled(conversationId, delegateId, featureSetName);
+        result.conversationEnabled = conversationEnabled;
+        result.visible = runtimeEnabled && conversationEnabled;
+        result.visibleToolCount = counts.visibleToolCount;
+      }
+
+      if (scopeState) {
+        result.scopeRules = scopeState;
+      }
 
       return {
         toolUseId: '',
-        content: JSON.stringify(results.length === 1 ? results[0] : results, null, 2),
+        content: JSON.stringify(result, null, 2),
         isError: false,
       };
     }
   );
 
   // -------------------------------------------------------------------------
-  // enable_server (MCPL tool — receives userId + conversationId via context)
+  // enable_feature_set (MCPL tool — exact delegateId, wildcard featureSet)
   // -------------------------------------------------------------------------
   toolRegistry.registerMcplManagementTool(
-    'enable_server',
+    'enable_feature_set',
     {
-      name: 'enable_server',
+      name: 'enable_feature_set',
       description:
-        'Enable tools from a specific delegate for the current conversation. ' +
-        'Re-includes the delegate\'s tools in the tool list. ' +
-        'Supports wildcards: "memory.*" enables all delegates starting with "memory.".',
+        'Enable a feature set\'s tools for the current conversation. ' +
+        'Re-includes the feature set\'s tools in the tool list. ' +
+        'Supports wildcards for featureSet: "memory.*" enables all feature sets starting with "memory.".',
       inputSchema: {
         type: 'object',
         properties: {
           delegateId: {
             type: 'string',
-            description: 'The delegate ID to enable (supports wildcards, e.g. "memory.*")',
+            description: 'The exact delegate ID (no wildcards)',
+          },
+          featureSet: {
+            type: 'string',
+            description: 'The feature set name to enable (supports wildcards, e.g. "memory.*")',
           },
         },
-        required: ['delegateId'],
+        required: ['delegateId', 'featureSet'],
       },
     },
     async (input, context) => {
-      const delegateIdPattern = input.delegateId as string;
+      const delegateId = input.delegateId as string;
+      const featureSetPattern = input.featureSet as string;
       const { userId, conversationId } = context;
 
       if (!conversationId) {
         return { toolUseId: '', content: 'No active conversation', isError: true };
       }
 
-      // Resolve wildcard delegateId against known delegates
-      const stats = delegateManager.getStats();
-      const matchingDelegates = stats.delegates.filter(
-        d => d.userId === userId && matchesPattern(delegateIdPattern, d.delegateId)
-      );
-
-      if (matchingDelegates.length === 0) {
+      // Validate delegate exists for this user
+      const delegate = delegateManager.findDelegate(userId, delegateId);
+      if (!delegate) {
+        const stats = delegateManager.getStats();
+        const userDelegates = stats.delegates
+          .filter(d => d.userId === userId)
+          .map(d => d.delegateId);
         return {
           toolUseId: '',
-          content: `No delegates matching "${delegateIdPattern}" are connected. Available: ${stats.delegates.filter(d => d.userId === userId).map(d => d.delegateId).join(', ') || 'none'}`,
+          content: `Delegate "${delegateId}" not found. Available: ${userDelegates.join(', ') || 'none'}`,
           isError: true,
         };
       }
 
-      let totalServers = 0;
-      let totalTools = 0;
-      const enabledDelegates: string[] = [];
+      // Match featureSet pattern against declared feature sets
+      const declaredNames = mcplSessionManager.getFeatureSetNamesForDelegate(userId, delegateId);
+      const matchingNames = declaredNames.filter(name => matchesPattern(featureSetPattern, name));
 
-      for (const match of matchingDelegates) {
-        const delegate = delegateManager.findDelegate(userId, match.delegateId);
-        if (!delegate) continue;
+      if (matchingNames.length === 0) {
+        return {
+          toolUseId: '',
+          content: `No feature sets matching "${featureSetPattern}" on delegate "${delegateId}". Available: ${declaredNames.join(', ') || 'none'}`,
+          isError: true,
+        };
+      }
 
-        // Collect serverIds for this delegate
-        const serverIds = new Set<string>();
-        for (const tool of delegate.tools) {
-          const serverId = delegateManager.getOrCreateServerId(
-            match.delegateId,
-            (tool as any).serverName || '_default'
-          );
-          serverIds.add(serverId);
-        }
+      let totalToolCount = 0;
+      const enabledNames: string[] = [];
 
-        // Enable each server
-        for (const serverId of serverIds) {
-          await db.setServerEnabled(conversationId, serverId, match.delegateId, true, 'agent');
-        }
-
-        totalServers += serverIds.size;
-        totalTools += delegate.tools.length;
-        enabledDelegates.push(match.delegateId);
+      for (const name of matchingNames) {
+        await db.setFeatureSetEnabled(conversationId, delegateId, name, true, 'agent');
+        const counts = countToolsForFeatureSet(userId, delegateId, name);
+        totalToolCount += counts.totalToolCount;
+        enabledNames.push(name);
       }
 
       return {
         toolUseId: '',
-        content: `Enabled ${enabledDelegates.length} delegate(s) matching "${delegateIdPattern}" for this conversation: ${enabledDelegates.join(', ')} (${totalServers} server(s), ${totalTools} tools).`,
+        content: `Enabled ${enabledNames.length} feature set(s) on delegate "${delegateId}" for this conversation: ${enabledNames.join(', ')} (${totalToolCount} tools).`,
         isError: false,
       };
     }
   );
 
   // -------------------------------------------------------------------------
-  // disable_server (MCPL tool — receives userId + conversationId via context)
+  // disable_feature_set (MCPL tool — exact delegateId, wildcard featureSet)
   // -------------------------------------------------------------------------
   toolRegistry.registerMcplManagementTool(
-    'disable_server',
+    'disable_feature_set',
     {
-      name: 'disable_server',
+      name: 'disable_feature_set',
       description:
-        'Disable tools from a specific delegate for the current conversation. ' +
-        'The delegate stays connected but its tools are excluded from tool lists. ' +
-        'Supports wildcards: "memory.*" disables all delegates starting with "memory.".',
+        'Disable a feature set\'s tools for the current conversation. ' +
+        'The delegate stays connected but the feature set\'s tools are excluded from tool lists. ' +
+        'Supports wildcards for featureSet: "memory.*" disables all feature sets starting with "memory.".',
       inputSchema: {
         type: 'object',
         properties: {
           delegateId: {
             type: 'string',
-            description: 'The delegate ID to disable (supports wildcards, e.g. "memory.*")',
+            description: 'The exact delegate ID (no wildcards)',
+          },
+          featureSet: {
+            type: 'string',
+            description: 'The feature set name to disable (supports wildcards, e.g. "memory.*")',
           },
         },
-        required: ['delegateId'],
+        required: ['delegateId', 'featureSet'],
       },
     },
     async (input, context) => {
-      const delegateIdPattern = input.delegateId as string;
+      const delegateId = input.delegateId as string;
+      const featureSetPattern = input.featureSet as string;
       const { userId, conversationId } = context;
 
       if (!conversationId) {
         return { toolUseId: '', content: 'No active conversation', isError: true };
       }
 
-      // Resolve wildcard delegateId against known delegates
-      const stats = delegateManager.getStats();
-      const matchingDelegates = stats.delegates.filter(
-        d => d.userId === userId && matchesPattern(delegateIdPattern, d.delegateId)
-      );
-
-      if (matchingDelegates.length === 0) {
+      // Validate delegate exists for this user
+      const delegate = delegateManager.findDelegate(userId, delegateId);
+      if (!delegate) {
         return {
           toolUseId: '',
-          content: `No delegates matching "${delegateIdPattern}" are connected.`,
+          content: `Delegate "${delegateId}" not found.`,
           isError: true,
         };
       }
 
-      let totalServers = 0;
-      let totalTools = 0;
-      const disabledDelegates: string[] = [];
+      // Match featureSet pattern against declared feature sets
+      const declaredNames = mcplSessionManager.getFeatureSetNamesForDelegate(userId, delegateId);
+      const matchingNames = declaredNames.filter(name => matchesPattern(featureSetPattern, name));
 
-      for (const match of matchingDelegates) {
-        const delegate = delegateManager.findDelegate(userId, match.delegateId);
-        if (!delegate) continue;
+      if (matchingNames.length === 0) {
+        return {
+          toolUseId: '',
+          content: `No feature sets matching "${featureSetPattern}" on delegate "${delegateId}". Available: ${declaredNames.join(', ') || 'none'}`,
+          isError: true,
+        };
+      }
 
-        // Collect serverIds for this delegate
-        const serverIds = new Set<string>();
-        for (const tool of delegate.tools) {
-          const serverId = delegateManager.getOrCreateServerId(
-            match.delegateId,
-            (tool as any).serverName || '_default'
-          );
-          serverIds.add(serverId);
-        }
+      let totalToolCount = 0;
+      const disabledNames: string[] = [];
 
-        // Disable each server
-        for (const serverId of serverIds) {
-          await db.setServerEnabled(conversationId, serverId, match.delegateId, false, 'agent');
-        }
-
-        totalServers += serverIds.size;
-        totalTools += delegate.tools.length;
-        disabledDelegates.push(match.delegateId);
+      for (const name of matchingNames) {
+        await db.setFeatureSetEnabled(conversationId, delegateId, name, false, 'agent');
+        const counts = countToolsForFeatureSet(userId, delegateId, name);
+        totalToolCount += counts.totalToolCount;
+        disabledNames.push(name);
       }
 
       return {
         toolUseId: '',
-        content: `Disabled ${disabledDelegates.length} delegate(s) matching "${delegateIdPattern}" for this conversation: ${disabledDelegates.join(', ')} (${totalServers} server(s), ${totalTools} tools excluded).`,
+        content: `Disabled ${disabledNames.length} feature set(s) on delegate "${delegateId}" for this conversation: ${disabledNames.join(', ')} (${totalToolCount} tools excluded).`,
         isError: false,
       };
     }

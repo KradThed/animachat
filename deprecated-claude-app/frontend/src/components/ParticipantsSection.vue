@@ -529,7 +529,13 @@
             </v-select>
 
             <!-- Delegate Status Panel -->
-            <DelegateStatusPanel class="mt-4" @delegates-updated="onDelegatesUpdated" />
+            <DelegateStatusPanel
+              class="mt-4"
+              :delegates="connectedDelegates"
+              :loading="false"
+              mode="global"
+              :on-refresh="fetchToolsAndDelegates"
+            />
           </template>
 
           <v-alert
@@ -565,7 +571,8 @@ import { get as _get, set as _set, cloneDeep, isEqual } from 'lodash-es';
 import ModelSelector from './ModelSelector.vue';
 import ModelSpecificSettings from './ModelSpecificSettings.vue';
 import DelegateStatusPanel from './DelegateStatusPanel.vue';
-import { getAvailableTools, getConnectedDelegates, type ToolInfo, type DelegateInfo } from '@/services/api';
+import { getConnectedDelegates, type ToolInfo, type DelegateInfo } from '@/services/api';
+import { useConversationDelegateTools } from '@/composables/useConversationDelegateTools';
 
 const props = defineProps({
   modelValue: {
@@ -587,6 +594,10 @@ const props = defineProps({
   canUsePersonas: {
     type: Boolean,
     default: false
+  },
+  conversationId: {
+    type: String as PropType<string | undefined>,
+    default: undefined
   }
 });
 
@@ -701,7 +712,12 @@ const conversationModeOptions = [
 // Tool Configuration
 // =============================================================================
 
-const availableTools = ref<ToolInfo[]>([]);
+const conversationIdRef = computed(() => props.conversationId);
+const {
+  visibleTools: conversationVisibleTools,
+} = useConversationDelegateTools(conversationIdRef);
+
+const availableTools = computed(() => conversationVisibleTools.value);
 const connectedDelegates = ref<DelegateInfo[]>([]);
 const previousToolSelection = ref<string[]>([]);
 
@@ -761,14 +777,11 @@ function setToolConfigField(field: string, value: any) {
 
 async function fetchToolsAndDelegates() {
   try {
-    const [toolsResult, delegatesResult] = await Promise.all([
-      getAvailableTools(),
-      getConnectedDelegates()
-    ]);
-    availableTools.value = toolsResult.tools;
+    // Tools are fetched by useConversationDelegateTools composable
+    const delegatesResult = await getConnectedDelegates();
     connectedDelegates.value = delegatesResult.delegates;
   } catch (error) {
-    console.error('Failed to fetch tools/delegates:', error);
+    console.error('Failed to fetch delegates:', error);
   }
 }
 
@@ -777,10 +790,6 @@ onMounted(() => {
   fetchToolsAndDelegates();
 });
 
-// Handler for when DelegateStatusPanel refreshes
-function onDelegatesUpdated(delegates: DelegateInfo[]) {
-  connectedDelegates.value = delegates;
-}
 
 // Grouped tools for the select dropdown (same as ConversationSettingsDialog)
 const groupedToolItems = computed(() => {

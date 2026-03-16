@@ -110,6 +110,16 @@
             </div>
           </div>
         </div>
+        <div v-if="hasMore" class="load-more">
+          <v-btn
+            size="small"
+            variant="text"
+            :loading="loading"
+            @click="loadMore"
+          >
+            Load older events
+          </v-btn>
+        </div>
       </div>
     </div>
   </div>
@@ -154,6 +164,10 @@ const emit = defineEmits<{
 
 const events = ref<ConversationEvent[]>([]);
 const loading = ref(true);
+const PAGE_SIZE = 50;
+const currentOffset = ref(0);
+const totalCount = ref(0);
+const hasMore = computed(() => events.value.length < totalCount.value);
 
 // Event types to filter out (too noisy or not meaningful to users)
 const noisyEventTypes = new Set([
@@ -162,21 +176,30 @@ const noisyEventTypes = new Set([
   'active_branch_changed'
 ]);
 
-async function loadEvents() {
+async function loadEvents(append = false) {
   if (!props.conversationId) return;
-  
+
   loading.value = true;
   try {
-    const response = await api.get(`/conversations/${props.conversationId}/events`);
+    const response = await api.get(
+      `/conversations/${props.conversationId}/events?limit=${PAGE_SIZE}&offset=${currentOffset.value}`
+    );
+    totalCount.value = parseInt(response.headers['x-total-count'] || '0');
     // Filter out noisy events and reverse to show newest first
-    events.value = (response.data || [])
+    const newEvents = (response.data || [])
       .filter((e: ConversationEvent) => !noisyEventTypes.has(e.type))
       .reverse();
+    events.value = append ? [...events.value, ...newEvents] : newEvents;
   } catch (error) {
     console.error('Failed to load events:', error);
   } finally {
     loading.value = false;
   }
+}
+
+function loadMore() {
+  currentOffset.value += PAGE_SIZE;
+  loadEvents(true);
 }
 
 
@@ -421,8 +444,9 @@ function markAllAsRead() {
   store.markBranchesAsRead(branchIds);
 }
 
-// Refresh events when new messages arrive
+// Refresh events when new messages arrive — reset to newest page
 function handleWsMessage() {
+  currentOffset.value = 0;
   loadEvents();
 }
 

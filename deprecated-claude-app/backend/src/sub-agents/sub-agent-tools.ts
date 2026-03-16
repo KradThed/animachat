@@ -43,8 +43,8 @@ export const SUB_AGENT_TOOL_NAMES = new Set([
  * Sub-agents are narrow workers — they should not enable/disable servers or manage policies.
  */
 export const MCPL_MANAGEMENT_TOOL_NAMES = new Set([
-  'list_mcp_servers', 'get_server_status', 'enable_server',
-  'disable_server', 'manage_scope_policies',
+  'list_mcp_feature_sets', 'get_feature_set_status', 'enable_feature_set',
+  'disable_feature_set', 'manage_scope_policies',
 ]);
 
 // =============================================================================
@@ -435,7 +435,7 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
         }
 
         // BUG 11: Pass conversationId for ownership validation
-        const result = manager.getSubtaskResults(groupId as string, context.conversationId);
+        const result = await manager.getSubtaskResults(groupId as string, context.conversationId);
 
         return {
           toolUseId: '',
@@ -783,7 +783,7 @@ export function registerSubAgentTools(manager: SubAgentManager): void {
           return { toolUseId: '', content: 'Error: groupId must be a non-empty string', isError: true };
         }
 
-        const metrics = manager.getGroupMetrics(
+        const metrics = await manager.getGroupMetrics(
           groupId as string,
           context.conversationId,
         );

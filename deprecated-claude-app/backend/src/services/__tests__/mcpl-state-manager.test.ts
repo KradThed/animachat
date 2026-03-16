@@ -13,6 +13,7 @@ import type { Database } from '../../database/index.js';
 // Helpers
 // =============================================================================
 
+const FS = '';  // H8+L2: featureSet param (empty for tests)
 const CONV = 'test-conv-1';
 const USER = 'test-user-1';
 
@@ -40,7 +41,7 @@ function createMockDb() {
  */
 function applyNPatches(mgr: McplStateManager, convId: string, n: number): void {
   for (let i = 0; i < n; i++) {
-    mgr.applyPatch(convId, [
+    mgr.applyPatch(FS, convId, [
       { op: 'add', path: `/patch_${i}`, value: i + 1 },
     ]);
   }
@@ -124,7 +125,7 @@ describe('McplStateManager Phase 8', () => {
 
   describe('Linear mode', () => {
     it('creates checkpoint after CHECKPOINT_INTERVAL mutations', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10 → checkpoint at 10
 
       const tree = getTree(mgr, CONV);
@@ -135,7 +136,7 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('builds checkpoint chain with parent/children linked', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19); // mutations 2-20 → checkpoints at 10, 20
 
       const tree = getTree(mgr, CONV)!;
@@ -149,14 +150,14 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('rollback() backward compat returns boolean and restores state', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19); // mutations 2-20 → chk_1 at 10, chk_2 at 20
 
-      const result = mgr.rollback(CONV);
+      const result = mgr.rollback(FS, CONV);
       expect(result).toBe(true);
 
       // State restored to chk_1 snapshot (includes patch keys added before chk_1)
-      const state = mgr.getState(CONV);
+      const state = mgr.getState(FS, CONV);
       expect(state).toBeDefined();
       expect(state!.counter).toBe(0);
       // chk_1 was taken at mutation 10 (setState + 9 patches), so has patch_0..patch_8
@@ -167,16 +168,16 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('rollback() returns false when no checkpoints', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       // Only 5 patches (mutations 2-6) — not enough for a checkpoint (need 10)
       applyNPatches(mgr, CONV, 5);
 
-      expect(mgr.rollback(CONV)).toBe(false);
+      expect(mgr.rollback(FS, CONV)).toBe(false);
     });
 
     it('trimChain evicts oldest when exceeding MAX_NODES', () => {
       (McplStateManager as any).MAX_NODES = 3;
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 49); // mutations 2-50 → checkpoints at 10,20,30,40,50
 
       const tree = getTree(mgr, CONV)!;
@@ -192,7 +193,7 @@ describe('McplStateManager Phase 8', () => {
 
     it('trimChain reparents children to null', () => {
       (McplStateManager as any).MAX_NODES = 3;
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 49); // mutations 2-50
 
       const tree = getTree(mgr, CONV)!;
@@ -203,7 +204,7 @@ describe('McplStateManager Phase 8', () => {
 
     it('has no tombstones in linear mode', () => {
       (McplStateManager as any).MAX_NODES = 3;
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 49); // triggers eviction
 
       const tree = getTree(mgr, CONV)!;
@@ -212,23 +213,23 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('applyPatch actually mutates state', () => {
-      mgr.setState(CONV, { counter: 0 });
-      mgr.applyPatch(CONV, [{ op: 'replace', path: '/counter', value: 42 }]);
-      expect(mgr.getState(CONV)!.counter).toBe(42);
+      mgr.setState(FS, CONV, { counter: 0 });
+      mgr.applyPatch(FS, CONV, [{ op: 'replace', path: '/counter', value: 42 }]);
+      expect(mgr.getState(FS, CONV)!.counter).toBe(42);
     });
 
     it('applyPatch mutates in place — same object reference', () => {
-      mgr.setState(CONV, { counter: 0 });
-      const ref = mgr.getState(CONV);
-      mgr.applyPatch(CONV, [{ op: 'replace', path: '/counter', value: 1 }]);
-      expect(mgr.getState(CONV)).toBe(ref); // same object
+      mgr.setState(FS, CONV, { counter: 0 });
+      const ref = mgr.getState(FS, CONV);
+      mgr.applyPatch(FS, CONV, [{ op: 'replace', path: '/counter', value: 1 }]);
+      expect(mgr.getState(FS, CONV)).toBe(ref); // same object
       expect(ref!.counter).toBe(1); // mutated in place
     });
 
     it('stays in linear mode without named rollback', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19); // mutations 2-20
-      mgr.rollback(CONV); // no checkpointId → stays linear
+      mgr.rollback(FS, CONV); // no checkpointId → stays linear
 
       const tree = getTree(mgr, CONV)!;
       expect(tree.mode).toBe('linear');
@@ -241,11 +242,11 @@ describe('McplStateManager Phase 8', () => {
 
   describe('Tree mode', () => {
     it('canRollback(checkpointId) triggers ensureTreeMode', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
-      mgr.setUserId(CONV, USER);
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
+      mgr.setUserId(FS, CONV, USER);
       applyNPatches(mgr, CONV, 19); // mutations 2-20 → chk_1, chk_2
 
-      const check = mgr.canRollback(CONV, 'chk_1');
+      const check = mgr.canRollback(FS, CONV,'chk_1');
       expect(check.exists).toBe(true);
 
       const tree = getTree(mgr, CONV)!;
@@ -253,21 +254,21 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('mode upgrade is one-way', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19);
-      mgr.canRollback(CONV, 'chk_1'); // upgrades to tree
+      mgr.canRollback(FS, CONV,'chk_1'); // upgrades to tree
 
       // Now use without checkpointId — should stay tree
-      mgr.canRollback(CONV);
+      mgr.canRollback(FS, CONV);
       const tree = getTree(mgr, CONV)!;
       expect(tree.mode).toBe('tree');
     });
 
     it('mode upgrade persisted to db', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
-      mgr.setUserId(CONV, USER);
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
+      mgr.setUserId(FS, CONV, USER);
       applyNPatches(mgr, CONV, 19);
-      mgr.canRollback(CONV, 'chk_1'); // triggers ensureTreeMode
+      mgr.canRollback(FS, CONV,'chk_1'); // triggers ensureTreeMode
 
       const calls = (mockDb.appendMcplUserEvent as ReturnType<typeof vi.fn>).mock.calls;
       const modeUpgradeCall = calls.find(
@@ -278,11 +279,11 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('creates branch after rollback', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19); // mutations 2-20 → chk_1 at 10, chk_2 at 20
 
       // Rollback to chk_1 (resets mutationCount to 0)
-      mgr.commitRollback(CONV, 'chk_1');
+      mgr.commitRollback(FS, CONV,'chk_1');
 
       // New mutations → new checkpoint chk_3 as child of chk_1 (at mutation 10)
       applyNPatches(mgr, CONV, 10);
@@ -297,11 +298,11 @@ describe('McplStateManager Phase 8', () => {
 
     it('evictTree protects active branch', () => {
       (McplStateManager as any).MAX_NODES = 3;
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19); // mutations 2-20 → chk_1 at 10, chk_2 at 20
 
       // Rollback to chk_1 (resets mutationCount to 0)
-      mgr.commitRollback(CONV, 'chk_1');
+      mgr.commitRollback(FS, CONV,'chk_1');
       applyNPatches(mgr, CONV, 10); // mutations 1-10 → chk_3 as child of chk_1
 
       // Now create chk_4 to exceed MAX_NODES (3)
@@ -323,13 +324,13 @@ describe('McplStateManager Phase 8', () => {
 
     it('evictTree removes oldest off-branch leaf first', () => {
       (McplStateManager as any).MAX_NODES = 4;
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19); // mutations 2-20 → chk_1, chk_2
 
       // Create two off-branch forks from chk_1
-      mgr.commitRollback(CONV, 'chk_1'); // resets mutations to 0
+      mgr.commitRollback(FS, CONV,'chk_1'); // resets mutations to 0
       applyNPatches(mgr, CONV, 10); // mutations 1-10 → chk_3 (fork 1)
-      mgr.commitRollback(CONV, 'chk_1'); // resets mutations to 0
+      mgr.commitRollback(FS, CONV,'chk_1'); // resets mutations to 0
       applyNPatches(mgr, CONV, 10); // mutations 1-10 → chk_4 (fork 2, current)
 
       // Upgrade to tree mode
@@ -384,10 +385,10 @@ describe('McplStateManager Phase 8', () => {
 
     it('creates tombstone on eviction', () => {
       (McplStateManager as any).MAX_NODES = 3;
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19); // mutations 2-20 → chk_1, chk_2
 
-      mgr.commitRollback(CONV, 'chk_1'); // resets mutations to 0
+      mgr.commitRollback(FS, CONV,'chk_1'); // resets mutations to 0
       applyNPatches(mgr, CONV, 10); // mutations 1-10 → chk_3
 
       const tree = getTree(mgr, CONV)!;
@@ -403,7 +404,7 @@ describe('McplStateManager Phase 8', () => {
 
     it('caps tombstones at MAX_TOMBSTONES', () => {
       (McplStateManager as any).MAX_TOMBSTONES = 3;
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
 
       // Build a tree in tree mode and manually add tombstones
       applyNPatches(mgr, CONV, 9); // mutations 2-10 → chk_1
@@ -423,29 +424,29 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('canRollback returns expired for evicted ID', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10 → chk_1
 
       const tree = getTree(mgr, CONV)!;
       tree.mode = 'tree';
       tree.evictedIds.add('chk_old');
 
-      const check = mgr.canRollback(CONV, 'chk_old');
+      const check = mgr.canRollback(FS, CONV,'chk_old');
       expect(check.exists).toBe(false);
       expect((check as any).error).toBe('expired');
     });
 
     it('canRollback returns unknown for non-existent ID', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10 → chk_1
 
-      const check = mgr.canRollback(CONV, 'nonexistent');
+      const check = mgr.canRollback(FS, CONV,'nonexistent');
       expect(check.exists).toBe(false);
       expect((check as any).error).toBe('unknown');
     });
 
     it('canRollback returns no_checkpoints for empty manager', () => {
-      const check = mgr.canRollback(CONV);
+      const check = mgr.canRollback(FS, CONV);
       expect(check.exists).toBe(false);
       expect((check as any).error).toBe('no_checkpoints');
     });
@@ -457,43 +458,43 @@ describe('McplStateManager Phase 8', () => {
 
   describe('Two-phase rollback', () => {
     it('canRollback + commitRollback restores state', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19); // mutations 2-20 → chk_1 at 10, chk_2 at 20
 
-      const check = mgr.canRollback(CONV, 'chk_1');
+      const check = mgr.canRollback(FS, CONV,'chk_1');
       expect(check.exists).toBe(true);
       if (!check.exists) return;
 
-      const result = mgr.commitRollback(CONV, check.checkpointId);
+      const result = mgr.commitRollback(FS, CONV,check.checkpointId);
       expect(result.success).toBe(true);
       // State restored to chk_1 snapshot (counter=0, plus patch keys from mutations 2-10)
-      expect(mgr.getState(CONV)!.counter).toBe(0);
-      expect(mgr.getState(CONV)!.patch_0).toBe(1); // patches now actually mutate state
+      expect(mgr.getState(FS, CONV)!.counter).toBe(0);
+      expect(mgr.getState(FS, CONV)!.patch_0).toBe(1); // patches now actually mutate state
     });
 
     it('commitRollback moves current pointer', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19);
-      mgr.commitRollback(CONV, 'chk_1');
+      mgr.commitRollback(FS, CONV,'chk_1');
 
       const tree = getTree(mgr, CONV)!;
       expect(tree.current).toBe('chk_1');
     });
 
     it('commitRollback resets mutationCount to 0', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 15); // mutations 2-16 → chk_1 at 10
       expect(getMutationCount(mgr, CONV)).toBe(16); // setState(1) + 15 patches
 
-      mgr.commitRollback(CONV, 'chk_1');
+      mgr.commitRollback(FS, CONV,'chk_1');
       expect(getMutationCount(mgr, CONV)).toBe(0);
     });
 
     it('commitRollback persists rollback event', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
-      mgr.setUserId(CONV, USER);
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
+      mgr.setUserId(FS, CONV, USER);
       applyNPatches(mgr, CONV, 19);
-      mgr.commitRollback(CONV, 'chk_1');
+      mgr.commitRollback(FS, CONV,'chk_1');
 
       const calls = (mockDb.appendMcplUserEvent as ReturnType<typeof vi.fn>).mock.calls;
       const rollbackCall = calls.find(
@@ -504,24 +505,24 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('commitRollback is idempotent', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19);
 
-      const r1 = mgr.commitRollback(CONV, 'chk_1');
-      const r2 = mgr.commitRollback(CONV, 'chk_1');
+      const r1 = mgr.commitRollback(FS, CONV,'chk_1');
+      const r2 = mgr.commitRollback(FS, CONV,'chk_1');
       expect(r1.success).toBe(true);
       expect(r2.success).toBe(true);
     });
 
     it('commitRollback with corrupt JSON returns rollback_failed and removes node', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10 → chk_1
 
       // Corrupt the checkpoint state
       const tree = getTree(mgr, CONV)!;
       tree.nodes.get('chk_1')!.state = '{invalid json!!!';
 
-      const result = mgr.commitRollback(CONV, 'chk_1');
+      const result = mgr.commitRollback(FS, CONV,'chk_1');
       expect(result.success).toBe(false);
       expect((result as any).error).toBe('rollback_failed');
 
@@ -530,53 +531,53 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('after removeNode on corrupt state: canRollback does not return exists:true', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19); // mutations 2-20 → chk_1, chk_2
 
       // Corrupt chk_1
       const tree = getTree(mgr, CONV)!;
       tree.nodes.get('chk_1')!.state = 'CORRUPT';
-      mgr.commitRollback(CONV, 'chk_1'); // removes chk_1
+      mgr.commitRollback(FS, CONV,'chk_1'); // removes chk_1
 
       // canRollback for chk_1 should NOT return exists: true
-      const check = mgr.canRollback(CONV, 'chk_1');
+      const check = mgr.canRollback(FS, CONV,'chk_1');
       expect(check.exists).toBe(false);
     });
 
     it('commitRollback returns checkpoint_expired when node deleted between can and commit', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10 → chk_1
 
-      const check = mgr.canRollback(CONV, 'chk_1');
+      const check = mgr.canRollback(FS, CONV,'chk_1');
       expect(check.exists).toBe(true);
 
       // Delete node between can and commit
       const tree = getTree(mgr, CONV)!;
       tree.nodes.delete('chk_1');
 
-      const result = mgr.commitRollback(CONV, 'chk_1');
+      const result = mgr.commitRollback(FS, CONV,'chk_1');
       expect(result.success).toBe(false);
       expect((result as any).error).toBe('checkpoint_expired');
     });
 
     it('canRollback returns expired for host-managed node with null state', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10 → chk_1
 
       // Null out state (simulate corrupted replay)
       const tree = getTree(mgr, CONV)!;
       tree.nodes.get('chk_1')!.state = null;
 
-      const check = mgr.canRollback(CONV, 'chk_1');
+      const check = mgr.canRollback(FS, CONV,'chk_1');
       expect(check.exists).toBe(false);
       expect((check as any).error).toBe('expired');
     });
 
     it('canRollback without checkpointId resolves to parent of current', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19); // mutations 2-20 → chk_1, chk_2 (current)
 
-      const check = mgr.canRollback(CONV);
+      const check = mgr.canRollback(FS, CONV);
       expect(check.exists).toBe(true);
       if (check.exists) {
         expect(check.checkpointId).toBe('chk_1');
@@ -590,7 +591,7 @@ describe('McplStateManager Phase 8', () => {
 
   describe('removeNode', () => {
     it('reparents children to parent', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 29); // mutations 2-30 → chk_1, chk_2, chk_3
 
       const tree = getTree(mgr, CONV)!;
@@ -602,7 +603,7 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('updates parent children list', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 29); // mutations 2-30 → chk_1, chk_2, chk_3
 
       const tree = getTree(mgr, CONV)!;
@@ -614,7 +615,7 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('moves current to parent when removing current node', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19); // mutations 2-20 → chk_1, chk_2 (current)
 
       const tree = getTree(mgr, CONV)!;
@@ -625,7 +626,7 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('adds tombstone in tree mode', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19);
 
       const tree = getTree(mgr, CONV)!;
@@ -636,7 +637,7 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('does not add tombstone in linear mode', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19);
 
       const tree = getTree(mgr, CONV)!;
@@ -653,7 +654,7 @@ describe('McplStateManager Phase 8', () => {
 
   describe('State cap', () => {
     it('creates checkpoint for small state', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10 → chk_1
 
       const tree = getTree(mgr, CONV);
@@ -669,7 +670,7 @@ describe('McplStateManager Phase 8', () => {
       for (let i = 0; i < 20; i++) {
         largeState[`key_${i}`] = 'x'.repeat(10);
       }
-      mgr.setState(CONV, largeState); // mutation 1
+      mgr.setState(FS, CONV, largeState); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10 → triggers checkpoint, but skip due to cap
 
       const tree = getTree(mgr, CONV);
@@ -686,7 +687,7 @@ describe('McplStateManager Phase 8', () => {
       for (let i = 0; i < 20; i++) {
         largeState[`key_${i}`] = 'x'.repeat(10);
       }
-      mgr.setState(CONV, largeState); // mutation 1
+      mgr.setState(FS, CONV, largeState); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10
 
       const tree = getTree(mgr, CONV);
@@ -702,7 +703,7 @@ describe('McplStateManager Phase 8', () => {
 
   describe('Metadata', () => {
     it('label has "After N mutations" format', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10 → chk_1 at mutation 10
 
       const tree = getTree(mgr, CONV)!;
@@ -711,7 +712,7 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('records mutationCount', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10 → chk_1
 
       const tree = getTree(mgr, CONV)!;
@@ -721,7 +722,7 @@ describe('McplStateManager Phase 8', () => {
 
     it('sets createdAt to approximately Date.now()', () => {
       const before = Date.now();
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10
       const after = Date.now();
 
@@ -732,10 +733,10 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('getCheckpoints returns metadata', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10 → chk_1
 
-      const result = mgr.getCheckpoints(CONV);
+      const result = mgr.getCheckpoints(FS, CONV);
       expect(result).toBeDefined();
       expect(result!.checkpoints.length).toBe(1);
 
@@ -753,12 +754,12 @@ describe('McplStateManager Phase 8', () => {
 
   describe('getCheckpoints', () => {
     it('returns all nodes with parent/children', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19); // mutations 2-20 → chk_1, chk_2
-      mgr.commitRollback(CONV, 'chk_1'); // resets mutations to 0
+      mgr.commitRollback(FS, CONV,'chk_1'); // resets mutations to 0
       applyNPatches(mgr, CONV, 10); // mutations 1-10 → chk_3 (fork)
 
-      const result = mgr.getCheckpoints(CONV)!;
+      const result = mgr.getCheckpoints(FS, CONV)!;
       expect(result.checkpoints.length).toBe(3);
 
       const chk1 = result.checkpoints.find(c => c.id === 'chk_1')!;
@@ -767,24 +768,24 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('isCurrent true only for current node', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19);
 
-      const result = mgr.getCheckpoints(CONV)!;
+      const result = mgr.getCheckpoints(FS, CONV)!;
       const currentNodes = result.checkpoints.filter(c => c.isCurrent);
       expect(currentNodes.length).toBe(1);
       expect(currentNodes[0].id).toBe(result.current);
     });
 
     it('returns null for empty tree', () => {
-      expect(mgr.getCheckpoints(CONV)).toBeNull();
+      expect(mgr.getCheckpoints(FS, CONV)).toBeNull();
     });
 
     it('returns children as copies not references', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 19);
 
-      const result = mgr.getCheckpoints(CONV)!;
+      const result = mgr.getCheckpoints(FS, CONV)!;
       const chk1 = result.checkpoints.find(c => c.id === 'chk_1')!;
       const origLength = chk1.children.length;
 
@@ -803,8 +804,8 @@ describe('McplStateManager Phase 8', () => {
 
   describe('Persistence', () => {
     it('writes checkpoint event to db with userId', () => {
-      mgr.setUserId(CONV, USER);
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setUserId(FS, CONV, USER);
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10 → chk_1
 
       const calls = (mockDb.appendMcplUserEvent as ReturnType<typeof vi.fn>).mock.calls;
@@ -817,8 +818,8 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('checkpoint event includes state snapshot', () => {
-      mgr.setUserId(CONV, USER);
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setUserId(FS, CONV, USER);
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10 → chk_1
 
       const calls = (mockDb.appendMcplUserEvent as ReturnType<typeof vi.fn>).mock.calls;
@@ -837,8 +838,8 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('checkpoint event includes createdAt', () => {
-      mgr.setUserId(CONV, USER);
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setUserId(FS, CONV, USER);
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10 → chk_1
 
       const calls = (mockDb.appendMcplUserEvent as ReturnType<typeof vi.fn>).mock.calls;
@@ -850,7 +851,7 @@ describe('McplStateManager Phase 8', () => {
 
     it('does not persist without userId', () => {
       // No setUserId call
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10
 
       const calls = (mockDb.appendMcplUserEvent as ReturnType<typeof vi.fn>).mock.calls;
@@ -861,9 +862,9 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('uses latest userId after update', () => {
-      mgr.setUserId(CONV, 'user-old');
-      mgr.setUserId(CONV, 'user-new');
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setUserId(FS, CONV, 'user-old');
+      mgr.setUserId(FS, CONV, 'user-new');
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10
 
       const calls = (mockDb.appendMcplUserEvent as ReturnType<typeof vi.fn>).mock.calls;
@@ -933,7 +934,7 @@ describe('McplStateManager Phase 8', () => {
         createdAt: 100, label: 'c1', mutationCount: 10,
       });
 
-      expect(mgr.getState(CONV)).toEqual({ counter: 42 });
+      expect(mgr.getState(FS, CONV)).toEqual({ counter: 42 });
     });
 
     it('replays rollback and moves current pointer', () => {
@@ -960,7 +961,7 @@ describe('McplStateManager Phase 8', () => {
       const tree = getTree(mgr, CONV)!;
       expect(tree.current).toBe('chk_1');
       // State restored to chk_1 snapshot
-      expect(mgr.getState(CONV)).toEqual({ v: 1 });
+      expect(mgr.getState(FS, CONV)).toEqual({ v: 1 });
     });
 
     it('replay rollback guard: skips unknown ID', () => {
@@ -1083,7 +1084,7 @@ describe('McplStateManager Phase 8', () => {
 
       // New checkpoint after replay should get chk_6+
       // setState resets the live state. mutation count starts fresh.
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10
 
       // New node should be chk_6
@@ -1102,7 +1103,7 @@ describe('McplStateManager Phase 8', () => {
       // Node should still exist in tree
       expect(tree.nodes.has('chk_1')).toBe(true);
       // But live state should not be set (parse failed)
-      expect(mgr.getState(CONV)).toBeUndefined();
+      expect(mgr.getState(FS, CONV)).toBeUndefined();
     });
   });
 
@@ -1112,13 +1113,13 @@ describe('McplStateManager Phase 8', () => {
 
   describe('cleanup', () => {
     it('clears all data for conversation', () => {
-      mgr.setUserId(CONV, USER);
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setUserId(FS, CONV, USER);
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 9); // mutations 2-10 → chk_1
 
-      mgr.cleanup(CONV);
+      mgr.cleanup(FS, CONV);
 
-      expect(mgr.getState(CONV)).toBeUndefined();
+      expect(mgr.getState(FS, CONV)).toBeUndefined();
       expect(getTree(mgr, CONV)).toBeUndefined();
       expect(getMutationCount(mgr, CONV)).toBe(0);
       expect((mgr as any).userIds.get(CONV)).toBeUndefined();
@@ -1131,9 +1132,9 @@ describe('McplStateManager Phase 8', () => {
 
   describe('getStats', () => {
     it('counts conversations and nodes', () => {
-      mgr.setState('conv-a', { counter: 0 }); // mutation 1
+      mgr.setState(FS, 'conv-a', { counter: 0 }); // mutation 1
       applyNPatches(mgr, 'conv-a', 9); // mutations 2-10 → 1 node
-      mgr.setState('conv-b', { counter: 0 }); // mutation 1
+      mgr.setState(FS, 'conv-b', { counter: 0 }); // mutation 1
       applyNPatches(mgr, 'conv-b', 19); // mutations 2-20 → 2 nodes
 
       const stats = mgr.getStats();
@@ -1142,7 +1143,7 @@ describe('McplStateManager Phase 8', () => {
     });
 
     it('reports maxTreeDepth as longest root→current chain', () => {
-      mgr.setState(CONV, { counter: 0 }); // mutation 1
+      mgr.setState(FS, CONV, { counter: 0 }); // mutation 1
       applyNPatches(mgr, CONV, 49); // mutations 2-50 → 5 checkpoints deep
 
       const stats = mgr.getStats();

@@ -80,6 +80,59 @@ export async function getConnectedDelegates(): Promise<{ delegates: DelegateInfo
 }
 
 // =============================================================================
+// Feature Set API
+// =============================================================================
+
+export interface FeatureSetSummary {
+  name: string;
+  description?: string;
+  uses: string[];
+  runtimeEnabled: boolean;        // effective: enabled AND not quarantined
+  quarantined: boolean;           // blocked due to unsupported uses declaration
+  conversationEnabled?: boolean;  // only when conversationId provided
+  visible?: boolean;              // runtimeEnabled && conversationEnabled
+  totalToolCount: number;         // all delegate tools tagged with this featureSet
+  visibleToolCount?: number;      // only when conversationId provided
+}
+
+export interface DelegateFeatureSets {
+  delegateId: string;
+  featureSets: FeatureSetSummary[];
+}
+
+/**
+ * Get feature sets grouped by delegate, with optional conversation-scoped state.
+ */
+export async function getDelegateFeatureSets(conversationId?: string): Promise<{ delegates: DelegateFeatureSets[] }> {
+  const params = conversationId ? { conversationId } : {};
+  const response = await api.get('/tools/delegate-feature-sets', { params });
+  return response.data;
+}
+
+/**
+ * Get visible tools for the current user, optionally filtered by conversation.
+ */
+export async function getVisibleTools(conversationId?: string): Promise<{ tools: ToolInfo[] }> {
+  const params = conversationId ? { conversationId } : {};
+  const response = await api.get('/tools/visible', { params });
+  return response.data;
+}
+
+/**
+ * Enable a feature set for a conversation.
+ */
+export async function enableFeatureSet(delegateId: string, featureSet: string, conversationId: string): Promise<void> {
+  await api.post('/tools/feature-sets/enable', { delegateId, featureSet, conversationId });
+}
+
+/**
+ * Disable a feature set for a conversation.
+ */
+export async function disableFeatureSet(delegateId: string, featureSet: string, conversationId: string): Promise<void> {
+  await api.post('/tools/feature-sets/disable', { delegateId, featureSet, conversationId });
+}
+
+// =============================================================================
 // Delegate API Keys
 // =============================================================================
 

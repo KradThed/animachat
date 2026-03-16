@@ -23,6 +23,7 @@ export const ToolDefinitionSchema = z.object({
     required: z.array(z.string()).optional(),
   }),
   serverName: z.string().optional(),
+  featureSet: z.string().optional(),  // explicit featureSet from delegate
 });
 
 // =============================================================================
@@ -100,6 +101,10 @@ export const ToolCallRequestMessageSchema = z.object({
     chainId: z.string(),
     frameId: z.string(),
   }).optional(),
+  // H7: Spec §8.4 — state/checkpoint at params top level (not in mcplState wrapper)
+  state: z.record(z.unknown()).nullable().optional(),
+  checkpoint: z.string().optional(),           // H7: was mcplState.checkpointId
+  stateVersion: z.number().optional(),         // S-6: CAS version for conflict detection
 });
 
 export const TriggerInferenceResultMessageSchema = z.object({
@@ -123,39 +128,105 @@ export const DelegatePongMessageSchema = z.object({
 
 const McplCapabilitySchema = z.enum(['context_hooks', 'push_events', 'inference_requests', 'tool_management']);
 
+/** Spec §5.1: Nested capabilities object for hello/ack wire protocol */
+const McplCapabilitiesSchema = z.object({
+  version: z.string().optional(),
+  pushEvents: z.boolean().optional(),
+  contextHooks: z.object({
+    beforeInference: z.boolean().optional(),
+    afterInference: z.union([z.boolean(), z.object({ blocking: z.boolean().optional() })]).optional(),
+  }).optional(),
+  inferenceRequest: z.object({
+    streaming: z.boolean().optional(),
+  }).optional(),
+  modelInfo: z.boolean().optional(),
+  featureSets: z.boolean().optional(),
+  toolManagement: z.boolean().optional(),
+}).passthrough();
+
 const McplFeatureSetSchema = z.object({
-  contextHooks: z.boolean(),
-  pushEvents: z.boolean(),
-  inferenceRequests: z.boolean(),
-  toolManagement: z.boolean(),
+  description: z.string().optional(),
+  uses: z.array(z.string()),  // §6.2: dotted uses strings
+  scoped: z.boolean().optional(),
+  rollback: z.boolean().optional(),
+  ownerServerId: z.string().optional(),
 });
 
-/** Delegate → Server: MCPL hello (first message after WS connect) */
+/** Wire shape for capabilities.experimental.mcpl in hello/ack.
+ *  featureSets here is dict of declarations, NOT boolean. */
+const McplHandshakeCapabilitiesSchema = z.object({
+  version: z.string().optional(),
+  pushEvents: z.boolean().optional(),
+  contextHooks: z.object({
+    beforeInference: z.boolean().optional(),
+    afterInference: z.union([z.boolean(), z.object({ blocking: z.boolean().optional() })]).optional(),
+  }).optional(),
+  inferenceRequest: z.object({
+    streaming: z.boolean().optional(),
+  }).optional(),
+  modelInfo: z.boolean().optional(),
+  featureSets: z.record(McplFeatureSetSchema).optional(),  // dict, not boolean
+  toolManagement: z.boolean().optional(),
+}).passthrough();
+
+/** H5: MCP initialize request with experimental.mcpl (spec §3.1, §5.1) */
 export const McplHelloMessageSchema = z.object({
-  type: z.literal('mcpl/hello'),
+  type: z.literal('initialize'),
   protocolVersion: z.string(),
-  capabilities: z.array(McplCapabilitySchema),
-  delegateId: z.string(),
-  delegateName: z.string(),
-  sessionId: z.string().optional(),
+  clientInfo: z.object({
+    name: z.string(),
+    version: z.string().optional(),
+  }).optional(),
+  capabilities: z.object({
+    experimental: z.object({
+      mcpl: McplHandshakeCapabilitiesSchema.optional(),
+    }).optional(),
+  }).optional(),
+  _mcpl: z.object({
+    delegateId: z.string().optional(),
+    sessionId: z.string().optional(),
+    lastReceivedSeq: z.number().optional(),
+  }).optional(),
 });
 
-/** Server → Delegate: MCPL ack (response to hello) */
+/** H5: MCP initializeResult with experimental.mcpl (spec §5.2) */
 export const McplAckMessageSchema = z.object({
   type: z.literal('mcpl/ack'),
-  sessionId: z.string(),
-  negotiatedCapabilities: z.array(McplCapabilitySchema),
-  featureSets: z.record(McplFeatureSetSchema),
+  protocolVersion: z.string(),
+  serverInfo: z.object({
+    name: z.string(),
+    version: z.string().optional(),
+  }).optional(),
+  capabilities: z.object({
+    experimental: z.object({
+      mcpl: McplHandshakeCapabilitiesSchema.optional(),
+    }).optional(),
+  }).optional(),
+  _mcpl: z.object({
+    sessionId: z.string(),
+    resumedFromSeq: z.number().optional(),
+  }).optional(),
 });
 
-/** Delegate → Server: context hook response */
+/** Spec Section 10.3: content block for multimodal injections */
+export const McplContentBlockSchema = z.object({
+  type: z.enum(['text', 'image', 'audio', 'resource']),
+  text: z.string().optional(),
+  data: z.string().optional(),       // base64 for image or audio
+  mimeType: z.string().optional(),
+  uri: z.string().optional(),        // for audio (alt source) or resource
+});
+
+/** Delegate → Server: context hook response (spec Section 10.2) */
 export const McplBeforeInferenceResponseSchema = z.object({
   type: z.literal('mcpl/beforeInference_response'),
   requestId: z.string(),
-  injections: z.array(z.object({
-    serverId: z.string(),
+  featureSet: z.string().optional(),           // spec: declaring feature set
+  contextInjections: z.array(z.object({        // spec: was 'injections'
+    namespace: z.string(),                     // spec: was 'serverId'
     position: z.enum(['system', 'beforeUser', 'afterUser']),
-    content: z.string(),
+    content: z.union([z.string(), z.array(McplContentBlockSchema)]),
+    metadata: z.record(z.unknown()).optional(), // spec: arbitrary metadata
   })),
 });
 
@@ -165,38 +236,70 @@ export const McplAfterInferenceAckSchema = z.object({
   requestId: z.string(),
 });
 
+/** Delegate → Server: after inference response (spec Section 10.5) */
+export const McplAfterInferenceResponseSchema = z.object({
+  type: z.literal('mcpl/afterInference_response'),
+  requestId: z.string(),
+  featureSet: z.string().optional(),
+  modifiedResponse: z.string().optional(),
+  metadata: z.record(z.unknown()).optional(),
+});
+
 /** Delegate → Server: push event from external trigger */
 export const McplPushEventMessageSchema = z.object({
   type: z.literal('mcpl/push_event'),
-  id: z.string(),
-  source: z.string(),
+  requestId: z.string(),                     // F8c: push_event is a request (expects push_event_response)
+  eventId: z.string(),                       // spec: unique event identifier (was: id)
+  featureSet: z.string(),                    // spec: declaring feature set
+  timestamp: z.string(),                     // spec: ISO 8601
+  origin: z.record(z.unknown()).optional(),  // spec: provenance metadata object
+  payload: z.unknown(),                      // spec: { content: ContentBlock[] }; accept any shape
+  // Extensions:
   conversationId: z.string(),
   eventType: z.string(),
-  payload: z.unknown(),
   systemMessage: z.string(),
   idempotencyKey: z.string(),
-  timestamp: z.string(),
 });
 
 /** Delegate → Server: MCP server requests inference from host */
 export const McplInferenceRequestMessageSchema = z.object({
   type: z.literal('mcpl/inference_request'),
   requestId: z.string(),
-  serverId: z.string(),
-  conversationId: z.string(),
-  systemMessage: z.string().optional(),
-  userMessage: z.string(),
-  maxTokens: z.number().optional(),
+  featureSet: z.string(),                  // spec: declaring feature set (was: serverId)
+  conversationId: z.string().optional(),   // spec: optional
   stream: z.boolean().optional(),
-  parentChainId: z.string().optional(),   // recursion prevention (Fix #5)
-  parentFrameId: z.string().optional(),   // recursion prevention (Fix #5)
+  messages: z.array(z.object({
+    role: z.enum(['user', 'assistant']),
+    content: z.string(),
+  })).optional(),
+  preferences: z.object({                  // spec Section 11.2: generation preferences
+    maxTokens: z.number().optional(),
+    temperature: z.number().optional(),
+  }).optional(),
+  systemMessage: z.string().optional(),
+  userMessage: z.string().optional(),
+  parentChainId: z.string().optional(),
+  parentFrameId: z.string().optional()
+});
+
+/** Server → Delegate: inference result */
+export const McplInferenceResponseMessageSchema = z.object({
+  type: z.literal('mcpl/inference_response'),
+  requestId: z.string(),
+  content: z.string().optional(),
+  model: z.string().optional(),
+  finishReason: z.enum(['end_turn', 'max_tokens', 'stop_sequence']).optional(),
+  usage: z.object({
+    inputTokens: z.number(),
+    outputTokens: z.number(),
+  }).optional(),
 });
 
 /** Server → Delegate: streaming inference chunk (Phase 7 — Batch 5) */
 export const McplInferenceChunkMessageSchema = z.object({
   type: z.literal('mcpl/inference_chunk'),
   requestId: z.string(),
-  chunkIndex: z.number(),
+  index: z.number(),                         // spec: sequential chunk index (was: chunkIndex)
   delta: z.string(),
 });
 
@@ -210,37 +313,60 @@ export const McplScopeChangeRequestMessageSchema = z.object({
   conversationId: z.string().optional(),
   url: z.string().optional(),
   serverName: z.string().optional(),
+  payload: z.record(z.unknown()).optional(),  // F12: arbitrary data for UI display
 });
 
-/** Context passed with inference hook messages */
-export const McplInferenceHookContextSchema = z.object({
-  conversationId: z.string(),
-  userId: z.string(),
-  isSubAgent: z.boolean(),
-  taskId: z.string().optional(),
-  groupId: z.string().optional(),
-  instruction: z.string().optional(),
-  inferenceId: z.string().optional(),
-  turnIndex: z.number().optional(),
-  model: z.string().optional(),
+/** Server → Delegate: scope change result */
+export const McplScopeChangeResultMessageSchema = z.object({
+  type: z.literal('mcpl/scope_change_result'),
+  requestId: z.string(),
+  approved: z.boolean(),
+  scoped: z.boolean().optional(),  // F12: per spec Section 7
 });
 
-/** Server → Delegate: before-inference hook (request) */
+/** Model metadata per spec Section 10.1 */
+export const McplModelInfoSchema = z.object({
+  id: z.string(),
+  vendor: z.string(),
+  contextWindow: z.number(),
+  capabilities: z.array(z.string()),
+});
+
+/** Server → Delegate: before-inference hook (spec Section 10.1, flat params) */
 export const McplBeforeInferenceMessageSchema = z.object({
   type: z.literal('mcpl/beforeInference'),
   requestId: z.string(),
+  // Spec fields (top-level):
+  inferenceId: z.string(),
   conversationId: z.string(),
+  turnIndex: z.number().optional(),
+  userMessage: z.string().nullable().optional(),
+  model: McplModelInfoSchema.optional(),
+  // Extensions:
   messagesSummary: z.string().optional(),
-  context: McplInferenceHookContextSchema.optional(),
+  userId: z.string().optional(),
+  isSubAgent: z.boolean().optional(),
 });
 
-/** Server → Delegate: after-inference hook (request) */
+/** Server → Delegate: after-inference hook (spec Section 10.5, flat params) */
 export const McplAfterInferenceMessageSchema = z.object({
   type: z.literal('mcpl/afterInference'),
   requestId: z.string(),
+  // Spec fields (top-level):
+  inferenceId: z.string().optional(),
   conversationId: z.string(),
+  turnIndex: z.number().optional(),
+  userMessage: z.string().optional(),
+  assistantMessage: z.string().optional(),
+  model: McplModelInfoSchema.optional(),
+  usage: z.object({
+    inputTokens: z.number().optional(),
+    outputTokens: z.number().optional(),
+  }).optional(),
+  // Extensions:
   responseSummary: z.string().optional(),
-  context: McplInferenceHookContextSchema.optional(),
+  userId: z.string().optional(),
+  isSubAgent: z.boolean().optional(),
 });
 
 /** Server → Delegate: connect a new MCP server */
@@ -250,32 +376,53 @@ export const McplConnectServerMessageSchema = z.object({
   serverName: z.string().optional(),
 });
 
-/** Delegate → Server: scope elevate request (Phase 7 — Batch 4) */
+/** Delegate → Server: scope elevate request (spec Section 7.4) */
 export const McplScopeElevateRequestMessageSchema = z.object({
   type: z.literal('mcpl/scope_elevate_request'),
   requestId: z.string(),
+  featureSet: z.string(),
+  scope: z.object({                              // spec: nested scope object
+    label: z.string(),
+    payload: z.record(z.unknown()).optional(),
+  }),
+  // Extensions:
   delegateId: z.string(),
   serverId: z.string(),
   conversationId: z.string(),
-  featureSet: z.string(),
-  label: z.string(),
-  requestedCapabilities: z.array(McplCapabilitySchema),
+  requestedUses: z.array(z.string()),            // §6.2 dotted uses strings
   reason: z.string(),
   timeoutMs: z.number().optional(),
 });
 
-/** Server → Delegate: scope elevate result */
+/** Server → Delegate: scope elevate result (spec Section 7.5) */
 export const McplScopeElevateResultMessageSchema = z.object({
   type: z.literal('mcpl/scope_elevate_result'),
   requestId: z.string(),
   approved: z.boolean(),
-  newCapabilities: z.array(McplCapabilitySchema).optional(),
+  payload: z.record(z.unknown()).optional(),     // spec: echo back payload
+  reason: z.string().optional(),                 // spec: denial reason
+  // Extensions:
+  scoped: z.boolean().optional(),
+  newUses: z.array(z.string()).optional(),        // §6.2 dotted uses strings
 });
 
-/** Delegate → Server: dynamic featureSet update (Phase 7 — Batch 2a) */
+/** Delegate → Server: dynamic featureSet update (F15: delta semantics + legacy fallback) */
 export const McplFeatureSetsChangedMessageSchema = z.object({
   type: z.literal('mcpl/featureSets_changed'),
-  featureSets: z.record(McplFeatureSetSchema),
+  added: z.record(McplFeatureSetSchema).optional(),
+  removed: z.array(z.string()).optional(),
+  featureSets: z.record(McplFeatureSetSchema).optional(),  // legacy: full replacement
+});
+
+/** F16: Server → Delegate: notify about capability changes the server made (Spec Section 5.3, 6.7) */
+export const McplFeatureSetsUpdateMessageSchema = z.object({
+  type: z.literal('mcpl/featureSets_update'),
+  enabled: z.array(z.string()).optional(),   // featureSet names that were enabled
+  disabled: z.array(z.string()).optional(),  // featureSet names that were disabled
+  scopes: z.record(z.object({               // per-featureSet scope rules
+    whitelist: z.array(z.string()),
+    blacklist: z.array(z.string()),
+  })).optional(),
 });
 
 /** Delegate → Server: set conversation state (Phase 7 — Batch 2b) */
@@ -331,26 +478,21 @@ export const McplStateResponseMessageSchema = z.object({
 export const McplModelInfoRequestMessageSchema = z.object({
   type: z.literal('mcpl/model_info_request'),
   requestId: z.string(),
+  conversationId: z.string().optional(),
 });
 
-/** Server → Delegate: model capabilities response */
+/** Server → Delegate: model capabilities response (spec Section 12.2) */
 export const McplModelInfoResponseMessageSchema = z.object({
   type: z.literal('mcpl/model_info_response'),
   requestId: z.string(),
-  modelId: z.string(),
-  provider: z.string(),
+  id: z.string(),                              // spec (was: modelId)
+  vendor: z.string(),                          // spec (was: provider)
   contextWindow: z.number(),
-  outputTokenLimit: z.number(),
-  supportsThinking: z.boolean(),
-  supportsPrefill: z.boolean(),
-  capabilities: z.object({
-    imageInput: z.boolean(),
-    pdfInput: z.boolean(),
-    audioInput: z.boolean(),
-    videoInput: z.boolean(),
-    imageOutput: z.boolean(),
-    audioOutput: z.boolean(),
-  }),
+  capabilities: z.array(z.string()),           // spec: string[] (was: object)
+  // Extensions:
+  outputTokenLimit: z.number().optional(),
+  supportsThinking: z.boolean().optional(),
+  supportsPrefill: z.boolean().optional(),
 });
 
 /** Delegate → Server: query checkpoint tree (Phase 8) */
@@ -447,6 +589,7 @@ export const DelegateToServerMessageSchema = z.discriminatedUnion('type', [
   McplHelloMessageSchema,
   McplBeforeInferenceResponseSchema,
   McplAfterInferenceAckSchema,
+  McplAfterInferenceResponseSchema,
   McplPushEventMessageSchema,
   McplInferenceRequestMessageSchema,
   McplScopeChangeRequestMessageSchema,
@@ -479,6 +622,7 @@ export const ServerToDelegateMessageSchema = z.discriminatedUnion('type', [
   McplBeforeInferenceMessageSchema,
   McplAfterInferenceMessageSchema,
   McplConnectServerMessageSchema,
+  McplFeatureSetsUpdateMessageSchema,
 ]);
 
 // =============================================================================
@@ -509,6 +653,7 @@ export type McplConnectServerResultMessage = z.infer<typeof McplConnectServerRes
 export type McplModelInfoRequestMessage = z.infer<typeof McplModelInfoRequestMessageSchema>;
 export type McplModelInfoResponseMessage = z.infer<typeof McplModelInfoResponseMessageSchema>;
 export type McplFeatureSetsChangedMessage = z.infer<typeof McplFeatureSetsChangedMessageSchema>;
+export type McplFeatureSetsUpdateMessage = z.infer<typeof McplFeatureSetsUpdateMessageSchema>;
 export type McplStateSetMessage = z.infer<typeof McplStateSetMessageSchema>;
 export type McplStatePatchMessage = z.infer<typeof McplStatePatchMessageSchema>;
 export type McplStatePatchResultMessage = z.infer<typeof McplStatePatchResultMessageSchema>;
@@ -521,7 +666,7 @@ export type McplInferenceChunkMessage = z.infer<typeof McplInferenceChunkMessage
 export type McplCheckpointListMessage = z.infer<typeof McplCheckpointListMessageSchema>;
 export type McplCheckpointListResponseMessage = z.infer<typeof McplCheckpointListResponseMessageSchema>;
 export type McplErrorMessage = z.infer<typeof McplErrorMessageSchema>;
-export type McplInferenceHookContext = z.infer<typeof McplInferenceHookContextSchema>;
+export type McplModelInfo = z.infer<typeof McplModelInfoSchema>;
 export type McplBeforeInferenceMessage = z.infer<typeof McplBeforeInferenceMessageSchema>;
 export type McplAfterInferenceMessage = z.infer<typeof McplAfterInferenceMessageSchema>;
 

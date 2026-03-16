@@ -207,6 +207,7 @@
           <McplQueueWidget
             v-if="mcplQueueState.totalCount > 0"
             :queue="mcplQueueState"
+            v-model="mcplQueueExpanded"
             @toggle-pause="toggleQueuePause"
           />
           <!-- Delegate status indicator -->
@@ -716,17 +717,23 @@
             ref="messageTextarea"
             v-model="messageInput"
             :label="typingIndicatorLabel"
-            placeholder="Type your message..."
+            :placeholder="subAgentState.active ? 'Sub-agents working... message will be queued' : 'Type your message...'"
+            :readonly="false"
             rows="1"
             auto-grow
             max-rows="15"
             variant="outlined"
             hide-details
+            :class="{ 'input-locked': subAgentState.active }"
             @keydown.enter.exact.prevent="sendMessage"
             @focus="handleTextareaFocus"
             @paste="handlePaste"
             @input="handleTypingInput"
-          />
+          >
+            <template v-if="subAgentState.active" #prepend-inner>
+              <v-icon size="16" color="warning" class="mr-1">mdi-lock-outline</v-icon>
+            </template>
+          </v-textarea>
           
           <!-- Bottom control row -->
           <div class="bottom-controls d-flex align-center mt-2">
@@ -1254,6 +1261,16 @@
         <v-btn variant="text" @click="dismissNotification">OK</v-btn>
       </template>
     </v-snackbar>
+
+    <!-- Push event toast -->
+    <v-snackbar v-model="pushToastVisible" :timeout="4000" color="info" location="bottom right">
+      {{ pushToastMessage }}
+      <template #actions>
+        <v-btn variant="text" size="small" @click="mcplQueueExpanded = true; pushToastVisible = false">
+          Details
+        </v-btn>
+      </template>
+    </v-snackbar>
   </v-layout>
 </template>
 
@@ -1424,7 +1441,7 @@ interface PendingScopeElevate {
   delegateName: string;
   featureSet: string;
   label: string;
-  requestedCapabilities: string[];
+  requestedUses: string[];
   reason: string;
   timeout: number;
   receivedAt: number;
@@ -1432,9 +1449,15 @@ interface PendingScopeElevate {
 const pendingScopeElevates = ref<PendingScopeElevate[]>([]);
 
 // MCPL queue state
-interface McplQueueItem { id: string; source: string; eventType: string; status: string; timestamp: string; }
+interface McplQueueItem { id: string; featureSet: string; eventType: string; status: string; timestamp: string; systemMessage?: string; }
 interface McplQueueState { items: McplQueueItem[]; totalCount: number; isPaused: boolean; }
 const mcplQueueState = ref<McplQueueState>({ items: [], totalCount: 0, isPaused: false });
+
+// Push event toast state
+const pushToastVisible = ref(false);
+const pushToastMessage = ref('');
+const mcplQueueExpanded = ref(false);
+let hasSeenQueueSnapshot = false;
 
 function toggleQueuePause() {
   if (!currentConversation.value) return;
@@ -1724,6 +1747,14 @@ const groupedMessages = computed((): MessageGroup[] => {
 });
 const wsConnectionState = computed(() => store.state.wsConnectionState);
 const isWsConnected = computed(() => store.state.wsConnectionState === 'connected');
+
+// Suppress toast on first post-reconnect queue snapshot
+watch(wsConnectionState, (newState) => {
+  if (newState === 'connected') {
+    hasSeenQueueSnapshot = false;
+    mcplQueueExpanded.value = false;
+  }
+});
 
 // Compute which messages are affected by post-hoc operations
 // IMPORTANT: Only consider operations that are on the CURRENT visible branch path
@@ -2729,7 +2760,7 @@ function handleWsScopeElevateApproval(data: any) {
     delegateName: data.delegateName || data.delegateId,
     featureSet: data.featureSet,
     label: data.label,
-    requestedCapabilities: data.requestedCapabilities || [],
+    requestedUses: data.requestedUses || [],
     reason: data.reason || '',
     timeout: data.timeout || 60,
     receivedAt: Date.now(),
@@ -2737,13 +2768,27 @@ function handleWsScopeElevateApproval(data: any) {
 }
 
 function handleWsQueueUpdate(data: any) {
-  if (data.conversationId === currentConversation.value?.id) {
-    mcplQueueState.value = {
-      items: data.queue || [],
-      totalCount: data.totalCount || 0,
-      isPaused: data.isPaused || false,
-    };
+  if (data.conversationId !== currentConversation.value?.id) return;
+
+  const oldIds = new Set(mcplQueueState.value.items.map((i: McplQueueItem) => i.id));
+  const incomingItems: McplQueueItem[] = data.queue || [];
+  const newItems = incomingItems.filter((i: McplQueueItem) => !oldIds.has(i.id));
+
+  mcplQueueState.value = {
+    items: incomingItems,
+    totalCount: data.totalCount || 0,
+    isPaused: data.isPaused || false,
+  };
+
+  // Toast ONLY for genuinely new items (not status transitions, not initial hydration)
+  if (hasSeenQueueSnapshot && newItems.length > 0) {
+    const label = newItems.length === 1
+      ? (newItems[0].systemMessage || `${newItems[0].featureSet}/${newItems[0].eventType}`)
+      : `${newItems.length} new push events`;
+    pushToastMessage.value = label;
+    pushToastVisible.value = true;
   }
+  hasSeenQueueSnapshot = true;
 }
 
 // Named function reference for proper off() cleanup
@@ -2772,6 +2817,7 @@ watch(showEventHistory, (v) => { if (v) showCheckpoints.value = false; });
 
 function handleSubtaskStatusChanged(data: any) {
   if (!data.groupId) return;
+  if (data.conversationId && data.conversationId !== currentConversation.value?.id) return;
 
   // Detect group switch — new group started, clear old tasks
   if (subAgentState.groupId && subAgentState.groupId !== data.groupId) {
@@ -2802,6 +2848,7 @@ function handleSubtaskStatusChanged(data: any) {
 
 function handleSubtaskGroupFinalized(data: any) {
   if (!data.groupId) return;
+  if (data.conversationId && data.conversationId !== currentConversation.value?.id) return;
   // Only finalize if this is our current group (ignore stale events)
   if (subAgentState.groupId && subAgentState.groupId !== data.groupId) return;
   subAgentState.groupId = data.groupId;
@@ -2834,6 +2881,7 @@ function handleSubtaskResultsSnapshot(data: any) {
 }
 
 function handleSubtaskQueueBlocked(data: any) {
+  if (data.conversationId && data.conversationId !== currentConversation.value?.id) return;
   if (data.queuedText) {
     subAgentState.queuedText = data.queuedText;
   }
@@ -3008,6 +3056,9 @@ watch(() => getConversationIdFromRoute(), async (newId, oldId) => {
   pendingScopeChanges.value = [];
   pendingScopeElevates.value = [];
   mcplQueueState.value = { items: [], totalCount: 0, isPaused: false };
+  hasSeenQueueSnapshot = false;
+  mcplQueueExpanded.value = false;
+  pushToastVisible.value = false;
 
   // Reset sub-agent state (prevents stale data flash from previous conversation)
   resetSubAgentState();
@@ -5673,6 +5724,11 @@ function formatDate(date: Date | string): string {
 }
 
 /* Drop zone styles for drag-and-drop attachments */
+.input-locked :deep(.v-field) {
+  border-color: rgb(var(--v-theme-warning)) !important;
+  opacity: 0.75;
+}
+
 .input-drop-zone {
   position: relative;
   width: 100%;

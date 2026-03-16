@@ -16,7 +16,7 @@
       </div>
       <div class="text-caption text-medium-emphasis mb-1">{{ request.reason }}</div>
       <div class="text-caption mb-1">
-        Capabilities: {{ request.requestedCapabilities.join(', ') }}
+        Capabilities: {{ request.requestedUses.join(', ') }}
       </div>
       <v-checkbox
         v-model="remember"
@@ -52,7 +52,7 @@ interface PendingScopeElevate {
   delegateName: string;
   featureSet: string;
   label: string;
-  requestedCapabilities: string[];
+  requestedUses: string[];
   reason: string;
   timeout: number;
   receivedAt: number;

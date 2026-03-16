@@ -1433,45 +1433,81 @@ export function createStore(): {
         }
       });
 
+      // Stream buffering — accumulate delta chunks, flush on rAF
+      let pendingStreamDeltas: Map<string, string> = new Map(); // key: messageId::branchId → accumulated delta
+      let pendingContentBlocks: Map<string, any[]> = new Map();
+      let streamFlushScheduled = false;
+
+      function flushStreamDeltas(): boolean {
+        streamFlushScheduled = false;
+        if (pendingStreamDeltas.size === 0 && pendingContentBlocks.size === 0) return false;
+
+        for (const [key, delta] of pendingStreamDeltas) {
+          const [messageId, branchId] = key.split('::');
+          const message = state.allMessages.find(m => m.id === messageId);
+          if (!message) continue;
+          const branch = message.branches.find(b => b.id === branchId);
+          if (!branch) continue;
+          branch.content += delta; // single accumulated append
+
+          const notification = state.hiddenBranchActivities.get(branchId);
+          if (notification) notification.content = (branch.content || '').slice(0, 100);
+        }
+        for (const [key, blocks] of pendingContentBlocks) {
+          const [messageId, branchId] = key.split('::');
+          const message = state.allMessages.find(m => m.id === messageId);
+          if (!message) continue;
+          const branch = message.branches.find(b => b.id === branchId);
+          if (branch) branch.contentBlocks = blocks;
+        }
+        pendingStreamDeltas.clear();
+        pendingContentBlocks.clear();
+        return true;
+      }
+
       state.wsService.on('stream', (data: any) => {
         const message = state.allMessages.find(m => m.id === data.messageId);
         if (!message) {
           if (data.isComplete) console.warn(`[Store:stream] Message NOT FOUND: ${data.messageId}, isComplete=${data.isComplete}`);
           return;
         }
-        if (message) {
-          const branch = message.branches.find(b => b.id === data.branchId);
-          if (!branch) {
-            if (data.isComplete) console.warn(`[Store:stream] Branch NOT FOUND: ${data.branchId} in message ${data.messageId}`);
-            return;
-          }
-          if (branch) {
-            // On isComplete, if server provides fullContent (recovered from contentBlocks
-            // when onChunk didn't stream text during tool loops, or content was filtered),
-            // use it as the authoritative final content instead of appending the empty chunk.
-            if (data.isComplete && data.fullContent != null) {
-              branch.content = data.fullContent;
-            } else {
-              branch.content += data.content;
-            }
-            if (data.isComplete) {
-              console.log(`[Store:stream] isComplete: fullContent=${data.fullContent?.length ?? 'null'}, branch.content=${branch.content.length}`);
-            }
-            // Update content blocks if provided
-            if (data.contentBlocks) {
-              branch.contentBlocks = data.contentBlocks;
-            }
-            // Force Vue reactivity on every isComplete or contentBlocks update
-            if (data.isComplete || data.contentBlocks) {
-              state.messagesVersion++;
-            }
+        const branch = message.branches.find(b => b.id === data.branchId);
+        if (!branch) {
+          if (data.isComplete) console.warn(`[Store:stream] Branch NOT FOUND: ${data.branchId} in message ${data.messageId}`);
+          return;
+        }
 
-            // Update notification preview if this is a hidden branch
-            const notification = state.hiddenBranchActivities.get(data.branchId);
-            if (notification) {
-              notification.content = (branch.content || '').slice(0, 100);
-            }
+        if (data.isComplete) {
+          // Flush any pending deltas first (don't bump version yet)
+          flushStreamDeltas();
+
+          // Apply authoritative final state
+          if (data.fullContent != null) {
+            branch.content = data.fullContent;
+          } else if (data.content) {
+            branch.content += data.content;
           }
+          if (data.contentBlocks) branch.contentBlocks = data.contentBlocks;
+          console.log(`[Store:stream] isComplete: fullContent=${data.fullContent?.length ?? 'null'}, branch.content=${branch.content.length}`);
+
+          // Single version bump covers flush + final state
+          state.messagesVersion++;
+
+          const notification = state.hiddenBranchActivities.get(data.branchId);
+          if (notification) notification.content = (branch.content || '').slice(0, 100);
+          return;
+        }
+
+        // Non-complete: buffer delta
+        const key = `${data.messageId}::${data.branchId}`;
+        const existing = pendingStreamDeltas.get(key) || '';
+        pendingStreamDeltas.set(key, existing + data.content);
+        if (data.contentBlocks) pendingContentBlocks.set(key, data.contentBlocks);
+        if (!streamFlushScheduled) {
+          streamFlushScheduled = true;
+          requestAnimationFrame(() => {
+            if (flushStreamDeltas()) state.messagesVersion++;
+          });
         }
       });
       

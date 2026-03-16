@@ -113,6 +113,19 @@ export class BulkEventStore {
         }
     }
 
+    /** Scan filesystem for all task IDs without loading event content. */
+    async scanTaskIds(): Promise<string[]> {
+        try {
+            const files = await fs.readdir(this.baseDir, { recursive: true });
+            return (files as string[])
+                .filter(f => f.endsWith('.jsonl'))
+                .map(f => path.basename(f, '.jsonl'));
+        } catch (e: any) {
+            if (e.code === 'ENOENT') return [];
+            throw e;
+        }
+    }
+
     async close() {
         for (var closingId of this.mostRecentIds) {
             var closingEventStore = this.mostRecentEventStores.get(closingId);

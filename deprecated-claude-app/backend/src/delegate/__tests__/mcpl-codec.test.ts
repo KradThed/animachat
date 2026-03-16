@@ -166,23 +166,19 @@ describe('McplCodec', () => {
   // ---------------------------------------------------------------------------
 
   describe('send — Notification encoding', () => {
-    it('encodes mcpl/push_event as JSON-RPC notification (no id)', () => {
+    it('encodes mcpl/featureSets_changed as JSON-RPC notification (no id)', () => {
       const { codec, transport } = createCodec();
       codec.send({
-        type: 'mcpl/push_event',
-        serverId: 'srv-1',
-        eventType: 'file_changed',
-        data: { path: '/foo' },
+        type: 'mcpl/featureSets_changed',
+        added: { 'test-fs': { uses: ['pushEvents'], description: 'test' } },
       });
 
       const wire = transport.sentMessages[0];
       expect(wire.jsonrpc).toBe('2.0');
-      expect(wire.method).toBe('mcpl/push_event');
+      expect(wire.method).toBe('featureSets/changed');  // F1: internal → wire
       expect(wire).not.toHaveProperty('id');
       expect(wire.params).toEqual({
-        serverId: 'srv-1',
-        eventType: 'file_changed',
-        data: { path: '/foo' },
+        added: { 'test-fs': { uses: ['pushEvents'], description: 'test' } },
       });
     });
 
@@ -191,7 +187,7 @@ describe('McplCodec', () => {
       codec.send({ type: 'mcpl/inference_chunk', chunk: 'hello' });
 
       const wire = transport.sentMessages[0];
-      expect(wire.method).toBe('mcpl/inference_chunk');
+      expect(wire.method).toBe('inference/chunk');  // F1: internal → wire
       expect(wire).not.toHaveProperty('id');
     });
 
@@ -200,7 +196,7 @@ describe('McplCodec', () => {
       codec.send({ type: 'mcpl/connect_server_result', serverId: 'srv-2', success: true });
 
       const wire = transport.sentMessages[0];
-      expect(wire.method).toBe('mcpl/connect_server_result');
+      expect(wire.method).toBe('mcpl/connectServerResult');  // F1: internal → wire
       expect(wire).not.toHaveProperty('id');
     });
   });
@@ -221,8 +217,29 @@ describe('McplCodec', () => {
       const wire = transport.sentMessages[0];
       expect(wire.jsonrpc).toBe('2.0');
       expect(wire.id).toBe('req-10');
-      expect(wire.method).toBe('mcpl/beforeInference');
+      expect(wire.method).toBe('context/beforeInference');  // F1: internal → wire
       expect(wire.params).toEqual({ conversationId: 'conv-1' });
+    });
+
+    it('encodes mcpl/push_event as JSON-RPC request (F8c fix — not notification)', () => {
+      const { codec, transport } = createCodec();
+      codec.send({
+        type: 'mcpl/push_event',
+        requestId: 'pe-1',
+        serverId: 'srv-1',
+        eventType: 'file_changed',
+        data: { path: '/foo' },
+      });
+
+      const wire = transport.sentMessages[0];
+      expect(wire.jsonrpc).toBe('2.0');
+      expect(wire.id).toBe('pe-1');
+      expect(wire.method).toBe('push/event');  // F1: internal → wire
+      expect(wire.params).toEqual({
+        serverId: 'srv-1',
+        eventType: 'file_changed',
+        data: { path: '/foo' },
+      });
     });
 
     it('tracks request in pendingRequests for response correlation', () => {
@@ -242,7 +259,7 @@ describe('McplCodec', () => {
       codec.send({ type: 'mcpl/scope_change_request', scopes: [] });
 
       const wire = transport.sentMessages[0];
-      expect(wire.method).toBe('mcpl/scope_change_request');
+      expect(wire.method).toBe('scope/request');  // F1: internal → wire
       expect(wire).not.toHaveProperty('id');
       expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('no requestId'));
 
@@ -363,10 +380,11 @@ describe('McplCodec', () => {
     it('decodes JSON-RPC request to internal format', () => {
       const { transport, received } = createCodec();
 
+      // F1: incoming uses wire method names
       transport.fireMessage({
         jsonrpc: '2.0',
         id: 'srv-req-1',
-        method: 'mcpl/beforeInference',
+        method: 'context/beforeInference',
         params: { conversationId: 'conv-5' },
       });
 
@@ -381,16 +399,17 @@ describe('McplCodec', () => {
     it('decodes JSON-RPC notification (no id) to internal format', () => {
       const { transport, received } = createCodec();
 
+      // F1: incoming uses wire method names
       transport.fireMessage({
         jsonrpc: '2.0',
-        method: 'mcpl/push_event',
-        params: { serverId: 'srv-1', eventType: 'changed' },
+        method: 'featureSets/changed',
+        params: { added: { 'test-fs': { uses: ['pushEvents'] } } },
       });
 
       expect(received).toHaveLength(1);
-      expect(received[0].type).toBe('mcpl/push_event');
+      expect(received[0].type).toBe('mcpl/featureSets_changed');  // decoded to internal name
       expect(received[0]).not.toHaveProperty('requestId');
-      expect((received[0] as any).serverId).toBe('srv-1');
+      expect((received[0] as any).added).toEqual({ 'test-fs': { uses: ['pushEvents'] } });
     });
   });
 
@@ -620,7 +639,7 @@ describe('McplCodec', () => {
       // Don't call onMessage — no handler
 
       expect(() => {
-        transport.fireMessage({ jsonrpc: '2.0', method: 'mcpl/push_event', params: {} });
+        transport.fireMessage({ jsonrpc: '2.0', method: 'featureSets/changed', params: {} });
       }).not.toThrow();
     });
 

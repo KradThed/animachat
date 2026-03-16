@@ -35,18 +35,7 @@ export class BranchEventStore {
 
   /** List all branch task IDs (for orphan recovery on startup). */
   async listAllTaskIds(): Promise<string[]> {
-    const ids: string[] = [];
-    try {
-      for await (const { id } of this.inner.loadAllEvents()) {
-        ids.push(id);
-      }
-    } catch (error: any) {
-      // M7: Belt+suspenders ENOENT handling (BulkEventStore.loadAllEvents already handles this,
-      // but the error may come from a different path)
-      if (error.code === 'ENOENT') return [];
-      throw error;
-    }
-    return ids;
+    return this.inner.scanTaskIds();
   }
 
   /** SA-4: Delete a branch file for orphaned task cleanup. */

@@ -587,7 +587,8 @@ export const CreationSourceSchema = z.enum([
   'regeneration',   // AI regeneration of a previous attempt
   'split',          // Result of message split operation
   'import',         // Imported from external source
-  'fork'            // Copied from another conversation via fork
+  'fork',           // Copied from another conversation via fork
+  'mcpl_inference'  // Created by MCPL server-initiated inference
 ]);
 export type CreationSource = z.infer<typeof CreationSourceSchema>;
 
@@ -780,6 +781,13 @@ export const WsMessageSchema = z.discriminatedUnion('type', [
     conversationId: z.string().uuid(),
     requestId: z.string().min(1).optional(),
   }),
+  z.object({
+    type: z.literal('checkpoint_state_at'),
+    conversationId: z.string().uuid(),
+    checkpointId: z.string(),
+    featureSet: z.string().optional(),
+    requestId: z.string().optional(),
+  }),
   // Sub-agent WebSocket message types
   // Client → Server
   z.object({
@@ -801,11 +809,13 @@ export const WsMessageSchema = z.discriminatedUnion('type', [
   // Server → Client
   z.object({
     type: z.literal('subtask_queue_blocked'),
+    conversationId: z.string().uuid(),
     groupId: z.string().uuid(),
     queuedText: z.string(),
   }),
   z.object({
     type: z.literal('subtask_status_changed'),
+    conversationId: z.string().uuid(),
     groupId: z.string().uuid(),
     taskId: z.string(),
     status: z.string(),
@@ -813,10 +823,12 @@ export const WsMessageSchema = z.discriminatedUnion('type', [
   }),
   z.object({
     type: z.literal('subtask_group_finalized'),
+    conversationId: z.string().uuid(),
     groupId: z.string().uuid(),
   }),
   z.object({
     type: z.literal('subtask_group_auto_finalized'),
+    conversationId: z.string().uuid(),
     groupId: z.string().uuid(),
     reason: z.string(),
   }),
@@ -865,6 +877,21 @@ export const WsMessageSchema = z.discriminatedUnion('type', [
     type: z.literal('system_turn_started'),
     conversationId: z.string(),
     message: z.string(),
+  }),
+  z.object({
+    type: z.literal('mcpl/feature_sets_runtime_changed'),
+    delegateId: z.string(),
+    addedFeatureSets: z.array(z.string()),
+    removedFeatureSets: z.array(z.string()),
+    enabledFeatureSets: z.array(z.string()),
+    timestamp: z.number(),
+  }),
+  z.object({
+    type: z.literal('mcpl/conversation_feature_sets_changed'),
+    conversationId: z.string(),
+    delegateId: z.string(),
+    changedFeatureSets: z.array(z.string()),
+    timestamp: z.number(),
   }),
   z.object({
     type: z.literal('ping')
@@ -940,6 +967,16 @@ export const CheckpointTimelineResponseSchema = z.object({
   error: z.enum(['conversation_access_denied']).optional(),
 });
 export type CheckpointTimelineResponse = z.infer<typeof CheckpointTimelineResponseSchema>;
+
+export const CheckpointStateAtResponseSchema = z.object({
+  type: z.literal('checkpoint_state_at_response'),
+  conversationId: z.string().uuid(),
+  checkpointId: z.string().optional(),
+  state: z.record(z.unknown()).optional(),
+  error: z.enum(['no_checkpoints', 'unknown', 'expired', 'no_snapshot', 'conversation_access_denied']).optional(),
+  requestId: z.string().optional(),
+});
+export type CheckpointStateAtResponse = z.infer<typeof CheckpointStateAtResponseSchema>;
 
 // API Request/Response types
 export const CreateConversationRequestSchema = z.object({

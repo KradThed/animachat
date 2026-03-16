@@ -49,17 +49,32 @@ interface ConversationTree {
 // =============================================================================
 
 export class McplStateManager {
-  /** State keyed by conversationId */
+  /** H8+L2: State keyed by compound key `${featureSet}:${conversationId}` (spec §8) */
   private states: Map<string, Record<string, unknown>> = new Map();
 
-  /** Checkpoint trees per conversation (Phase 8: replaces linear stack) */
+  /** S-6 fix: Monotonic version counter per compound key for CAS checks. */
+  private stateVersions: Map<string, number> = new Map();
+
+  /** Checkpoint trees per compound key (Phase 8: replaces linear stack) */
   private trees: Map<string, ConversationTree> = new Map();
 
-  /** Mutation count per conversation (for auto-checkpointing) */
+  /** Mutation count per compound key (for auto-checkpointing) */
   private mutationCounts: Map<string, number> = new Map();
 
-  /** userId per conversation (for event persistence) */
+  /** userId per compound key (for event persistence) */
   private userIds: Map<string, string> = new Map();
+
+  /** H8+L2: Build compound key from featureSet + conversationId (spec §8) */
+  private compoundKey(featureSet: string, conversationId: string): string {
+    return featureSet ? `${featureSet}:${conversationId}` : conversationId;
+  }
+
+  /** Extract featureSet and conversationId from compound key */
+  private parseCompoundKey(key: string): { featureSet: string; conversationId: string } {
+    const colonIdx = key.indexOf(':');
+    if (colonIdx === -1) return { featureSet: '', conversationId: key };
+    return { featureSet: key.slice(0, colonIdx), conversationId: key.slice(colonIdx + 1) };
+  }
 
   /** Database reference for event persistence */
   private db: Database | null = null;
@@ -85,39 +100,85 @@ export class McplStateManager {
    * Set the userId for a conversation (for event persistence).
    * Must be called from delegate-handler before every state operation.
    */
-  setUserId(conversationId: string, userId: string): void {
-    this.userIds.set(conversationId, userId);
+  setUserId(featureSet: string, conversationId: string, userId: string): void {
+    this.userIds.set(this.compoundKey(featureSet, conversationId), userId);
   }
 
   /**
    * Get current state for a conversation.
    */
-  getState(conversationId: string): Record<string, unknown> | undefined {
-    return this.states.get(conversationId);
+  getState(featureSet: string, conversationId: string): Record<string, unknown> | undefined {
+    return this.states.get(this.compoundKey(featureSet, conversationId));
+  }
+
+  /**
+   * S-6 fix: Get the current state version for CAS checks.
+   * Tools should read this before executing, then pass it as expectedVersion
+   * to setState/applyPatch to detect concurrent modifications.
+   */
+  getStateVersion(featureSet: string, conversationId: string): number {
+    return this.stateVersions.get(this.compoundKey(featureSet, conversationId)) ?? 0;
   }
 
   /**
    * Set (replace) state for a conversation.
    * Triggers auto-checkpoint.
+   *
+   * @param expectedVersion  S-6 fix: If provided, rejects the write when the
+   *   current version doesn't match (compare-and-swap). Prevents stale writes
+   *   that could cause irreversible side effects on effectful tools.
    */
-  setState(conversationId: string, state: Record<string, unknown>): void {
-    this.states.set(conversationId, state);
-    this.incrementMutations(conversationId);
-    console.log(`[McplStateManager] State set for conversation ${conversationId}`);
+  setState(
+    featureSet: string,
+    conversationId: string,
+    state: Record<string, unknown>,
+    expectedVersion?: number
+  ): { success: boolean; error?: string } {
+    const key = this.compoundKey(featureSet, conversationId);
+    if (expectedVersion !== undefined) {
+      const current = this.stateVersions.get(key) ?? 0;
+      if (current !== expectedVersion) {
+        return {
+          success: false,
+          error: `State version conflict: expected ${expectedVersion}, current ${current}. Re-read state before retrying.`,
+        };
+      }
+    }
+
+    this.states.set(key, state);
+    this.stateVersions.set(key, (this.stateVersions.get(key) ?? 0) + 1);
+    this.incrementMutations(key);
+    console.log(`[McplStateManager] State set for ${key} (v${this.stateVersions.get(key)})`);
+    return { success: true };
   }
 
   /**
    * Apply JSON Patch (RFC 6902) to conversation state.
    * Returns { success: true } or { success: false, error }.
    * Invalid patch or missing state → error, never crash.
+   *
+   * @param expectedVersion  S-6 fix: Optional CAS guard (same as setState).
    */
   applyPatch(
+    featureSet: string,
     conversationId: string,
-    patch: unknown[]
+    patch: unknown[],
+    expectedVersion?: number
   ): { success: boolean; error?: string } {
-    const state = this.states.get(conversationId);
+    const key = this.compoundKey(featureSet, conversationId);
+    if (expectedVersion !== undefined) {
+      const current = this.stateVersions.get(key) ?? 0;
+      if (current !== expectedVersion) {
+        return {
+          success: false,
+          error: `State version conflict: expected ${expectedVersion}, current ${current}. Re-read state before retrying.`,
+        };
+      }
+    }
+
+    const state = this.states.get(key);
     if (!state) {
-      return { success: false, error: `No state for conversation ${conversationId}` };
+      return { success: false, error: `No state for ${key}` };
     }
 
     try {
@@ -129,11 +190,12 @@ export class McplStateManager {
         }
       }
 
-      this.incrementMutations(conversationId);
+      this.stateVersions.set(key, (this.stateVersions.get(key) ?? 0) + 1);
+      this.incrementMutations(key);
       return { success: true };
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
-      console.warn(`[McplStateManager] Patch failed for ${conversationId}: ${errorMsg}`);
+      console.warn(`[McplStateManager] Patch failed for ${key}: ${errorMsg}`);
       return { success: false, error: errorMsg };
     }
   }
@@ -147,17 +209,19 @@ export class McplStateManager {
    * Named rollback (checkpointId provided) triggers one-way upgrade to tree mode.
    */
   canRollback(
+    featureSet: string,
     conversationId: string,
     checkpointId?: string,
   ): { exists: true; checkpointId: string } | { exists: false; error: 'expired' | 'unknown' | 'no_checkpoints' } {
-    const tree = this.trees.get(conversationId);
+    const key = this.compoundKey(featureSet, conversationId);
+    const tree = this.trees.get(key);
     if (!tree || tree.nodes.size === 0) {
       return { exists: false, error: 'no_checkpoints' };
     }
 
     // Named rollback → upgrade to tree mode (one-way, persisted)
     if (checkpointId) {
-      this.ensureTreeMode(conversationId);
+      this.ensureTreeMode(key);
     }
 
     // If no checkpointId, resolve to parent of current
@@ -189,10 +253,12 @@ export class McplStateManager {
    * For host-managed: immediate. For server-managed (8b): caller waits for server first.
    */
   commitRollback(
+    featureSet: string,
     conversationId: string,
     checkpointId: string,
   ): { success: true } | { success: false; error: 'rollback_failed' | 'checkpoint_expired' } {
-    const tree = this.trees.get(conversationId);
+    const key = this.compoundKey(featureSet, conversationId);
+    const tree = this.trees.get(key);
     if (!tree) return { success: false, error: 'rollback_failed' };
 
     const node = tree.nodes.get(checkpointId);
@@ -203,25 +269,24 @@ export class McplStateManager {
       if (!node.state) return { success: false, error: 'rollback_failed' };
       try {
         const restored = JSON.parse(node.state);
-        this.states.set(conversationId, restored);
+        this.states.set(key, restored);
       } catch (err) {
         console.error(`[McplStateManager] Corrupt state in ${checkpointId}:`, err);
-        this.removeNode(tree, checkpointId, conversationId);  // prevent infinite canRollback→commitRollback loop
+        this.removeNode(tree, checkpointId, key);
         return { success: false, error: 'rollback_failed' };
       }
     }
-    // Server-managed: don't restore state (caller already has server's state)
-    // Just move the tree pointer
 
     tree.current = checkpointId;
-    this.mutationCounts.set(conversationId, 0);  // reset mutation count
-    console.log(`[McplStateManager] Rolled back ${conversationId} to ${checkpointId}`);
+    this.mutationCounts.set(key, 0);
+    console.log(`[McplStateManager] Rolled back ${key} to ${checkpointId}`);
 
-    // Persist rollback event (fire-and-forget, after state change)
-    const userId = this.userIds.get(conversationId);
+    const userId = this.userIds.get(key);
     if (userId) {
       this.db?.appendMcplUserEvent(userId, 'checkpoint_tree_updated', {
+        _compoundKey: key,
         _conversationId: conversationId,
+        _featureSet: featureSet,
         action: 'rollback',
         checkpointId,
       } as Record<string, unknown>).catch(err =>
@@ -236,10 +301,10 @@ export class McplStateManager {
    * Backward compat wrapper — Phase 7 API.
    * Rolls back to parent of current (no named checkpoint).
    */
-  rollback(conversationId: string): boolean {
-    const check = this.canRollback(conversationId);
+  rollback(featureSet: string, conversationId: string): boolean {
+    const check = this.canRollback(featureSet, conversationId);
     if (!check.exists) return false;
-    return this.commitRollback(conversationId, check.checkpointId).success;
+    return this.commitRollback(featureSet, conversationId, check.checkpointId).success;
   }
 
   /**
@@ -247,14 +312,15 @@ export class McplStateManager {
    * Used by WS handler for checkpoint_rollback messages.
    */
   tryRollback(
+    featureSet: string,
     conversationId: string,
     checkpointId?: string,
   ): { success: true; checkpointId: string } | { success: false; error: 'expired' | 'unknown' | 'no_checkpoints' | 'rollback_failed' } {
-    const check = this.canRollback(conversationId, checkpointId);
+    const check = this.canRollback(featureSet, conversationId, checkpointId);
     if (!check.exists) {
       return { success: false, error: check.error };
     }
-    const result = this.commitRollback(conversationId, check.checkpointId);
+    const result = this.commitRollback(featureSet, conversationId, check.checkpointId);
     if (result.success) {
       return { success: true, checkpointId: check.checkpointId };
     }
@@ -272,7 +338,7 @@ export class McplStateManager {
   /**
    * Get checkpoint tree for a conversation (for mcpl/checkpoint_list response).
    */
-  getCheckpoints(conversationId: string): {
+  getCheckpoints(featureSet: string, conversationId: string): {
     current: string;
     checkpoints: Array<{
       id: string; parent: string | null; children: string[];
@@ -280,7 +346,7 @@ export class McplStateManager {
       label: string; mutationCount: number;
     }>;
   } | null {
-    const tree = this.trees.get(conversationId);
+    const tree = this.trees.get(this.compoundKey(featureSet, conversationId));
     if (!tree || tree.nodes.size === 0) return null;
 
     const checkpoints = [];
@@ -298,6 +364,30 @@ export class McplStateManager {
     return { current: tree.current, checkpoints };
   }
 
+  /**
+   * Get state snapshot at a specific checkpoint (read-only, no rollback).
+   * V1 limitation: featureSet defaults to '' in frontend — only queries default featureSet.
+   */
+  getStateAtCheckpoint(
+    featureSet: string, conversationId: string, checkpointId: string
+  ): { state: Record<string, unknown> } | { error: 'no_checkpoints' | 'unknown' | 'expired' | 'no_snapshot' } {
+    const key = this.compoundKey(featureSet, conversationId);
+    const tree = this.trees.get(key);
+    if (!tree || tree.nodes.size === 0) return { error: 'no_checkpoints' };
+
+    const node = tree.nodes.get(checkpointId);
+    if (!node) {
+      return { error: tree.evictedIds.has(checkpointId) ? 'expired' : 'unknown' };
+    }
+    if (node.state === null) return { error: 'no_snapshot' };
+
+    try {
+      return { state: JSON.parse(node.state) };
+    } catch {
+      return { error: 'no_snapshot' };
+    }
+  }
+
   // --------------------------------------------------------------------------
   // Public API — lifecycle
   // --------------------------------------------------------------------------
@@ -305,12 +395,13 @@ export class McplStateManager {
   /**
    * Cleanup on conversation close.
    */
-  cleanup(conversationId: string): void {
-    this.states.delete(conversationId);
-    this.trees.delete(conversationId);  // nodes + tombstones + counter + mode all go
-    this.mutationCounts.delete(conversationId);
-    this.userIds.delete(conversationId);
-    console.log(`[McplStateManager] Cleaned up state for ${conversationId}`);
+  cleanup(featureSet: string, conversationId: string): void {
+    const key = this.compoundKey(featureSet, conversationId);
+    this.states.delete(key);
+    this.trees.delete(key);
+    this.mutationCounts.delete(key);
+    this.userIds.delete(key);
+    console.log(`[McplStateManager] Cleaned up state for ${key}`);
   }
 
   /**
@@ -347,18 +438,27 @@ export class McplStateManager {
    * Called from index.ts via db.onReplayEvent('checkpoint_tree_updated').
    */
   replayCheckpointEvent(data: Record<string, unknown>): void {
-    const conversationId = data._conversationId as string;
-    if (!conversationId) return;
+    // Compound key resolution: _compoundKey > _featureSet:_conversationId > _conversationId (legacy)
+    let key: string;
+    if (data._compoundKey) {
+      key = data._compoundKey as string;
+    } else if (data._featureSet != null && data._conversationId) {
+      key = this.compoundKey(data._featureSet as string, data._conversationId as string);
+    } else if (data._conversationId) {
+      key = this.compoundKey('', data._conversationId as string); // legacy: empty featureSet
+    } else {
+      return;
+    }
 
     if (data.action === 'checkpoint') {
-      let tree = this.trees.get(conversationId);
+      let tree = this.trees.get(key);
       if (!tree) {
         tree = {
           nodes: new Map(), current: '', nextSeq: 0,
           evictedIds: new Set(), hostManaged: (data.hostManaged as boolean) ?? true,
           mode: 'linear',
         };
-        this.trees.set(conversationId, tree);
+        this.trees.set(key, tree);
       }
 
       const id = data.checkpointId as string;
@@ -391,7 +491,7 @@ export class McplStateManager {
       // Also restore live state from latest checkpoint
       if (stateSnapshot && tree.hostManaged) {
         try {
-          this.states.set(conversationId, JSON.parse(stateSnapshot));
+          this.states.set(key, JSON.parse(stateSnapshot));
         } catch { /* corrupted — skip */ }
       }
 
@@ -399,7 +499,7 @@ export class McplStateManager {
       this.evict(tree);
 
     } else if (data.action === 'rollback') {
-      const tree = this.trees.get(conversationId);
+      const tree = this.trees.get(key);
       if (tree && data.checkpointId) {
         const id = data.checkpointId as string;
         // Guard: skip if node doesn't exist (corrupted JSONL, partial write)
@@ -412,22 +512,22 @@ export class McplStateManager {
         const node = tree.nodes.get(id);
         if (node?.state && tree.hostManaged) {
           try {
-            this.states.set(conversationId, JSON.parse(node.state));
+            this.states.set(key, JSON.parse(node.state));
           } catch { /* corrupted — skip */ }
         }
       }
 
     } else if (data.action === 'remove_node') {
-      const tree = this.trees.get(conversationId);
+      const tree = this.trees.get(key);
       if (tree) {
         const nodeId = data.nodeId as string;
         if (nodeId && tree.nodes.has(nodeId)) {
-          this.removeNode(tree, nodeId, conversationId, false);  // persist=false: event already in log
+          this.removeNode(tree, nodeId, key, false);  // persist=false: event already in log
         }
       }
 
     } else if (data.action === 'mode_upgrade') {
-      const tree = this.trees.get(conversationId);
+      const tree = this.trees.get(key);
       if (tree) tree.mode = (data.mode as 'linear' | 'tree') ?? 'tree';
     }
   }
@@ -436,12 +536,12 @@ export class McplStateManager {
   // Internal — mutation tracking
   // --------------------------------------------------------------------------
 
-  private incrementMutations(conversationId: string): void {
-    const count = (this.mutationCounts.get(conversationId) || 0) + 1;
-    this.mutationCounts.set(conversationId, count);
+  private incrementMutations(key: string): void {
+    const count = (this.mutationCounts.get(key) || 0) + 1;
+    this.mutationCounts.set(key, count);
 
     if (count % McplStateManager.CHECKPOINT_INTERVAL === 0) {
-      this.checkpoint(conversationId, count);
+      this.checkpoint(key, count);
     }
   }
 
@@ -449,11 +549,11 @@ export class McplStateManager {
   // Internal — checkpoint creation
   // --------------------------------------------------------------------------
 
-  private checkpoint(conversationId: string, seq: number): void {
-    const state = this.states.get(conversationId);
+  private checkpoint(key: string, seq: number): void {
+    const state = this.states.get(key);
     if (!state) return;
 
-    let tree = this.trees.get(conversationId);
+    let tree = this.trees.get(key);
     if (!tree) {
       tree = {
         nodes: new Map(),
@@ -463,22 +563,21 @@ export class McplStateManager {
         hostManaged: true,
         mode: 'linear',
       };
-      this.trees.set(conversationId, tree);
+      this.trees.set(key, tree);
     }
 
     try {
       const snapshot = tree.hostManaged ? JSON.stringify(state) : null;
 
-      // State cap: skip checkpoint if state too large
       if (snapshot && snapshot.length > McplStateManager.MAX_STATE_BYTES) {
-        console.warn(`[McplStateManager] State too large (${snapshot.length}B), skipping checkpoint for ${conversationId}`);
+        console.warn(`[McplStateManager] State too large (${snapshot.length}B), skipping checkpoint for ${key}`);
         return;
       }
 
       const id = this.allocateId(tree);
       const parentId = tree.current || null;
 
-      const mutCount = this.mutationCounts.get(conversationId) ?? 0;
+      const mutCount = this.mutationCounts.get(key) ?? 0;
       const node: CheckpointNode = {
         id,
         parent: parentId,
@@ -491,7 +590,6 @@ export class McplStateManager {
 
       tree.nodes.set(id, node);
 
-      // Link parent → child
       if (parentId) {
         const parentNode = tree.nodes.get(parentId);
         if (parentNode) parentNode.children.push(id);
@@ -500,13 +598,15 @@ export class McplStateManager {
       tree.current = id;
       this.evict(tree);
 
-      console.log(`[McplStateManager] Checkpoint ${id} for ${conversationId} (nodes=${tree.nodes.size})`);
+      console.log(`[McplStateManager] Checkpoint ${id} for ${key} (nodes=${tree.nodes.size})`);
 
-      // Persist checkpoint event (fire-and-forget, after state change)
-      const userId = this.userIds.get(conversationId);
+      const userId = this.userIds.get(key);
       if (userId) {
+        const { featureSet: _fs, conversationId: _cid } = this.parseCompoundKey(key);
         this.db?.appendMcplUserEvent(userId, 'checkpoint_tree_updated', {
-          _conversationId: conversationId,
+          _compoundKey: key,
+          _conversationId: _cid,
+          _featureSet: _fs,
           action: 'checkpoint',
           checkpointId: id,
           parentId: parentId,
@@ -520,7 +620,7 @@ export class McplStateManager {
         );
       }
     } catch (err) {
-      console.warn(`[McplStateManager] Failed to create checkpoint for ${conversationId}:`, err);
+      console.warn(`[McplStateManager] Failed to create checkpoint for ${key}:`, err);
     }
   }
 
@@ -633,22 +733,25 @@ export class McplStateManager {
    * Triggered on first named rollback (checkpointId provided).
    * Persisted so upgrade survives restart.
    */
-  private ensureTreeMode(conversationId: string): void {
-    const tree = this.trees.get(conversationId);
+  private ensureTreeMode(key: string): void {
+    const tree = this.trees.get(key);
     if (!tree || tree.mode === 'tree') return;
 
     tree.mode = 'tree';
-    const userId = this.userIds.get(conversationId);
+    const userId = this.userIds.get(key);
     if (userId) {
+      const { featureSet: _fs, conversationId: _cid } = this.parseCompoundKey(key);
       this.db?.appendMcplUserEvent(userId, 'checkpoint_tree_updated', {
-        _conversationId: conversationId,
+        _compoundKey: key,
+        _conversationId: _cid,
+        _featureSet: _fs,
         action: 'mode_upgrade',
         mode: 'tree',
       } as Record<string, unknown>).catch(err =>
         console.warn('[McplStateManager] Failed to persist mode upgrade:', err)
       );
     }
-    console.log(`[McplStateManager] ${conversationId} upgraded to tree mode`);
+    console.log(`[McplStateManager] ${key} upgraded to tree mode`);
   }
 
   // --------------------------------------------------------------------------
@@ -663,17 +766,15 @@ export class McplStateManager {
    * @param persist — if true, persist a remove_node event so the removal survives restart.
    *                  Set to false during replay (the event already exists in the log).
    */
-  private removeNode(tree: ConversationTree, nodeId: string, conversationId?: string, persist = true): void {
+  private removeNode(tree: ConversationTree, nodeId: string, key?: string, persist = true): void {
     const node = tree.nodes.get(nodeId);
     if (!node) return;
 
-    // Reparent children to node's parent
     for (const childId of node.children) {
       const child = tree.nodes.get(childId);
       if (child) child.parent = node.parent;
     }
 
-    // Update parent's children list
     if (node.parent) {
       const parent = tree.nodes.get(node.parent);
       if (parent) {
@@ -684,7 +785,6 @@ export class McplStateManager {
 
     tree.nodes.delete(nodeId);
 
-    // Tombstone if tree mode
     if (tree.mode === 'tree') {
       tree.evictedIds.add(nodeId);
       if (tree.evictedIds.size > McplStateManager.MAX_TOMBSTONES) {
@@ -693,17 +793,18 @@ export class McplStateManager {
       }
     }
 
-    // If current pointed to removed node, move to parent
     if (tree.current === nodeId) {
       tree.current = node.parent ?? '';
     }
 
-    // Persist removal so it survives restart (fire-and-forget)
-    if (persist && conversationId) {
-      const userId = this.userIds.get(conversationId);
+    if (persist && key) {
+      const userId = this.userIds.get(key);
       if (userId) {
+        const { featureSet: _fs, conversationId: _cid } = this.parseCompoundKey(key);
         this.db?.appendMcplUserEvent(userId, 'checkpoint_tree_updated', {
-          _conversationId: conversationId,
+          _compoundKey: key,
+          _conversationId: _cid,
+          _featureSet: _fs,
           action: 'remove_node',
           nodeId,
         } as Record<string, unknown>).catch(err =>

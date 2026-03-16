@@ -23,9 +23,12 @@ import { ContextManager } from '../services/context-manager.js';
 import { ModelLoader } from '../config/model-loader.js';
 import { toolRegistry } from '../tools/tool-registry.js';
 import { roomManager } from '../websocket/room-manager.js';
-import { mcplHookManager } from '../services/mcpl-hook-manager.js';
+import { mcplHookManager, type InferenceHookContext } from '../services/mcpl-hook-manager.js';
 import type { ToolCall, ToolResult } from '../tools/tool-registry.js';
 import type { TriggerInferenceMessage, TriggerInferenceResultMessage } from './protocol.js';
+import { normalizeInjectionContent } from '@deprecated-claude/shared';
+import { applyUserInjections } from '../utils/message-helpers.js';
+import { buildFeatureSetPredicate } from '../utils/feature-set-predicate.js';
 
 class TriggerHandler {
   /**
@@ -196,35 +199,25 @@ class TriggerHandler {
           error: `MCPL beforeInference aborted: ${hookResult.abortReason ?? 'no reason'}`,
         };
       }
-      const injections = hookResult.injections;
+      const injections = hookResult.contextInjections;
       if (injections.length > 0) {
         // system injections → system prompt
-        const systemParts = injections.filter(i => i.position === 'system').map(i => i.content);
+        // F4 fix: normalizeInjectionContent handles McplContentBlock[] (avoids "[object Object]")
+        const systemParts = injections.filter(i => i.position === 'system').map(i => normalizeInjectionContent(i.content));
         if (systemParts.length > 0) {
           mcplSystemInjection = systemParts.join('\n');
         }
         // beforeUser/afterUser → inject into last user message content
         // (same pattern as inference-runner.ts — don't flatten into system prompt)
-        const beforeUser = injections.filter(i => i.position === 'beforeUser').map(i => i.content);
-        const afterUser = injections.filter(i => i.position === 'afterUser').map(i => i.content);
-        if ((beforeUser.length > 0 || afterUser.length > 0) && messages.length > 0) {
-          const lastIdx = messages.length - 1;
-          const lastMsg = messages[lastIdx];
-          const branch = lastMsg.branches?.find((b: any) => b.id === lastMsg.activeBranchId);
-          if (branch) {
-            let content = branch.content || '';
-            if (beforeUser.length > 0) content = beforeUser.join('\n') + '\n\n' + content;
-            if (afterUser.length > 0) content = content + '\n\n' + afterUser.join('\n');
-            // Immutable update — don't mutate shared reference
-            messages = messages.map((m: any, i: number) => {
-              if (i !== lastIdx) return m;
-              return {
-                ...m,
-                branches: m.branches.map((b: any) =>
-                  b.id === m.activeBranchId ? { ...b, content } : b
-                ),
-              };
-            });
+        // F4 fix: normalizeInjectionContent handles McplContentBlock[]
+        const beforeUser = injections.filter(i => i.position === 'beforeUser').map(i => normalizeInjectionContent(i.content));
+        const afterUser = injections.filter(i => i.position === 'afterUser').map(i => normalizeInjectionContent(i.content));
+        if (beforeUser.length > 0 || afterUser.length > 0) {
+          const result = applyUserInjections(messages, beforeUser, afterUser);
+          messages = result.messages;
+          if (result.systemAppend) {
+            mcplSystemInjection = mcplSystemInjection
+              ? `${mcplSystemInjection}\n\n${result.systemAppend}` : result.systemAppend;
           }
         }
         console.log(`[TriggerHandler] MCPL injected ${injections.length} context block(s)`);
@@ -256,8 +249,8 @@ class TriggerHandler {
     const inferenceService = new EnhancedInferenceService(baseInferenceService, contextManager);
 
     // 10. Build tool options (delegate tools available to this user)
-    const isServerEnabled = (serverId: string) => db.isServerEnabled(msg.conversationId!, serverId);
-    const tools = toolRegistry.getToolsForUser(userId, isServerEnabled);
+    const isFeatureSetEnabled = buildFeatureSetPredicate(userId, msg.conversationId!, db);
+    const tools = toolRegistry.getToolsForUser(userId, isFeatureSetEnabled);
     const toolOptions = tools.length > 0 ? {
       tools,
       executeToolCall: async (call: ToolCall): Promise<ToolResult> => {
@@ -267,6 +260,7 @@ class TriggerHandler {
 
     // 11. Run inference
     let fullResponse = '';
+    let finalUsage: { inputTokens?: number; outputTokens?: number } | undefined;
     const branchId = assistantMessage.activeBranchId;
 
     console.log(`[TriggerHandler] Starting inference for trigger "${triggerId}" (model: ${model.id})`);
@@ -294,6 +288,7 @@ class TriggerHandler {
 
           // Save content on complete
           if (isComplete) {
+            if (usage) finalUsage = usage;
             await db.updateMessageContent(
               assistantMessage.id,
               msg.conversationId!,
@@ -323,7 +318,29 @@ class TriggerHandler {
       };
     }
 
-    // 12. Return success with the model's response
+    // 12. MCPL afterInference hooks — fire-and-forget notify
+    try {
+      const afterContext: InferenceHookContext = {
+        conversationId: msg.conversationId!,
+        userId,
+        isSubAgent: false,
+        assistantMessage: fullResponse || undefined,
+        model: {
+          id: model.id,
+          vendor: (model as any).provider ?? 'unknown',
+          contextWindow: (model as any).contextWindow ?? 0,
+          capabilities: [],
+        },
+        usage: finalUsage,
+      };
+      mcplHookManager.afterInference(userId, msg.conversationId!, undefined, afterContext).catch(err => {
+        console.error('[TriggerHandler] MCPL afterInference error:', err);
+      });
+    } catch (err) {
+      console.error('[TriggerHandler] MCPL afterInference setup error:', err);
+    }
+
+    // 13. Return success with the model's response
     return {
       type: 'trigger_inference_result',
       triggerId,

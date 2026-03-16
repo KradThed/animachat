@@ -46,7 +46,7 @@ export type McplQueueEntryStatus =
 
 export interface McplQueueEntry {
   id: string;
-  source: string;
+  featureSet: string;  // F8a: was 'source'
   conversationId: string;
   eventType: string;
   payload: unknown;
@@ -114,7 +114,7 @@ export class McplEventQueue {
    */
   push(event: {
     id: string;
-    source: string;
+    featureSet: string;  // F8a: was 'source'
     conversationId: string;
     eventType: string;
     payload: unknown;
@@ -125,7 +125,7 @@ export class McplEventQueue {
     userId: string;
   }): McplQueueEntry {
     // 1. Check idempotency
-    const effectiveKey = event.idempotencyKey || this.computeFallbackKey(event);
+    const effectiveKey = event.id || event.idempotencyKey || this.computeFallbackKey(event);
 
     if (this.seenKeys.has(effectiveKey)) {
       const entry: McplQueueEntry = {
@@ -133,7 +133,7 @@ export class McplEventQueue {
         idempotencyKey: effectiveKey,
         status: 'duplicate_ignored',
       };
-      console.log(`[McplEventQueue] Duplicate ignored: ${event.source}/${event.eventType} (key: ${effectiveKey.substring(0, 12)}...)`);
+      console.log(`[McplEventQueue] Duplicate ignored: ${event.featureSet}/${event.eventType} (key: ${effectiveKey.substring(0, 12)}...)`);
       this.broadcastQueueUpdate(event.conversationId);
       return entry;
     }
@@ -148,10 +148,10 @@ export class McplEventQueue {
         idempotencyKey: effectiveKey,
         status: 'rate_limited',
       };
-      console.warn(`[McplEventQueue] Rate limited: ${event.source}/${event.eventType} (${userTimestamps.length}/${this.config.maxPushesPerHour} per hour for user ${userId})`);
+      console.warn(`[McplEventQueue] Rate limited: ${event.featureSet}/${event.eventType} (${userTimestamps.length}/${this.config.maxPushesPerHour} per hour for user ${userId})`);
       if (this.db) {
         this.db.appendMcplConversationEvent(event.conversationId, 'push_event_rate_limited', {
-          id: entry.id, source: entry.source, eventType: entry.eventType, status: entry.status,
+          id: entry.id, featureSet: entry.featureSet, eventType: entry.eventType, status: entry.status,
         }).catch(err => console.warn('[McplEventQueue] Failed to persist push_event_rate_limited:', err));
       }
       this.broadcastQueueUpdate(event.conversationId);
@@ -185,11 +185,11 @@ export class McplEventQueue {
     // Persist push_event_received (audit trail)
     if (this.db) {
       this.db.appendMcplConversationEvent(event.conversationId, 'push_event_received', {
-        id: entry.id, source: entry.source, eventType: entry.eventType, status: entry.status,
+        id: entry.id, featureSet: entry.featureSet, eventType: entry.eventType, status: entry.status,
       }).catch(err => console.warn('[McplEventQueue] Failed to persist push_event_received:', err));
     }
 
-    console.log(`[McplEventQueue] Queued: ${event.source}/${event.eventType} (${event.id}) → conversation ${event.conversationId} [${queue.length} in queue]`);
+    console.log(`[McplEventQueue] Queued: ${event.featureSet}/${event.eventType} (${event.id}) → conversation ${event.conversationId} [${queue.length} in queue]`);
     this.broadcastQueueUpdate(event.conversationId);
 
     // 6. Start processing if not paused and not already processing
@@ -296,7 +296,7 @@ export class McplEventQueue {
     this.processing.add(conversationId);
     this.broadcastQueueUpdate(conversationId);
 
-    console.log(`[McplEventQueue] Processing: ${entry.source}/${entry.eventType} (${entry.id})`);
+    console.log(`[McplEventQueue] Processing: ${entry.featureSet}/${entry.eventType} (${entry.id})`);
 
     try {
       await this.executeEvent(entry);
@@ -304,11 +304,11 @@ export class McplEventQueue {
       const userTs = this.processedTimestamps.get(entry.userId) || [];
       userTs.push(Date.now());
       this.processedTimestamps.set(entry.userId, userTs);
-      console.log(`[McplEventQueue] Completed: ${entry.source}/${entry.eventType} (${entry.id})`);
+      console.log(`[McplEventQueue] Completed: ${entry.featureSet}/${entry.eventType} (${entry.id})`);
     } catch (err) {
       entry.status = 'failed';
       entry.error = err instanceof Error ? err.message : String(err);
-      console.error(`[McplEventQueue] Failed: ${entry.source}/${entry.eventType} (${entry.id}):`, entry.error);
+      console.error(`[McplEventQueue] Failed: ${entry.featureSet}/${entry.eventType} (${entry.id}):`, entry.error);
     }
 
     // Persist push_event_processed (audit trail)
@@ -340,7 +340,7 @@ export class McplEventQueue {
       {
         type: 'trigger_inference',
         triggerId: entry.id,
-        source: entry.source,
+        source: entry.featureSet,  // trigger handler uses 'source' as label
         conversationId: entry.conversationId,
         context: {
           eventType: entry.eventType,
@@ -453,7 +453,7 @@ export class McplEventQueue {
       conversationId,
       queue: queue.map(e => ({
         id: e.id,
-        source: e.source,
+        featureSet: e.featureSet,  // F8a: was 'source'
         eventType: e.eventType,
         status: e.status,
         timestamp: e.timestamp,
