@@ -273,7 +273,13 @@
                   title="Admin"
                   @click="$router.push('/admin')"
                 />
-                <v-divider v-if="isResearcher || isAdmin" class="my-1" />
+                <v-list-item
+                  v-if="rcUrl"
+                  prepend-icon="mdi-flask-outline"
+                  title="Connect to Research Commons"
+                  @click="connectToResearchCommons"
+                />
+                <v-divider v-if="isResearcher || isAdmin || rcUrl" class="my-1" />
                 <v-list-item
                   prepend-icon="mdi-logout"
                   title="Logout"
@@ -1346,6 +1352,9 @@ const isProgrammaticScroll = ref(false);  // Tracks when scroll is from code, no
 const isSwitchingBranch = ref(false);
 const streamingError = ref<{ messageId: string; error: string; suggestion?: string } | null>(null);
 const isLoadingConversation = ref(false);
+
+// Research Commons integration
+const rcUrl = import.meta.env.VITE_RC_URL || '';
 
 // Track last completed branch to prevent re-triggering streaming on DEBUG CAPTURE updates
 const lastCompletedBranchId = ref<string | null>(null);
@@ -3825,6 +3834,16 @@ async function exportConversation(id: string) {
   }
 }
 
+async function connectToResearchCommons() {
+  try {
+    const response = await api.post('/link/generate');
+    const { url } = response.data;
+    window.open(url, '_blank');
+  } catch (error) {
+    console.error('Failed to generate RC link:', error);
+  }
+}
+
 function handleConversationClick(_conversationId: string) {
   if (isMobile.value) {
     mobilePanel.value = 'conversation';
@@ -4959,6 +4978,7 @@ async function updateParticipants(updatedParticipants: Participant[]) {
         const hasChanges = existing.name !== updated.name ||
           existing.model !== updated.model ||
           existing.systemPrompt !== updated.systemPrompt ||
+          existing.personaContext !== updated.personaContext ||
           existing.conversationMode !== updated.conversationMode ||
           !isEqual(existing.settings, updated.settings) ||
           !isEqual(existing.contextManagement, updated.contextManagement) ||
@@ -4975,6 +4995,7 @@ async function updateParticipants(updatedParticipants: Participant[]) {
             name: updated.name,
             model: updated.model,
             systemPrompt: updated.systemPrompt,
+            personaContext: updated.personaContext,
             settings: updated.settings,
             contextManagement: updated.contextManagement,
             conversationMode: updated.conversationMode,

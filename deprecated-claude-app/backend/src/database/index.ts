@@ -3174,7 +3174,9 @@ export class Database {
         participant.model,
         includeSystemPrompt ? participant.systemPrompt : undefined,
         includeSettings && participant.settings ? JSON.parse(JSON.stringify(participant.settings)) : undefined,
-        includeSettings && participant.contextManagement ? JSON.parse(JSON.stringify(participant.contextManagement)) : undefined
+        includeSettings && participant.contextManagement ? JSON.parse(JSON.stringify(participant.contextManagement)) : undefined,
+        undefined, // participantUserId
+        includeSystemPrompt ? participant.personaContext : undefined
       );
       // We need to mirror this flag as well, by default they are active
       if (!participant.isActive) {
@@ -5212,7 +5214,8 @@ export class Database {
     systemPrompt?: string,
     settings?: any,
     contextManagement?: any,
-    participantUserId?: string // The user who "owns" this participant (for collaborative user participants)
+    participantUserId?: string, // The user who "owns" this participant (for collaborative user participants)
+    personaContext?: string // Large text body: memories, conversation history, persona material
   ): Promise<Participant> {
     await this.loadUser(conversationOwnerUserId);
     const participant: Participant = {
@@ -5225,6 +5228,7 @@ export class Database {
       systemPrompt,
       settings,
       contextManagement,
+      personaContext,
       isActive: true
     };
     
@@ -5312,10 +5316,13 @@ export class Database {
     const messages = await this.getConversationMessages(conversationId, conversationOwnerUserId);
     const participants = await this.getConversationParticipants(conversationId, conversationOwnerUserId);
 
+    const bookmarks = await this.getConversationBookmarks(conversationId);
+
     return {
       conversation,
       messages,
       participants,
+      bookmarks,
       exportedAt: new Date(),
       version: '1.0' // Version for future compatibility
     };

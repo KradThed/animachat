@@ -424,6 +424,10 @@ export const ParticipantSchema = z.object({
   toolConfig: ToolConfigSchema.optional(), // Tool configuration (only for assistant participants)
   isActive: z.boolean().default(true),
 
+  // Persona context: large text body injected per-participant at inference time
+  // Contains memories, conversation history, or other material private to this participant
+  personaContext: z.string().optional(),
+
   // Persona system fields
   personaId: z.string().uuid().optional(), // If set, this participant is a persona
   personaParticipationId: z.string().uuid().optional() // Link to participation record
@@ -440,6 +444,7 @@ export const UpdateParticipantSchema = z.object({
   conversationMode: ConversationModeEnum.optional(), // Per-participant format override
   toolConfig: ToolConfigSchema.optional(), // Tool configuration
   isActive: z.boolean().optional(),
+  personaContext: z.string().optional(),
   // Persona system fields
   personaId: z.string().uuid().optional(),
   personaParticipationId: z.string().uuid().optional()

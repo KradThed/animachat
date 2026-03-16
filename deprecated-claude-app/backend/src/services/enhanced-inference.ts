@@ -329,6 +329,7 @@ export class EnhancedInferenceService {
     // while Base/Membrane order is (toolOptions, abortSignal, maxToolDepth).
     // This is intentional — Enhanced wraps Base/Membrane and reorders params.
     maxToolDepth?: number,
+    personaContext?: string // Per-participant persona context to inject into prefill
   ): Promise<void> {
     // If no conversation provided, fall back to original behavior
     if (!conversation) {
@@ -350,15 +351,46 @@ export class EnhancedInferenceService {
       );
       return;
     }
-    
-    // Prepare context using context manager
-    const { formattedMessages, cacheKey, window } = await this.contextManager.prepareContext(
-      conversation,
-      messages,
-      undefined, // newMessage is already included in messages
-      participant,
-      model.contextWindow // Pass model's max context for cache arithmetic
-    );
+
+    // When persona context is present, handler.ts already truncated messages
+    // to fit within the model's context window. Skip the context manager's
+    // rolling window to avoid double-truncation — handler is the authority.
+    let window: import('./context-strategies.js').ContextWindow;
+    let cacheKey: string | undefined;
+
+    if (personaContext) {
+      // Build a minimal context window from pre-truncated messages
+      const totalTokens = messages.reduce((sum, m) => {
+        const branch = m.branches?.find((b: any) => b.id === m.activeBranchId) || m.branches?.[0];
+        return sum + Math.ceil((branch?.content?.length || 0) / 4);
+      }, 0);
+
+      window = {
+        messages,
+        cacheablePrefix: [],
+        activeWindow: messages,
+        metadata: {
+          totalMessages: messages.length,
+          totalTokens,
+          windowStart: 0,
+          windowEnd: messages.length,
+          lastRotation: null
+        }
+      };
+      cacheKey = undefined;
+      Logger.context(`[EnhancedInference] Persona context present — bypassing context manager (${messages.length} pre-truncated messages, ~${totalTokens} tokens)`);
+    } else {
+      // Normal path: use context manager for rolling window + cache management
+      const result = await this.contextManager.prepareContext(
+        conversation,
+        messages,
+        undefined, // newMessage is already included in messages
+        participant,
+        model.contextWindow // Pass model's max context for cache arithmetic
+      );
+      window = result.window;
+      cacheKey = result.cacheKey;
+    }
     
     // Debug logging with visual indicators
     const hasCaching = window.cacheablePrefix.length > 0;
@@ -580,6 +612,7 @@ export class EnhancedInferenceService {
       toolOptions,
       abortSignal,
       maxToolDepth,
+      personaContext  // Per-participant persona context for prefill injection
     );
   }
 
@@ -738,6 +771,13 @@ export class EnhancedInferenceService {
       ?? INPUT_PRICING_PER_MILLION[model.id];
     
     if (price === undefined) {
+      if (model.provider === 'openai-compatible') {
+        console.warn(
+          `[Pricing] No pricing configured for openai-compatible model ${model.id} (${model.providerModelId || 'none'}), assuming $0 for metrics`
+        );
+        return 0;
+      }
+
       // Throw error instead of silently returning $0 - prevents untracked charges
       throw new PricingNotConfiguredError(model.id, model.provider, model.providerModelId);
     }
@@ -765,6 +805,13 @@ export class EnhancedInferenceService {
       ?? OUTPUT_PRICING_PER_MILLION[model.id];
     
     if (price === undefined) {
+      if (model.provider === 'openai-compatible') {
+        console.warn(
+          `[Pricing] No pricing configured for openai-compatible model ${model.id} (${model.providerModelId || 'none'}), assuming $0 for metrics`
+        );
+        return 0;
+      }
+
       // Throw error instead of silently returning $0 - prevents untracked charges
       throw new PricingNotConfiguredError(model.id, model.provider, model.providerModelId);
     }

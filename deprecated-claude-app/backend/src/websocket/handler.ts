@@ -657,6 +657,54 @@ function applyUserMessageInjections(
 }
 
 /**
+ * Truncate messages to fit within the model's context window when persona context is present.
+ * The persona context is a fixed block injected into every API call, so conversation messages
+ * must fit in whatever space remains. Without persona context, returns messages unchanged.
+ */
+function truncateForPersonaBudget(
+  messages: any[],
+  personaContext: string | undefined,
+  systemPrompt: string,
+  maxOutputTokens: number,
+  contextWindow: number,
+  participantName: string
+): any[] {
+  if (!personaContext || !personaContext.trim()) return messages;
+
+  const estimateTokens = (text: string) => Math.ceil(text.length / 4);
+  const personaTokens = estimateTokens(personaContext);
+  const systemTokens = estimateTokens(systemPrompt);
+  const outputTokens = maxOutputTokens || 8192;
+  const safetyBuffer = 2000;
+  const available = contextWindow - personaTokens - systemTokens - outputTokens - safetyBuffer;
+
+  console.log(`[PersonaContext] Budget for ${participantName}: contextWindow=${contextWindow}, persona=${personaTokens}, system=${systemTokens}, output=${outputTokens}, available=${available}`);
+
+  if (available <= 0) {
+    console.warn(`[PersonaContext] WARNING: Persona context (${personaTokens} tokens) exceeds available budget. Sending minimal conversation.`);
+    return messages.slice(-3);
+  }
+
+  let totalTokens = 0;
+  let startIndex = messages.length;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    const branch = msg.branches?.find((b: any) => b.id === msg.activeBranchId) || msg.branches?.[0];
+    const msgTokens = estimateTokens(branch?.content || '');
+    if (totalTokens + msgTokens > available && startIndex < messages.length) break;
+    totalTokens += msgTokens;
+    startIndex = i;
+  }
+
+  if (startIndex > 0) {
+    console.log(`[PersonaContext] Truncating: keeping ${messages.length - startIndex}/${messages.length} messages (${totalTokens} est. tokens)`);
+    return messages.slice(startIndex);
+  }
+
+  return messages;
+}
+
+/**
  * Parameters for running parallel branch inference.
  * This shared utility handles creating multiple branches and running inference on them in parallel.
  */
@@ -682,6 +730,7 @@ interface ParallelInferenceParams {
   creationSource: 'inference' | 'regeneration';
   conversationId: string; // For room broadcasts
   toolOptions?: ToolOptions;
+  personaContext?: string; // Per-participant persona context to inject
 }
 
 /**
@@ -712,7 +761,8 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
     abortSignal,
     creationSource,
     conversationId,
-    toolOptions
+    toolOptions,
+    personaContext
   } = params;
 
   // Record tool snapshot for this inference turn (Phase 2c)
@@ -1051,7 +1101,8 @@ async function runParallelBranchInference(params: ParallelInferenceParams): Prom
       },
       participants,
       abortSignal,
-      toolOptions
+      toolOptions,
+      personaContext
     );
     
     return branchContent;
@@ -2177,6 +2228,17 @@ async function handleChatMessage(
       return;
     }
 
+    // Per-participant context budgeting
+    const responderPersonaContext = responder.personaContext;
+    const truncatedMessages = truncateForPersonaBudget(
+      messagesForInference,
+      responderPersonaContext,
+      inferenceSystemPrompt || '',
+      inferenceSettings.maxTokens || 8192,
+      modelConfig.contextWindow || 200000,
+      responder.name
+    );
+
     let generatedBranchIds: string[];
     try {
       // Run parallel inference using shared utility
@@ -2191,7 +2253,7 @@ async function handleChatMessage(
         samplingBranchCount,
         modelConfig,
         model: responder.model || conversation.model,
-        historyMessages: messagesForInference,
+        historyMessages: truncatedMessages,
         systemPrompt: inferenceSystemPrompt || '',
         settings: inferenceSettings,
         participants,
@@ -2201,7 +2263,8 @@ async function handleChatMessage(
         abortSignal: abortController.signal,
         creationSource: 'inference',
         conversationId: message.conversationId,
-        toolOptions: buildToolOptions(conversation.userId, conversation, responder, db)
+        toolOptions: buildToolOptions(conversation.userId, conversation, responder, db),
+        personaContext: responderPersonaContext
       });
 
     // DEBUG CAPTURE: Capture debug data for the first branch after completion
@@ -2257,6 +2320,90 @@ async function handleChatMessage(
 
     // Update conversation timestamp after all branches complete
     await db.updateConversation(conversation.id, conversation.userId, { updatedAt: new Date() });
+
+    try {
+      const needsTitle = !conversation.title || conversation.title === 'New Conversation';
+      
+      // Check if this is the first assistant message in the conversation
+      // We check filteredHistory length (which is previous messages) + 1 (current user message)
+      // If it's small (e.g., just 1 user message), it's the start.
+      const isFirstExchange = filteredHistory.length <= 1;
+
+
+      if (needsTitle && isFirstExchange) {
+        const firstUserMessage = filteredHistory.find(m => {
+          const activeBranch = m.branches.find(b => b.id === m.activeBranchId);
+          return activeBranch?.role === 'user';
+        });
+        const firstAssistantContent = generatedBranchIds.length > 0 
+          ? assistantMessage.branches.find((b: any) => b.id === generatedBranchIds[0])?.content 
+          : undefined;
+        if (firstUserMessage && firstAssistantContent) {
+          // Get the active branch's content, not branches[0]
+          const userActiveBranch = firstUserMessage.branches.find(b => b.id === firstUserMessage.activeBranchId);
+          const userContent = userActiveBranch?.content?.substring(0, 500) ?? '';
+          
+          const titlePrompt = `Generate a short, concise title (3-6 words) for this conversation. Output only the title text, no formatting or markdown:\n\nUser: ${userContent}\n\nAssistant: ${firstAssistantContent.substring(0, 500)}`;
+          // Use baseInferenceService for a raw, simple call
+          // Signature: (modelId, messages, systemPrompt, settings, userId, onChunk, format, ...)
+          let generatedTitle = '';
+          const tempBranchId = 'temp-branch-' + Date.now();
+          const tempMessage: any = {
+            id: 'temp-title-msg',
+            conversationId: 'temp',
+            userId: conversation.userId,
+            activeBranchId: tempBranchId,
+            branches: [{
+              id: tempBranchId,
+              content: titlePrompt,
+              role: 'user',
+              createdAt: new Date(),
+              isActive: true,
+              parentBranchId: 'root'
+            }],
+            order: 0
+          };
+
+          await baseInferenceService.streamCompletion(
+            responder.model || conversation.model,
+            [tempMessage],
+            'You are a helpful assistant.',
+            { temperature: 0.7, maxTokens: 50 },
+            conversation.userId,
+            async (chunk: string) => {
+              generatedTitle += chunk;
+            }
+          );
+
+
+          const cleanTitle = generatedTitle.trim()
+            .replace(/^#+\s*/, '')           // Remove markdown heading markers
+            .replace(/^\*\*(.+)\*\*$/, '$1') // Remove ** only if it wraps the ENTIRE title
+            .replace(/^["']|["']$/g, '')     // Remove quotes at start/end
+            .substring(0, 60);
+
+
+          if (cleanTitle) {
+            await db.updateConversation(conversation.id, conversation.userId, { title: cleanTitle });
+            
+            // Notify frontend
+            const updatedConv = await db.getConversation(conversation.id, conversation.userId);
+            if (updatedConv) {
+               ws.send(JSON.stringify({ 
+                 type: 'conversation_updated', 
+                 id: conversation.id,
+                 updates: { 
+                   title: cleanTitle,
+                   updatedAt: updatedConv.updatedAt
+                 }
+               }));
+            }
+          }
+        }
+      }
+    } catch (titleError) {
+      console.error('[Auto-title] Failed to generate title:', titleError);
+    }
     
     } finally {
       endGeneration(conversation.userId, conversation.id);
@@ -2583,7 +2730,14 @@ async function handleRegenerate(
         samplingBranchCount,
         modelConfig,
         model: regenerateModel,
-        historyMessages: filteredHistoryMessages,
+        historyMessages: truncateForPersonaBudget(
+          filteredHistoryMessages,
+          responderParticipant?.personaContext,
+          responderSystemPrompt || '',
+          responderSettings?.maxTokens || 8192,
+          modelConfig.contextWindow || 200000,
+          responderParticipant?.name || 'unknown'
+        ),
         systemPrompt: responderSystemPrompt || '',
         settings: responderSettings,
         participants,
@@ -2593,7 +2747,8 @@ async function handleRegenerate(
         abortSignal: abortController.signal,
         creationSource: 'regeneration',
         conversationId: message.conversationId,
-        toolOptions: buildToolOptions(conversation.userId, conversation, responderParticipant, db)
+        toolOptions: buildToolOptions(conversation.userId, conversation, responderParticipant, db),
+        personaContext: responderParticipant?.personaContext
       });
     } finally {
       endGeneration(conversation.userId, conversation.id);
@@ -3036,7 +3191,14 @@ async function handleEdit(
           samplingBranchCount,
           modelConfig,
           model: responderModel,
-          historyMessages: filteredHistoryMessages,
+          historyMessages: truncateForPersonaBudget(
+            filteredHistoryMessages,
+            responderParticipant?.personaContext,
+            responderSystemPrompt || '',
+            responderSettings?.maxTokens || 8192,
+            modelConfig.contextWindow || 200000,
+            responderParticipant?.name || 'unknown'
+          ),
           systemPrompt: responderSystemPrompt || '',
           settings: responderSettings,
           participants,
@@ -3046,7 +3208,8 @@ async function handleEdit(
           abortSignal: abortController.signal,
           creationSource: 'inference',
           conversationId: message.conversationId,
-          toolOptions: buildToolOptions(conversation.userId, conversation, responderParticipant, db)
+          toolOptions: buildToolOptions(conversation.userId, conversation, responderParticipant, db),
+          personaContext: responderParticipant?.personaContext
         });
       } finally {
         endGeneration(conversation.userId, conversation.id);
@@ -3427,7 +3590,14 @@ async function handleContinue(
         samplingBranchCount,
         modelConfig,
         model: responder.model || conversation.model,
-        historyMessages: messagesWithNewAssistant,
+        historyMessages: truncateForPersonaBudget(
+          messagesWithNewAssistant,
+          responder.personaContext,
+          continueSystemPrompt,
+          inferenceSettings.maxTokens || 8192,
+          modelConfig.contextWindow || 200000,
+          responder.name
+        ),
         systemPrompt: continueSystemPrompt,
         settings: inferenceSettings,
         participants,
@@ -3437,7 +3607,8 @@ async function handleContinue(
         abortSignal: abortController.signal,
         creationSource: 'inference',
         conversationId,
-        toolOptions: buildToolOptions(conversation.userId, conversation, responder, db)
+        toolOptions: buildToolOptions(conversation.userId, conversation, responder, db),
+        personaContext: responder.personaContext
       });
 
       // DEBUG CAPTURE: Capture debug data for the first branch after completion
