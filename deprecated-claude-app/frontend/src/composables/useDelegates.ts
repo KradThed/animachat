@@ -132,9 +132,7 @@ export function useDelegates() {
         clearTimeout(toolFetchTimeout);
       }
       toolFetchTimeout = setTimeout(async () => {
-        const oldToolNames = allTools.value.map(t => t.name).sort().join(',');
         await fetchTools();
-        const newToolNames = allTools.value.map(t => t.name).sort().join(',');
         // No need to set refreshing - silent update
         toolFetchTimeout = null;
       }, 500);  // Increased debounce to 500ms
